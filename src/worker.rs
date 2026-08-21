@@ -220,7 +220,13 @@ fn install_child_credentials(command: &mut Command, account: &SystemAccount) {
     // child immediately before exec and cannot affect the gateway process.
     unsafe {
         command.pre_exec(move || {
-            if nix::libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+            let group_count = groups.len().try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "supplementary group list is too large",
+                )
+            })?;
+            if nix::libc::setgroups(group_count, groups.as_ptr()) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             if nix::libc::setgid(gid) != 0 {

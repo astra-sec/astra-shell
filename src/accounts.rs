@@ -1,12 +1,14 @@
 use std::{
-    ffi::CString,
+    ffi::{CStr, CString},
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
-use nix::unistd::{Gid, Uid, User, getgrouplist};
+#[cfg(not(target_vendor = "apple"))]
+use nix::unistd::getgrouplist;
+use nix::unistd::{Gid, Uid, User};
 
 #[derive(Clone, Debug)]
 pub struct SystemAccount {
@@ -27,11 +29,7 @@ impl SystemAccount {
             .context("system user lookup failed")?
             .with_context(|| format!("unknown Unix user {username}"))?;
         let c_username = CString::new(user.name.as_bytes())?;
-        let supplementary_groups = getgrouplist(&c_username, user.gid)
-            .context("supplementary group lookup failed")?
-            .into_iter()
-            .map(Gid::as_raw)
-            .collect();
+        let supplementary_groups = supplementary_groups(&c_username, user.gid)?;
         Ok(Self {
             username: user.name,
             uid: user.uid.as_raw(),
@@ -48,6 +46,55 @@ impl SystemAccount {
             .context("current system user lookup failed")?
             .context("effective UID has no passwd entry")?;
         Self::lookup(&user.name)
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn supplementary_groups(username: &CStr, gid: Gid) -> Result<Vec<u32>> {
+    Ok(getgrouplist(username, gid)
+        .context("supplementary group lookup failed")?
+        .into_iter()
+        .map(Gid::as_raw)
+        .collect())
+}
+
+#[cfg(target_vendor = "apple")]
+fn supplementary_groups(username: &CStr, gid: Gid) -> Result<Vec<u32>> {
+    let mut groups = Vec::<nix::libc::c_int>::with_capacity(8);
+    loop {
+        let capacity = groups.capacity();
+        let mut count = nix::libc::c_int::try_from(capacity)
+            .context("supplementary group list is too large")?;
+        // SAFETY: `groups` has capacity for `count` entries and the OS only
+        // initializes that buffer. The length is set after a successful call.
+        let result = unsafe {
+            nix::libc::getgrouplist(
+                username.as_ptr(),
+                gid.as_raw() as nix::libc::c_int,
+                groups.as_mut_ptr(),
+                &mut count,
+            )
+        };
+        if result >= 0 {
+            let count = usize::try_from(count).context("invalid supplementary group count")?;
+            if count > capacity {
+                bail!("supplementary group lookup returned an oversized result")
+            }
+            // SAFETY: `getgrouplist` reported that it initialized `count`
+            // entries, and the bounds check above keeps them within capacity.
+            unsafe { groups.set_len(count) };
+            return groups
+                .into_iter()
+                .map(|group| u32::try_from(group).context("invalid supplementary group ID"))
+                .collect();
+        }
+
+        let requested = usize::try_from(count).unwrap_or(0);
+        let next_capacity = requested.max(capacity.saturating_mul(2));
+        if next_capacity <= capacity {
+            bail!("supplementary group list is too large")
+        }
+        groups.reserve(next_capacity);
     }
 }
 
