@@ -19,6 +19,7 @@ path = "src/bin/astrad.rs"
 
 [dependencies]
 anyhow = "1.0"
+base64ct = { version = "1.8", features = ["alloc"] }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
 nix = { version = "0.31", features = ["fs", "user"] }
@@ -30,6 +31,7 @@ rcgen = "0.14"
 rusqlite = { version = "0.40", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 serde_json = "1.0"
+sha2 = "0.10"
 ssh-key = { version = "0.6.7", features = ["ed25519", "getrandom"] }
 tokio = { version = "1.47", features = ["full"] }
 tracing = "0.1"

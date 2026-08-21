@@ -58,11 +58,18 @@ start_gateway() {
     echo "managed gateway did not start; see $log_file" >&2
     exit 1
   fi
+  env HOME="$run_dir/home" XDG_CONFIG_HOME="$run_dir/home/.config" \
+    target/debug/astra \
+    -p "${listen##*:}" \
+    -o StrictHostKeyChecking=accept-new \
+    -i "$run_dir/id_ed25519" \
+    "$username@127.0.0.1" list >/dev/null
   client=(
     env HOME="$run_dir/home"
+    XDG_CONFIG_HOME="$run_dir/home/.config"
     target/debug/astra
     -p "${listen##*:}"
-    --server-cert "$run_dir/server/host-cert.der"
+    -o StrictHostKeyChecking=yes
     -i "$run_dir/id_ed25519"
     "$username@127.0.0.1"
   )
@@ -99,9 +106,9 @@ if ! printf '%s' "$after" | rg -q 'AFTER_GATEWAY_RESTART'; then
   exit 1
 fi
 
-if target/debug/astra \
+if HOME="$run_dir/home" XDG_CONFIG_HOME="$run_dir/home/.config" target/debug/astra \
   -p "${listen##*:}" \
-  --server-cert "$run_dir/server/host-cert.der" \
+  -o StrictHostKeyChecking=yes \
   -i "$run_dir/id_ed25519" \
   root@127.0.0.1 list >/dev/null 2>&1; then
   echo "non-root gateway unexpectedly allowed a different Unix account" >&2

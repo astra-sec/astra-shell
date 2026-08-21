@@ -111,6 +111,7 @@ name = "astra-shell"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64ct",
  "clap",
  "crossterm",
  "nix 0.31.3",
@@ -122,6 +123,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "serde_json",
+ "sha2",
  "ssh-key",
  "tempfile",
  "tokio",

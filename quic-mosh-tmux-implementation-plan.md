@@ -559,21 +559,19 @@ PTY 尺寸由 lease owner 控制。只读客户端按本地 viewport 做裁剪�
 
 ## 9. 认证与部署模型
 
-### 9.1 默认：Rootless SSH bootstrap
+### 9.1 默认：Astra 原生连接与 SSH 式 TOFU
 
-目标是保留 Mosh 的“普通用户无需管理员部署”优势。
+不使用 SSH bootstrap。Rootless 用户可以自行启动 daemon 并配置固定 UDP 端口；系统级部署由类似 sshd 的 gateway 监听共享端口。两种部署使用相同的 QUIC 握手和认证顺序：
 
-流程：
+1. 客户端直接与目标 UDP endpoint 建立 QUIC/TLS 1.3 连接；
+2. 服务端证明其持有长期 TLS 主机私钥，客户端取得叶证书；
+3. 客户端按 `host:port` 检查独立的 Astra known-hosts 文件；首次连接显示 SHA-256 指纹并要求确认，已记录证书发生变化时硬失败；
+4. 主机身份确认完成后，客户端才发送目标用户名；
+5. 服务端发送随机 challenge 和服务实例 ID，客户端使用 OpenSSH 格式私钥签署同时绑定 challenge、用户名和服务实例的认证 transcript；
+6. 服务端用目标账户的 `~/.ssh/authorized_keys` 验证签名，并把连接路由到对应用户 worker；
+7. 此后所有终端和其他通道复用同一条 QUIC 连接。
 
-1. 客户端用系统 OpenSSH 执行 `ssh host qterm bootstrap --json`；
-2. bootstrap 确保当前用户的 sessiond 已运行；
-3. sessiond 生成短期、单次 bootstrap token，并返回 UDP endpoint、TLS 公钥指纹、用户/实例 ID 和有效期；
-4. 客户端验证 SSH 主机身份后，使用返回的指纹 pin QUIC TLS；
-5. 在 1-RTT Control Stream 中提交 token；
-6. token 与 TLS exporter、目标用户和过期时间绑定，防止转发复用；
-7. SSH 连接关闭，此后所有终端复用该 QUIC 连接。
-
-该模式是“一用户一个 UDP 端口”，不是“一 Terminal 一个端口”。它已经大幅改善 Mosh 的端口模型，同时保持 rootless。
+首次 TOFU 与 SSH 首次连接一样无法单独抵御当场的主动中间人，因此 UI 必须展示可经其他可信渠道核对的指纹。主机身份决定必须发生在用户名、用户公钥和签名发送之前。Astra 不向 `~/.ssh/known_hosts` 写入 X.509 数据。
 
 ### 9.2 可选：系统级共享 UDP/443
 
@@ -581,7 +579,7 @@ PTY 尺寸由 lease owner 控制。只读客户端按本地 viewport 做裁剪�
 
 - `qterm-gatewayd` 监听 UDP/443；
 - 使用 ACME 证书或管理员提供证书；
-- 支持 SSH-agent 公钥挑战、mTLS、OIDC 或 PAM 插件；
+- 默认使用目标账户的 OpenSSH `authorized_keys` 做公钥挑战，后续可增加 SSH-agent、mTLS、OIDC 或 PAM 插件；
 - 验证用户后通过最小特权 helper 切换 UID/启动 sessiond；
 - gateway 与 sessiond 通过用户隔离 Unix socket 通信；
 - root monitor 不解析终端状态和文件内容；
@@ -589,14 +587,15 @@ PTY 尺寸由 lease owner 控制。只读客户端按本地 viewport 做裁剪�
 
 系统级模式必须单独安全审计，不能阻塞 rootless MVP。
 
-### 9.3 证书和设备身份
+### 9.3 主机证书和用户密钥
 
-- rootless 模式默认 SSH pinning，不依赖公开 PKI；
-- managed 模式支持公开证书；
-- 每设备有独立客户端密钥，服务端可单独撤销；
-- 不建议跨设备复制同一 SSH 私钥；
-- QUIC session ticket 只用于加速握手，不等同于长期用户授权；
-- token、ticket 和设备撤销记录必须有明确生命周期。
+- rootless 和 managed 模式都默认使用 Astra known-hosts TOFU，不依赖 SSH bootstrap 或公开 PKI；
+- managed 模式可由管理员预置/pin 证书，也可支持公开 CA 证书；
+- daemon 长期保存 TLS 主机私钥，作用等同于 sshd 的 host key；客户端只保存证书 SHA-256 pin，不复制服务端证书文件；
+- 主机证书轮换必须提供显式更新流程，不能在证书变化时静默覆盖旧 pin；
+- 用户认证继续使用 OpenSSH 私钥格式和 `authorized_keys`，后续增加 ssh-agent、硬件密钥、加密私钥及更多算法；
+- 不建议跨设备复制同一用户私钥；成熟版本应支持每设备独立密钥和单独撤销；
+- QUIC session ticket 只用于加速握手，不等同于长期用户授权；ticket 和设备撤销记录必须有明确生命周期。
 
 ## 10. 文件与端口通道
 
@@ -673,7 +672,7 @@ qterm/
 │   ├── qterm-termstate/      # 终端模型适配、snapshot/diff
 │   ├── qterm-pty/            # PTY worker、进程、signal、resize
 │   ├── qterm-session/        # workspace/terminal/attachment/lease
-│   ├── qterm-auth/           # bootstrap token、pinning、device identity
+│   ├── qterm-auth/           # known-hosts、SSH key challenge、device identity
 │   ├── qterm-files/          # 文件 RPC
 │   ├── qterm-client-core/    # replica、reconnect、prediction、cache
 │   └── qterm-testkit/        # netem、fake clock、PTY fixtures
@@ -719,9 +718,9 @@ qterm/
 
 ### 12.2 控制措施
 
-1. 使用 Quinn/rustls，不提供关闭证书验证的生产开关。
+1. 使用 Quinn/rustls；默认 `ask`，生产自动化使用 `yes` 或 `accept-new`。兼容 SSH 的 `no` 模式必须醒目警告，不能成为部署默认值。
 2. 公网服务启用 QUIC Retry、握手速率限制和连接配额。
-3. rootless token 单次、短期、绑定 TLS exporter 和 OS 用户。
+3. known-hosts 按 `host:port` 绑定证书 SHA-256 pin；证书变化在发送用户名和用户签名前失败，文件采用安全权限、拒绝符号链接并原子更新。
 4. 所有 mutation 等待 1-RTT；请求 ID 做幂等与重放检测。
 5. 每用户 runtime 目录 `0700`、socket `0600`，并验证 Unix peer credentials。
 6. gateway privilege separation；网络 worker 不长期保留 root。
@@ -730,7 +729,7 @@ qterm/
 9. OSC 52、通知、打开 URL、文件下载都进入客户端权限策略。
 10. PTY 创建使用 argv 数组和环境 allow/deny policy，不拼接 shell 字符串。
 11. 文件 API 使用 fd-relative 操作，防止 TOCTOU 和路径逃逸。
-12. 日志默认不记录按键、密码、终端输出、文件内容和 bootstrap token。
+12. 日志默认不记录按键、密码、终端输出、文件内容、用户私钥或认证签名。
 13. 正式版前完成独立安全审计和模糊测试覆盖审查。
 
 ## 13. 测试与验证计划
@@ -812,7 +811,7 @@ duplicate/reorder(datagrams) never regresses generation
 - Prometheus 可选指标：连接数、PTY 数、内存、状态帧、快照、丢包、RTT、迁移、重同步、fallback；
 - qlog 默认关闭，用户显式开启并自动脱敏 endpoint/token；
 - 每 Terminal 暴露状态：running/exited、PID、cwd、title、last activity、attachments、buffer usage；
-- `qterm doctor` 检查 UDP、证书、SSH bootstrap、runtime 权限、TERM/locale 和 daemon 版本；
+- `qterm doctor` 检查 UDP、主机证书/known-hosts、用户密钥、runtime 权限、TERM/locale 和 daemon 版本；
 - gateway 支持 drain，新连接拒绝，现有 Terminal 不受影响；
 - 协议和存储 schema 分开版本，支持 N/N-1 客户端兼容。
 
@@ -821,7 +820,7 @@ duplicate/reorder(datagrams) never regresses generation
 ### 15.1 SSH 生态
 
 - 解析并尊重 `~/.ssh/config` 的 Host、User、Port、IdentityFile、ProxyJump；
-- rootless bootstrap 默认调用系统 OpenSSH，避免重新实现复杂 SSH 配置；
+- QUIC 主连接不调用系统 OpenSSH；SSH 配置只作为目标、用户、密钥和可选 fallback 的配置来源；
 - UDP 不通时继续走同一 SSH 通道；
 - 支持 SSH agent，不默认复制私钥进应用 vault。
 
@@ -858,7 +857,7 @@ duplicate/reorder(datagrams) never regresses generation
 交付：
 
 - Quinn 单连接、多 Stream、DATAGRAM、priority 和 `Endpoint::rebind` spike；
-- SSH bootstrap + pinning spike；
+- QUIC 主机证书 TOFU、known-hosts 和 OpenSSH 用户密钥 challenge-response spike；
 - 一个 PTY worker 在客户端断开后继续运行；
 - 三个终端引擎的解析、snapshot、diff 和内存基准；
 - 可靠 raw stream 与累计 semantic patch 的对比；
@@ -970,7 +969,7 @@ duplicate/reorder(datagrams) never regresses generation
 建议现在接受以下决策：
 
 1. Rust/Quinn 作为首个实现，不手写 QUIC。
-2. 默认 rootless SSH bootstrap；系统级 UDP/443 后置。
+2. 默认直接 QUIC + Astra known-hosts TOFU + OpenSSH 用户密钥认证；不使用 SSH bootstrap。
 3. 服务端持有权威终端状态；客户端不只接收原始字节。
 4. raw reliable mode 先完成，DATAGRAM 状态同步在其后，不反过来阻塞 MVP。
 5. 布局归客户端，服务端管理 Terminal 而不是文本窗口管理器。

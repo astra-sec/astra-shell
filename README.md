@@ -5,6 +5,7 @@ Astra Shell 是一个以 QUIC 连接多个持久 PTY 的远程终端原型。`as
 当前 MVP 已实现：
 
 - QUIC/TLS 1.3，ALPN 为 `astra/1`；
+- SSH 风格的主机证书 TOFU：首次连接确认，后续自动校验并拒绝证书变化；
 - OpenSSH 私钥、SSHSIG challenge-response 和 `authorized_keys`；
 - 客户端选择目标 Unix 用户，签名同时绑定用户名、服务实例和随机 challenge；
 - managed gateway 按 passwd 数据库查找用户及其 `~/.ssh/authorized_keys`；
@@ -38,7 +39,7 @@ ssh-keygen -t ed25519 -N '' -f state/id_ed25519
 install -m 600 state/id_ed25519.pub state/authorized_keys
 ```
 
-服务端证书、私钥、`authorized_keys`、SQLite 和客户端测试密钥都在 `state/` 中。服务端状态目录会设置为 `0700`，秘密文件设置为 `0600`。
+服务端证书、私钥、`authorized_keys`、SQLite 和客户端测试密钥都在 `state/` 中。服务端状态目录会设置为 `0700`，秘密文件设置为 `0600`。`host-cert.der` 是服务端主机身份的一部分，客户端不再需要复制或显式传入它。
 
 ## Rootless 单用户模式
 
@@ -62,16 +63,17 @@ Rootless 模式使用 `state/authorized_keys`，daemon 只能代表启动它的 
 ```bash
 ./target/debug/astra \
   -p 4433 \
-  --server-cert state/host-cert.der \
   -i state/id_ed25519 \
   mimi@127.0.0.1 list
 ```
+
+第一次连接会像 SSH 一样显示服务端 X.509 证书的 SHA-256 指纹，并要求输入 `yes`；确认后记录到 `~/.config/astra/known_hosts`。以后同一主机和端口的证书发生变化会直接拒绝连接，而且这个检查发生在发送用户名和用户签名之前。Astra 使用独立文件，不会把 TLS 证书条目混入 OpenSSH 的 `~/.ssh/known_hosts`。
 
 不带子命令时，与 `ssh user@host` 一样直接创建并附着默认 shell：
 
 ```bash
 ./target/debug/astra -p 4433 \
-  --server-cert state/host-cert.der -i state/id_ed25519 \
+  -i state/id_ed25519 \
   mimi@127.0.0.1
 ```
 
@@ -79,7 +81,7 @@ Rootless 模式使用 `state/authorized_keys`，daemon 只能代表启动它的 
 
 ```bash
 ./target/debug/astra -p 4433 \
-  --server-cert state/host-cert.der -i state/id_ed25519 \
+  -i state/id_ed25519 \
   mimi@127.0.0.1 new --name logs -- /usr/bin/tail -f README.md
 ```
 
@@ -87,9 +89,20 @@ Rootless 模式使用 `state/authorized_keys`，daemon 只能代表启动它的 
 
 ```bash
 ./target/debug/astra -p 4433 \
-  --server-cert state/host-cert.der -i state/id_ed25519 \
+  -i state/id_ed25519 \
   mimi@127.0.0.1 attach TERMINAL_UUID
 ```
+
+无人值守的首次连接可以显式使用 SSH 同名策略；它只接受并记录新主机，绝不会覆盖已经变化的证书：
+
+```bash
+./target/debug/astra -p 4433 \
+  -o StrictHostKeyChecking=accept-new \
+  -i state/id_ed25519 \
+  mimi@127.0.0.1 list
+```
+
+支持的 SSH 风格选项是 `StrictHostKeyChecking=yes|ask|accept-new|no` 和 `UserKnownHostsFile=PATH`。默认是 `ask`。需要由配置管理系统严格下发证书时，仍可使用 `--server-cert /path/to/host-cert.der`，此时执行标准 TLS 证书和名称校验，不使用 TOFU。
 
 交互附着时按 `Ctrl+]` 只分离客户端，不结束远端进程。`--read-only` 创建观察者；已有写入者时，可显式使用 `--takeover` 获取新的 fencing lease。
 
@@ -113,7 +126,6 @@ sudo /home/mimi/astra-shell/target/debug/astrad serve \
 ```bash
 ./target/debug/astra \
   -p 4433 \
-  --server-cert /home/mimi/astra-shell/state-managed/host-cert.der \
   alice@SERVER_IP
 ```
 
@@ -149,7 +161,7 @@ cargo clippy --all-targets -- -D warnings
 ./scripts/managed-smoke.sh
 ```
 
-两个 smoke test 都只在 `.local-test/` 内生成一次性服务端、SSH 密钥和数据库。Managed 测试还会验证目标 UID、跨账户拒绝以及 gateway 重启后 PTY 恢复。
+两个 smoke test 都只在 `.local-test/` 内生成一次性服务端、SSH 密钥、Astra known-hosts 和数据库。它们会验证首次 `accept-new`、后续严格主机校验以及显式证书 pin。Managed 测试还会验证目标 UID、跨账户拒绝以及 gateway 重启后 PTY 恢复。
 
 ## MVP 边界
 
@@ -158,7 +170,7 @@ cargo clippy --all-targets -- -D warnings
 - managed 模式已经按 Unix 账户、supplementary groups、GID 和 UID 隔离，但尚未接入 PAM、账户锁定/过期策略；
 - 尚未实现按来源地址的认证速率限制、连接配额和审计日志后端，公开暴露前仍需补齐并接受独立安全审计；
 - 认证兼容 OpenSSH Ed25519 密钥格式和 `authorized_keys`，客户端会自动选择 `~/.ssh/id_ed25519`，但暂不支持 ssh-agent、加密私钥、其他密钥算法、SSH 用户证书及 authorized_keys options；
-- QUIC 主机身份使用显式固定的 DER 证书，还没有 SSH `known_hosts` 式 TOFU 管理；
+- QUIC 主机身份已经支持独立的 SSH 式 TOFU 文件，但当前 pin 的是完整自签名证书；正式的证书轮换机制尚未实现；
 - 保存的是有界原始输出，不是语义 screen/grid 快照；
 - 暂无 QUIC DATAGRAM 累计状态同步、预测、文件和端口通道；
 - 暂无 SSH stdio fallback；

@@ -1,4 +1,9 @@
-use std::{fs, net::SocketAddr, path::Path, sync::Arc};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::crypto::rustls::QuicClientConfig;
@@ -7,11 +12,82 @@ use rustls::pki_types::CertificateDer;
 use crate::{
     ALPN, PROTOCOL_VERSION,
     auth::{authentication_payload, sign_challenge},
+    known_hosts::{StrictHostKeyChecking, verify_server_certificate},
     protocol::{
         AttachRequest, AttachResponse, CloseRequest, ListRequest, Request, Response, SpawnRequest,
         WireMessage, read_message, request, response, wire_message, write_message,
     },
 };
+
+#[derive(Clone, Debug)]
+pub enum ServerTrust {
+    /// Validate TLS against exactly this certificate. Kept for scripted and
+    /// centrally provisioned deployments.
+    PinnedCertificate(PathBuf),
+    /// Use SSH-style trust on first use, scoped to the destination host and port.
+    KnownHosts {
+        host: String,
+        port: u16,
+        file: PathBuf,
+        policy: StrictHostKeyChecking,
+    },
+}
+
+#[derive(Debug)]
+struct DeferredServerVerification(Arc<rustls::crypto::CryptoProvider>);
+
+impl DeferredServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for DeferredServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // The leaf certificate is checked against Astra's known-hosts file as
+        // soon as the QUIC handshake completes and before authentication starts.
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            certificate,
+            signature,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            signature,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
 
 pub struct AstraClient {
     _endpoint: quinn::Endpoint,
@@ -28,24 +104,32 @@ impl AstraClient {
     pub async fn connect(
         remote: SocketAddr,
         server_name: &str,
-        server_certificate: &Path,
+        trust: &ServerTrust,
         identity: &Path,
         username: &str,
     ) -> Result<Self> {
-        let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(CertificateDer::from(
-                fs::read(server_certificate).with_context(|| {
-                    format!(
-                        "failed to read server certificate {}",
-                        server_certificate.display()
-                    )
-                })?,
-            ))
-            .context("invalid server certificate")?;
-        let mut tls = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let mut tls = match trust {
+            ServerTrust::PinnedCertificate(server_certificate) => {
+                let mut roots = rustls::RootCertStore::empty();
+                roots
+                    .add(CertificateDer::from(
+                        fs::read(server_certificate).with_context(|| {
+                            format!(
+                                "failed to read server certificate {}",
+                                server_certificate.display()
+                            )
+                        })?,
+                    ))
+                    .context("invalid server certificate")?;
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth()
+            }
+            ServerTrust::KnownHosts { .. } => rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(DeferredServerVerification::new())
+                .with_no_client_auth(),
+        };
         tls.alpn_protocols = vec![ALPN.to_vec()];
         let mut client_config = quinn::ClientConfig::new(Arc::new(
             QuicClientConfig::try_from(tls).context("invalid QUIC client TLS configuration")?,
@@ -64,6 +148,18 @@ impl AstraClient {
             .connect(remote, server_name)?
             .await
             .with_context(|| format!("failed to connect to {remote}"))?;
+        if let ServerTrust::KnownHosts {
+            host,
+            port,
+            file,
+            policy,
+        } = trust
+            && let Err(error) =
+                verify_connection_certificate(&connection, host, *port, file, *policy)
+        {
+            connection.close(1_u32.into(), b"host certificate rejected");
+            return Err(error);
+        }
         authenticate(&connection, identity, username).await?;
         Ok(Self {
             _endpoint: endpoint,
@@ -152,6 +248,26 @@ impl AstraClient {
         send.finish()?;
         require_response(&mut recv, &request_id).await
     }
+}
+
+fn verify_connection_certificate(
+    connection: &quinn::Connection,
+    host: &str,
+    port: u16,
+    known_hosts_file: &Path,
+    policy: StrictHostKeyChecking,
+) -> Result<()> {
+    let identity = connection
+        .peer_identity()
+        .context("server did not present a TLS certificate")?;
+    let certificates = identity
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| anyhow!("QUIC backend returned an unexpected server identity type"))?;
+    let leaf = certificates
+        .first()
+        .context("server presented an empty TLS certificate chain")?;
+    verify_server_certificate(host, port, leaf.as_ref(), known_hosts_file, policy)?;
+    Ok(())
 }
 
 async fn authenticate(

@@ -6,7 +6,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use astra_shell::{
-    client::AstraClient,
+    client::{AstraClient, ServerTrust},
+    known_hosts::{StrictHostKeyChecking, default_known_hosts_file},
     protocol::{
         Resize, SpawnRequest, TerminalCommand, WireMessage, read_message, terminal_command,
         terminal_event, wire_message, write_message,
@@ -25,8 +26,15 @@ struct Cli {
     /// TLS server name. Defaults to astra.local for astrad-generated certificates.
     #[arg(long)]
     server_name: Option<String>,
-    #[arg(long, default_value = "state/host-cert.der")]
-    server_cert: PathBuf,
+    /// Pin a provisioned DER certificate instead of using Astra known hosts.
+    #[arg(long)]
+    server_cert: Option<PathBuf>,
+    /// SSH-style option. Supported: StrictHostKeyChecking and UserKnownHostsFile.
+    #[arg(short = 'o', value_name = "OPTION", action = clap::ArgAction::Append)]
+    ssh_options: Vec<String>,
+    /// Override Astra's known-hosts path (normally ~/.config/astra/known_hosts).
+    #[arg(long)]
+    known_hosts_file: Option<PathBuf>,
     /// OpenSSH private key. Defaults to ~/.ssh/id_ed25519.
     #[arg(short = 'i', long)]
     identity: Option<PathBuf>,
@@ -87,6 +95,7 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    let ssh_options = parse_ssh_options(&cli.ssh_options)?;
     let destination = parse_destination(&cli.destination)?;
     let username = cli
         .user
@@ -99,14 +108,23 @@ async fn run() -> Result<()> {
         .server_name
         .unwrap_or_else(|| inferred_server_name(&destination.host));
     let identity = select_identity(cli.identity.as_deref())?;
-    let client = AstraClient::connect(
-        address,
-        &server_name,
-        &cli.server_cert,
-        &identity,
-        &username,
-    )
-    .await?;
+    let trust = match cli.server_cert {
+        Some(certificate) => ServerTrust::PinnedCertificate(certificate),
+        None => {
+            let configured_file = cli.known_hosts_file.or(ssh_options.user_known_hosts_file);
+            let known_hosts_file = match configured_file {
+                Some(path) => expand_home_path(&path)?,
+                None => default_known_hosts_file()?,
+            };
+            ServerTrust::KnownHosts {
+                host: destination.host.clone(),
+                port: cli.port,
+                file: known_hosts_file,
+                policy: ssh_options.strict_host_key_checking,
+            }
+        }
+    };
+    let client = AstraClient::connect(address, &server_name, &trust, &identity, &username).await?;
     match cli.command {
         None => {
             let terminal = client
@@ -344,6 +362,52 @@ fn default_username() -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+struct SshOptions {
+    strict_host_key_checking: StrictHostKeyChecking,
+    user_known_hosts_file: Option<PathBuf>,
+}
+
+fn parse_ssh_options(options: &[String]) -> Result<SshOptions> {
+    let mut parsed = SshOptions::default();
+    for option in options {
+        let option = option.trim();
+        let separator = option
+            .find('=')
+            .or_else(|| option.find(char::is_whitespace))
+            .with_context(|| format!("SSH-style option {option:?} must be KEY=VALUE"))?;
+        let key = option[..separator].trim().to_ascii_lowercase();
+        let value = option[separator + 1..].trim();
+        if value.is_empty() {
+            bail!("SSH-style option {option:?} has an empty value")
+        }
+        match key.as_str() {
+            "stricthostkeychecking" => {
+                parsed.strict_host_key_checking = value.parse()?;
+            }
+            "userknownhostsfile" => {
+                parsed.user_known_hosts_file = Some(PathBuf::from(value));
+            }
+            _ => bail!(
+                "unsupported SSH-style option {:?}; Astra currently supports StrictHostKeyChecking and UserKnownHostsFile",
+                &option[..separator]
+            ),
+        }
+    }
+    Ok(parsed)
+}
+
+fn expand_home_path(path: &Path) -> Result<PathBuf> {
+    let Ok(remainder) = path.strip_prefix("~") else {
+        return Ok(path.to_owned());
+    };
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .context("cannot expand ~ because the user home directory is unknown")?;
+    Ok(home.join(remainder))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Destination {
     username: Option<String>,
@@ -464,7 +528,29 @@ mod tests {
         let cli = Cli::try_parse_from(["astra", "-p", "4443", "mimi@localhost", "list"]).unwrap();
         assert_eq!(cli.port, 4443);
         assert_eq!(cli.destination, "mimi@localhost");
+        assert!(cli.server_cert.is_none());
         assert!(matches!(cli.command, Some(Command::List)));
+    }
+
+    #[test]
+    fn parses_supported_ssh_host_options() {
+        let cli = Cli::try_parse_from([
+            "astra",
+            "-oStrictHostKeyChecking=accept-new",
+            "-o",
+            "UserKnownHostsFile=~/astra_hosts",
+            "mimi@localhost",
+        ])
+        .unwrap();
+        let options = parse_ssh_options(&cli.ssh_options).unwrap();
+        assert_eq!(
+            options.strict_host_key_checking,
+            StrictHostKeyChecking::AcceptNew
+        );
+        assert_eq!(
+            options.user_known_hosts_file,
+            Some(PathBuf::from("~/astra_hosts"))
+        );
     }
 
     #[test]

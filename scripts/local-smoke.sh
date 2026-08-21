@@ -53,13 +53,34 @@ if [[ "$duplicate_status" -eq 0 || "$duplicate_status" -eq 124 ]]; then
   exit 1
 fi
 
-client=(
+tofu_bootstrap=(
   env HOME="$run_dir/home"
+  XDG_CONFIG_HOME="$run_dir/home/.config"
   target/debug/astra
   -p "${listen##*:}"
-  --server-cert "$run_dir/server/host-cert.der"
+  -o StrictHostKeyChecking=accept-new
   "$(id -un)@127.0.0.1"
 )
+"${tofu_bootstrap[@]}" list >/dev/null
+if [[ ! -s "$run_dir/home/.config/astra/known_hosts" ]]; then
+  echo "TOFU connection did not create Astra known hosts" >&2
+  exit 1
+fi
+
+client=(
+  env HOME="$run_dir/home"
+  XDG_CONFIG_HOME="$run_dir/home/.config"
+  target/debug/astra
+  -p "${listen##*:}"
+  -o StrictHostKeyChecking=yes
+  "$(id -un)@127.0.0.1"
+)
+
+# Keep strict, explicitly provisioned certificate pinning working for automation.
+HOME="$run_dir/home" XDG_CONFIG_HOME="$run_dir/home/.config" target/debug/astra \
+  -p "${listen##*:}" \
+  --server-cert "$run_dir/server/host-cert.der" \
+  "$(id -un)@127.0.0.1" list >/dev/null
 
 default_shell="$({ printf 'echo SSH_STYLE_DEFAULT_SHELL\nexit\n'; sleep 1; } | "${client[@]}")"
 if ! printf '%s' "$default_shell" | rg -q 'SSH_STYLE_DEFAULT_SHELL'; then
@@ -93,9 +114,9 @@ if ! printf '%s' "$after" | rg -q 'WHILE_DETACHED'; then
 fi
 
 ssh-keygen -q -t ed25519 -N '' -C astra-unauthorized -f "$run_dir/id_unauthorized"
-if HOME="$run_dir/home" target/debug/astra \
+if HOME="$run_dir/home" XDG_CONFIG_HOME="$run_dir/home/.config" target/debug/astra \
   -p "${listen##*:}" \
-  --server-cert "$run_dir/server/host-cert.der" \
+  -o StrictHostKeyChecking=yes \
   -i "$run_dir/id_unauthorized" \
   "$(id -un)@127.0.0.1" list >/dev/null 2>&1; then
   echo "unauthorized key was unexpectedly accepted" >&2
