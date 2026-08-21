@@ -739,6 +739,14 @@ where
         Ok(())
     }
     .await;
+    if let Err(error) = &result {
+        let _ = write_terminal_event(
+            &mut send,
+            &info.id,
+            terminal_event::Event::Error(error.to_string()),
+        )
+        .await;
+    }
     terminal.release_lease(&lease_id);
     let _ = send.shutdown().await;
     result
