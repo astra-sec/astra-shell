@@ -13,6 +13,7 @@ Astra Shell 是一个以 QUIC 连接多个持久 PTY 的远程终端原型。`as
 - root gateway 不创建 PTY，只代理认证后的协议字节流；
 - 一条 QUIC 连接上的多个独立双向请求流；
 - 创建、列出、附着和关闭多个 PTY；
+- 每个新 PTY 传递客户端 `TERM` 与白名单 `LANG`/`LANGUAGE`/`LC_*`，不可用时回退服务端 UTF-8 locale，并开启 `IUTF8` 输入处理；
 - 可靠、有序的输入、输出和 resize；
 - 单写者输入租约及 fencing ID、命令序列号；
 - 客户端断开后 PTY 继续运行，重新附着时恢复最近 1 MiB 原始输出；
@@ -104,6 +105,8 @@ Rootless 模式使用 `state/authorized_keys`，daemon 只能代表启动它的 
 
 支持的 SSH 风格选项是 `StrictHostKeyChecking=yes|ask|accept-new|no` 和 `UserKnownHostsFile=PATH`。默认是 `ask`。需要由配置管理系统严格下发证书时，仍可使用 `--server-cert /path/to/host-cert.der`，此时执行标准 TLS 证书和名称校验，不使用 TOFU。
 
+创建终端时，客户端会像 SSH 一样发送当前 `TERM` 和 locale。服务端只接受固定白名单中的 `LANG`、`LANGUAGE` 和标准 `LC_*`，不会接收 `PATH`、动态链接器或任意环境变量。客户端 locale 在服务端不存在或不是 UTF-8 时，服务端使用 `C.UTF-8`/`C.utf8` 等可用 UTF-8 locale；如果服务端完全没有 UTF-8 locale，则拒绝创建 PTY，并返回明确错误。
+
 交互附着时按 `Ctrl+]` 只分离客户端，不结束远端进程。`--read-only` 创建观察者；已有写入者时，可显式使用 `--takeover` 获取新的 fencing lease。
 
 ## Managed 多用户模式
@@ -161,7 +164,7 @@ cargo clippy --all-targets -- -D warnings
 ./scripts/managed-smoke.sh
 ```
 
-两个 smoke test 都只在 `.local-test/` 内生成一次性服务端、SSH 密钥、Astra known-hosts 和数据库。它们会验证首次 `accept-new`、后续严格主机校验以及显式证书 pin。Managed 测试还会验证目标 UID、跨账户拒绝以及 gateway 重启后 PTY 恢复。
+两个 smoke test 都只在 `.local-test/` 内生成一次性服务端、SSH 密钥、Astra known-hosts 和数据库。它们会验证首次 `accept-new`、后续严格主机校验以及显式证书 pin。Managed 测试还会验证目标 UID、跨账户拒绝、UTF-8 locale fallback、`TERM`/`IUTF8` 以及 gateway 重启后 PTY 恢复。
 
 ## MVP 边界
 

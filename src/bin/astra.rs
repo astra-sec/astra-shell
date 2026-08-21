@@ -9,8 +9,8 @@ use astra_shell::{
     client::{AstraClient, ServerTrust},
     known_hosts::{StrictHostKeyChecking, default_known_hosts_file},
     protocol::{
-        Resize, SpawnRequest, TerminalCommand, WireMessage, read_message, terminal_command,
-        terminal_event, wire_message, write_message,
+        EnvironmentVariable, LOCALE_ENVIRONMENT_VARIABLES, Resize, SpawnRequest, TerminalCommand,
+        WireMessage, read_message, terminal_command, terminal_event, wire_message, write_message,
     },
 };
 use clap::{Args, Parser, Subcommand};
@@ -134,6 +134,8 @@ async fn run() -> Result<()> {
                     cwd: String::new(),
                     rows: 24,
                     cols: 80,
+                    term: client_term()?,
+                    environment: client_locale_environment()?,
                 })
                 .await?;
             attach_terminal(&client, terminal.id, false, false).await?;
@@ -164,6 +166,8 @@ async fn run() -> Result<()> {
                     cwd: arguments.cwd,
                     rows: arguments.rows,
                     cols: arguments.cols,
+                    term: client_term()?,
+                    environment: client_locale_environment()?,
                 })
                 .await?;
             println!("{}", terminal.id);
@@ -360,6 +364,34 @@ fn default_username() -> String {
         .or_else(|_| std::env::var("LOGNAME"))
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown".into())
+}
+
+fn client_term() -> Result<String> {
+    match std::env::var_os("TERM") {
+        Some(value) => value
+            .into_string()
+            .map_err(|_| anyhow!("TERM is not valid UTF-8")),
+        None => Ok("xterm-256color".into()),
+    }
+}
+
+fn client_locale_environment() -> Result<Vec<EnvironmentVariable>> {
+    let mut environment = Vec::new();
+    for &name in LOCALE_ENVIRONMENT_VARIABLES {
+        let Some(value) = std::env::var_os(name) else {
+            continue;
+        };
+        let value = value
+            .into_string()
+            .map_err(|_| anyhow!("{name} is not valid UTF-8"))?;
+        if !value.is_empty() {
+            environment.push(EnvironmentVariable {
+                name: name.into(),
+                value,
+            });
+        }
+    }
+    Ok(environment)
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]

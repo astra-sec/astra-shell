@@ -502,6 +502,8 @@ message TerminalInput {
 argv[] · cwd · env delta · rows/cols · pixels · TERM · locale · restart policy
 ```
 
+`TERM` 与 locale 属于每次 Terminal 创建参数，而不是长期 worker 的全局环境。客户端发送 `TERM` 及 `LANG`/`LANGUAGE`/标准 `LC_*`；服务端按白名单验证，并确认目标 locale 已安装且为 UTF-8，否则回退到服务端可用的 UTF-8 locale。PTY 开启 `IUTF8`。任意环境变量透传和继承 gateway 全部环境都不允许。
+
 禁止把未转义字符串拼成 `$SHELL -c`；只有用户明确请求 shell command 模式时才调用 shell。Unix MVP 使用 `forkpty/openpty + execve`，后续可评估 `portable-pty` 以支持 ConPTY。
 
 ### 8.2 布局归客户端

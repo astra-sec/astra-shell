@@ -49,6 +49,12 @@ message SpawnRequest {
   string cwd = 3;
   uint32 rows = 4;
   uint32 cols = 5;
+  string term = 6;
+  repeated EnvironmentVariable environment = 7;
+}
+message EnvironmentVariable {
+  string name = 1;
+  string value = 2;
 }
 message AttachRequest {
   string terminal_id = 1;

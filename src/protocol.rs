@@ -3,6 +3,23 @@ use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
+pub const LOCALE_ENVIRONMENT_VARIABLES: &[&str] = &[
+    "LANG",
+    "LANGUAGE",
+    "LC_CTYPE",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_COLLATE",
+    "LC_MONETARY",
+    "LC_MESSAGES",
+    "LC_PAPER",
+    "LC_NAME",
+    "LC_ADDRESS",
+    "LC_TELEPHONE",
+    "LC_MEASUREMENT",
+    "LC_IDENTIFICATION",
+    "LC_ALL",
+];
 
 #[derive(Clone, PartialEq, Message)]
 pub struct WireMessage {
@@ -107,6 +124,18 @@ pub struct SpawnRequest {
     pub rows: u32,
     #[prost(uint32, tag = "5")]
     pub cols: u32,
+    #[prost(string, tag = "6")]
+    pub term: String,
+    #[prost(message, repeated, tag = "7")]
+    pub environment: Vec<EnvironmentVariable>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct EnvironmentVariable {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, tag = "2")]
+    pub value: String,
 }
 
 #[derive(Clone, PartialEq, Message)]

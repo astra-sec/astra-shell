@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
+    ffi::CString,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
@@ -9,14 +10,25 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::broadcast;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     database::Database,
-    protocol::{SpawnRequest, TerminalInfo},
+    protocol::{EnvironmentVariable, LOCALE_ENVIRONMENT_VARIABLES, SpawnRequest, TerminalInfo},
 };
 
 const HISTORY_LIMIT: usize = 1024 * 1024;
+const MAX_TERM_LENGTH: usize = 64;
+const MAX_LOCALE_VALUE_LENGTH: usize = 256;
+const SAFE_BASE_ENVIRONMENT: &[&str] = &["HOME", "USER", "LOGNAME", "SHELL", "PATH"];
+const UTF8_LOCALE_FALLBACKS: &[&str] = &["C.UTF-8", "C.utf8", "UTF-8", "en_US.UTF-8"];
+
+struct PreparedTerminalEnvironment {
+    term: String,
+    locale: Vec<EnvironmentVariable>,
+    used_locale_fallback: bool,
+}
 
 #[derive(Clone, Debug)]
 pub enum PtyEvent {
@@ -187,6 +199,8 @@ impl TerminalManager {
             bail!("terminal dimensions must be between 1 and 1000")
         }
 
+        let terminal_environment =
+            prepare_terminal_environment(&request.term, &request.environment)?;
         let cwd = self.resolve_cwd(&request.cwd)?;
         let argv = if request.argv.is_empty() {
             vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())]
@@ -211,12 +225,31 @@ impl TerminalManager {
                 pixel_height: 0,
             })
             .context("failed to allocate PTY")?;
+        enable_iutf8(pty.master.as_ref())?;
 
         let mut command = CommandBuilder::new(&argv[0]);
         command.args(&argv[1..]);
         command.cwd(&cwd);
-        command.env("TERM", "xterm-256color");
+        command.env_clear();
+        for &name in SAFE_BASE_ENVIRONMENT {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        if command.get_env("PATH").is_none() {
+            command.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+        }
+        command.env("TERM", &terminal_environment.term);
+        for variable in &terminal_environment.locale {
+            command.env(&variable.name, &variable.value);
+        }
         command.env("ASTRA_TERMINAL_ID", &id);
+        if terminal_environment.used_locale_fallback {
+            warn!(
+                terminal_id = %id,
+                "client locale is missing, unavailable, or not UTF-8; using a server UTF-8 fallback"
+            );
+        }
         let mut child = pty
             .slave
             .spawn_command(command)
@@ -284,6 +317,154 @@ impl TerminalManager {
     }
 }
 
+fn prepare_terminal_environment(
+    requested_term: &str,
+    requested_locale: &[EnvironmentVariable],
+) -> Result<PreparedTerminalEnvironment> {
+    let term = if requested_term.is_empty() {
+        "xterm-256color".to_owned()
+    } else {
+        requested_term.to_owned()
+    };
+    if term.len() > MAX_TERM_LENGTH
+        || !term
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.+".contains(&byte))
+    {
+        bail!("invalid TERM value")
+    }
+    if requested_locale.len() > LOCALE_ENVIRONMENT_VARIABLES.len() {
+        bail!("too many locale environment variables")
+    }
+
+    let mut locale = BTreeMap::new();
+    for variable in requested_locale {
+        if !LOCALE_ENVIRONMENT_VARIABLES.contains(&variable.name.as_str()) {
+            bail!("environment variable {} is not allowed", variable.name)
+        }
+        if variable.value.is_empty()
+            || variable.value.len() > MAX_LOCALE_VALUE_LENGTH
+            || !variable
+                .value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.@:".contains(&byte))
+        {
+            bail!("invalid value for locale variable {}", variable.name)
+        }
+        if locale
+            .insert(variable.name.clone(), variable.value.clone())
+            .is_some()
+        {
+            bail!("duplicate locale variable {}", variable.name)
+        }
+    }
+
+    let effective_ctype = locale
+        .get("LC_ALL")
+        .or_else(|| locale.get("LC_CTYPE"))
+        .or_else(|| locale.get("LANG"));
+    let locale_is_usable = effective_ctype.is_some_and(|value| locale_name_is_utf8(value))
+        && locale
+            .iter()
+            .filter(|(name, _)| name.as_str() != "LANGUAGE")
+            .all(|(_, value)| locale_is_available(value));
+
+    let (locale, used_locale_fallback) = if locale_is_usable {
+        (
+            locale
+                .into_iter()
+                .map(|(name, value)| EnvironmentVariable { name, value })
+                .collect(),
+            false,
+        )
+    } else {
+        let fallback = UTF8_LOCALE_FALLBACKS
+            .iter()
+            .copied()
+            .find(|value| locale_is_available(value))
+            .context("server has no supported UTF-8 locale")?;
+        (
+            vec![
+                EnvironmentVariable {
+                    name: "LANG".into(),
+                    value: fallback.into(),
+                },
+                EnvironmentVariable {
+                    name: "LC_CTYPE".into(),
+                    value: fallback.into(),
+                },
+            ],
+            true,
+        )
+    };
+
+    Ok(PreparedTerminalEnvironment {
+        term,
+        locale,
+        used_locale_fallback,
+    })
+}
+
+fn locale_name_is_utf8(value: &str) -> bool {
+    value
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .windows(4)
+        .any(|window| window == b"utf8")
+}
+
+#[cfg(unix)]
+fn locale_is_available(value: &str) -> bool {
+    let Ok(value) = CString::new(value) else {
+        return false;
+    };
+    // SAFETY: newlocale reads the NUL-terminated string and returns an
+    // independent locale object. It does not mutate the process-global locale.
+    let locale = unsafe {
+        nix::libc::newlocale(nix::libc::LC_ALL_MASK, value.as_ptr(), std::ptr::null_mut())
+    };
+    if locale.is_null() {
+        return false;
+    }
+    // SAFETY: locale is a valid object returned by newlocale and is freed once.
+    unsafe { nix::libc::freelocale(locale) };
+    true
+}
+
+#[cfg(not(unix))]
+fn locale_is_available(value: &str) -> bool {
+    locale_name_is_utf8(value)
+}
+
+#[cfg(unix)]
+fn enable_iutf8(master: &dyn MasterPty) -> Result<()> {
+    let descriptor = master
+        .as_raw_fd()
+        .context("PTY backend does not expose a terminal descriptor")?;
+    // SAFETY: descriptor is owned by master and remains valid for both calls.
+    // tcgetattr initializes the termios structure before it is read.
+    unsafe {
+        let mut attributes = std::mem::MaybeUninit::<nix::libc::termios>::uninit();
+        if nix::libc::tcgetattr(descriptor, attributes.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to read PTY attributes");
+        }
+        let mut attributes = attributes.assume_init();
+        attributes.c_iflag |= nix::libc::IUTF8;
+        if nix::libc::tcsetattr(descriptor, nix::libc::TCSANOW, &attributes) != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to enable UTF-8 PTY input handling");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn enable_iutf8(_master: &dyn MasterPty) -> Result<()> {
+    Ok(())
+}
+
 fn start_reader(terminal: Arc<Terminal>, mut reader: Box<dyn Read + Send>) {
     std::thread::Builder::new()
         .name(format!("astra-pty-{}", &terminal.info().id[..8]))
@@ -347,4 +528,105 @@ fn start_child_monitor(terminal: Arc<Terminal>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn variable(name: &str, value: &str) -> EnvironmentVariable {
+        EnvironmentVariable {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+
+    fn available_utf8_locale() -> &'static str {
+        UTF8_LOCALE_FALLBACKS
+            .iter()
+            .copied()
+            .find(|value| locale_is_available(value))
+            .expect("tests require a UTF-8 locale")
+    }
+
+    #[test]
+    fn preserves_an_available_client_utf8_locale_and_term() {
+        let locale = available_utf8_locale();
+        let prepared = prepare_terminal_environment(
+            "tmux-256color",
+            &[
+                variable("LANG", locale),
+                variable("LC_CTYPE", locale),
+                variable("LC_TIME", "C"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(prepared.term, "tmux-256color");
+        assert!(!prepared.used_locale_fallback);
+        assert!(
+            prepared
+                .locale
+                .iter()
+                .any(|entry| entry.name == "LC_CTYPE" && entry.value == locale)
+        );
+    }
+
+    #[test]
+    fn falls_back_when_client_locale_is_missing_non_utf8_or_unavailable() {
+        for requested in [
+            Vec::new(),
+            vec![variable("LANG", "C")],
+            vec![variable("LANG", "astra_MISSING.UTF-8")],
+        ] {
+            let prepared = prepare_terminal_environment("", &requested).unwrap();
+            assert_eq!(prepared.term, "xterm-256color");
+            assert!(prepared.used_locale_fallback);
+            assert!(
+                prepared
+                    .locale
+                    .iter()
+                    .any(|entry| { entry.name == "LC_CTYPE" && locale_name_is_utf8(&entry.value) })
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unapproved_or_malformed_environment() {
+        assert!(
+            prepare_terminal_environment(
+                "xterm-256color",
+                &[variable("LD_PRELOAD", "/tmp/library.so")],
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_terminal_environment(
+                "xterm-256color",
+                &[variable("LANG", "C.UTF-8"), variable("LANG", "C.UTF-8")],
+            )
+            .is_err()
+        );
+        assert!(prepare_terminal_environment("bad term", &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enables_utf8_input_handling_on_the_pty() {
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        enable_iutf8(pty.master.as_ref()).unwrap();
+        let descriptor = pty.master.as_raw_fd().unwrap();
+        // SAFETY: descriptor remains owned by pty for the duration of the call.
+        unsafe {
+            let mut attributes = std::mem::MaybeUninit::<nix::libc::termios>::uninit();
+            assert_eq!(nix::libc::tcgetattr(descriptor, attributes.as_mut_ptr()), 0);
+            assert_ne!(attributes.assume_init().c_iflag & nix::libc::IUTF8, 0);
+        }
+    }
 }

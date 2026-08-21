@@ -78,6 +78,39 @@ start_gateway() {
 start_gateway "$run_dir/gateway-1.log"
 "${client[@]}" list >/dev/null
 
+unicode_output="$(
+  { sleep 1; } | \
+    LC_ALL=astra_MISSING.UTF-8 TERM=astra-test-256color \
+      "${client[@]}" new --attach -- /bin/sh -c \
+    'printf "TERM=%s\n" "$TERM"; printf "CHARMAP="; locale charmap; printf "中文测试\n"; stty -a | grep -Eq "(^|[ ;])iutf8([ ;]|$)" && printf "IUTF8=on\n"'
+)"
+if ! printf '%s' "$unicode_output" | rg -q 'TERM=astra-test-256color'; then
+  echo "client TERM was not propagated to the managed PTY" >&2
+  exit 1
+fi
+if ! printf '%s' "$unicode_output" | rg -qi 'CHARMAP=UTF-?8'; then
+  echo "unavailable client locale did not fall back to server UTF-8" >&2
+  exit 1
+fi
+if ! printf '%s' "$unicode_output" | rg -q '中文测试'; then
+  echo "UTF-8 terminal output was not preserved" >&2
+  exit 1
+fi
+if ! printf '%s' "$unicode_output" | rg -q 'IUTF8=on'; then
+  echo "managed PTY did not enable IUTF8 input handling" >&2
+  exit 1
+fi
+
+erase_output="$(
+  { printf '中\177A\n'; sleep 1; } | \
+    "${client[@]}" new --attach -- /bin/sh -c \
+    'IFS= read -r line; hex="$(printf %s "$line" | od -An -tx1 | tr -d " \n")"; printf "INPUT_HEX=%s\n" "$hex"'
+)"
+if ! printf '%s' "$erase_output" | rg -q 'INPUT_HEX=41'; then
+  echo "IUTF8 did not erase a complete multibyte input character" >&2
+  exit 1
+fi
+
 observed_uid="$("${client[@]}" new --attach -- /usr/bin/id -u)"
 if ! printf '%s' "$observed_uid" | rg -q "(^|[^0-9])$uid([^0-9]|$)"; then
   echo "worker did not run the PTY as UID $uid" >&2
