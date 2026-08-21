@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::{
     ALPN, PROTOCOL_VERSION,
@@ -361,26 +361,24 @@ async fn authenticate_connection(
     state: &ServerState,
     connection: &quinn::Connection,
 ) -> Result<(String, String, ConnectionBackend)> {
-    let (mut auth_send, mut auth_recv) = connection
-        .accept_bi()
-        .await
-        .context("client did not open authentication stream")?;
-    let username = match read_message(&mut auth_recv).await? {
-        Some(WireMessage {
+    let (mut auth_send, mut auth_recv, first_message) =
+        accept_authentication_stream(connection).await?;
+    let username = match first_message {
+        WireMessage {
             body: Some(wire_message::Body::ClientHello(hello)),
-        }) if hello.protocol_version == PROTOCOL_VERSION && !hello.username.is_empty() => {
+        } if hello.protocol_version == PROTOCOL_VERSION && !hello.username.is_empty() => {
             hello.username
         }
-        Some(WireMessage {
+        WireMessage {
             body: Some(wire_message::Body::ClientHello(hello)),
-        }) if hello.protocol_version != PROTOCOL_VERSION => bail!(
+        } if hello.protocol_version != PROTOCOL_VERSION => bail!(
             "client protocol version {} is incompatible with server version {}",
             hello.protocol_version,
             PROTOCOL_VERSION
         ),
-        Some(WireMessage {
+        WireMessage {
             body: Some(wire_message::Body::ClientHello(_)),
-        }) => bail!("ClientHello has no target Unix username"),
+        } => bail!("ClientHello has no target Unix username"),
         _ => bail!("expected ClientHello"),
     };
 
@@ -439,6 +437,47 @@ async fn authenticate_connection(
         }
     };
     Ok((username, fingerprint, backend))
+}
+
+async fn accept_authentication_stream(
+    connection: &quinn::Connection,
+) -> Result<(quinn::SendStream, quinn::RecvStream, WireMessage)> {
+    // Apple's NWConnectionGroup reserves an empty client-initiated bidi stream
+    // for the group data flow, so the first application stream can have index
+    // 1. Read a small bounded set concurrently and use the first stream that
+    // actually sends a protocol frame. The outer authentication timeout still
+    // bounds the lifetime of this work.
+    const MAX_PENDING_STREAMS: usize = 8;
+    let mut pending = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = connection.accept_bi(), if pending.len() < MAX_PENDING_STREAMS => {
+                let (send, mut recv) = accepted
+                    .context("client did not open authentication stream")?;
+                trace!(stream_id = %recv.id(), "accepted authentication candidate stream");
+                pending.spawn(async move {
+                    let message = read_message(&mut recv).await;
+                    (send, recv, message)
+                });
+            }
+            completed = pending.join_next(), if !pending.is_empty() => {
+                let (send, recv, message) = completed
+                    .context("authentication stream reader set ended unexpectedly")?
+                    .context("authentication stream reader task failed")?;
+                match message? {
+                    Some(message) => {
+                        trace!(stream_id = %recv.id(), "received first authentication stream frame");
+                        // Keep unread reserved streams alive for the connection;
+                        // dropping them here would reset a Network.framework
+                        // group flow that the Apple client still owns.
+                        pending.detach_all();
+                        return Ok((send, recv, message));
+                    }
+                    None => continue,
+                }
+            }
+        }
+    }
 }
 
 fn authenticate_user(
