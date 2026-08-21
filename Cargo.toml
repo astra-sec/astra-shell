@@ -1,0 +1,40 @@
+[package]
+name = "astra-shell"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Persistent multi-terminal shell over QUIC"
+
+[lib]
+name = "astra_shell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "astra"
+path = "src/bin/astra.rs"
+
+[[bin]]
+name = "astrad"
+path = "src/bin/astrad.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
+nix = { version = "0.31", features = ["fs", "user"] }
+prost = "0.14"
+portable-pty = "0.9"
+quinn = "0.11"
+rand = "0.9"
+rcgen = "0.14"
+rusqlite = { version = "0.40", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+serde_json = "1.0"
+ssh-key = { version = "0.6.7", features = ["ed25519", "getrandom"] }
+tokio = { version = "1.47", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.18", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.21"

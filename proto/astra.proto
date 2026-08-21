@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package astra.v1;
+
+message WireMessage {
+  oneof body {
+    ServerHello server_hello = 1;
+    AuthRequest auth_request = 2;
+    AuthResult auth_result = 3;
+    Request request = 4;
+    Response response = 5;
+    TerminalCommand terminal_command = 6;
+    TerminalEvent terminal_event = 7;
+    ClientHello client_hello = 8;
+  }
+}
+
+message ClientHello {
+  uint32 protocol_version = 1;
+  string username = 2;
+}
+message ServerHello {
+  uint32 protocol_version = 1;
+  bytes challenge = 2;
+  string server_instance = 3;
+}
+message AuthRequest {
+  string public_key = 1;
+  string signature_pem = 2;
+}
+message AuthResult {
+  bool ok = 1;
+  string message = 2;
+}
+
+message Request {
+  string request_id = 1;
+  oneof command {
+    ListRequest list = 10;
+    SpawnRequest spawn = 11;
+    AttachRequest attach = 12;
+    CloseRequest close = 13;
+  }
+}
+message ListRequest {}
+message SpawnRequest {
+  string name = 1;
+  repeated string argv = 2;
+  string cwd = 3;
+  uint32 rows = 4;
+  uint32 cols = 5;
+}
+message AttachRequest {
+  string terminal_id = 1;
+  bool read_only = 2;
+  bool takeover = 3;
+}
+message CloseRequest { string terminal_id = 1; }
+
+message Response {
+  string request_id = 1;
+  oneof result {
+    ListResponse list = 10;
+    SpawnResponse spawn = 11;
+    AttachResponse attach = 12;
+    AckResponse ack = 13;
+    ErrorResponse error = 14;
+  }
+}
+message TerminalInfo {
+  string id = 1;
+  string name = 2;
+  repeated string argv = 3;
+  string cwd = 4;
+  string status = 5;
+  optional int32 exit_code = 6;
+  uint32 rows = 7;
+  uint32 cols = 8;
+}
+message ListResponse { repeated TerminalInfo terminals = 1; }
+message SpawnResponse { TerminalInfo terminal = 1; }
+message AttachResponse {
+  TerminalInfo terminal = 1;
+  string lease_id = 2;
+  bool read_only = 3;
+  bytes history = 4;
+}
+message AckResponse { string message = 1; }
+message ErrorResponse {
+  string code = 1;
+  string message = 2;
+}
+
+message TerminalCommand {
+  string terminal_id = 1;
+  string lease_id = 2;
+  uint64 sequence = 3;
+  oneof command {
+    bytes input = 10;
+    Resize resize = 11;
+    bool detach = 12;
+  }
+}
+message Resize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+message TerminalEvent {
+  string terminal_id = 1;
+  oneof event {
+    bytes output = 10;
+    int32 exited = 11;
+    string error = 12;
+  }
+}

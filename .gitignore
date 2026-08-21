@@ -1,0 +1,6 @@
+/target/
+/.cargo-home/
+/.local-test/
+/state/
+*.db-shm
+*.db-wal
