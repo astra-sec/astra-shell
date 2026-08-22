@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     ffi::CString,
+    fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
@@ -13,12 +14,12 @@ use tokio::sync::broadcast;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{
-    database::Database,
-    protocol::{EnvironmentVariable, LOCALE_ENVIRONMENT_VARIABLES, SpawnRequest, TerminalInfo},
+use crate::protocol::{
+    EnvironmentVariable, LOCALE_ENVIRONMENT_VARIABLES, SpawnRequest, TerminalInfo,
 };
 
 const HISTORY_LIMIT: usize = 1024 * 1024;
+const EXITED_TERMINAL_RETENTION: Duration = Duration::from_secs(60);
 const MAX_TERM_LENGTH: usize = 64;
 const MAX_LOCALE_VALUE_LENGTH: usize = 256;
 const SAFE_BASE_ENVIRONMENT: &[&str] = &["HOME", "USER", "LOGNAME", "SHELL", "PATH"];
@@ -51,7 +52,6 @@ pub struct Terminal {
     history: Mutex<VecDeque<u8>>,
     events: broadcast::Sender<PtyEvent>,
     lease: Mutex<Option<Lease>>,
-    database: Database,
 }
 
 impl Terminal {
@@ -126,7 +126,6 @@ impl Terminal {
             info.rows = rows;
             info.cols = cols;
         }
-        self.database.update_size(&self.info().id, rows, cols)?;
         lease
             .as_mut()
             .expect("validated lease disappeared")
@@ -164,24 +163,31 @@ impl Terminal {
 #[derive(Clone)]
 pub struct TerminalManager {
     terminals: Arc<RwLock<HashMap<String, Arc<Terminal>>>>,
-    database: Database,
     session_root: PathBuf,
 }
 
 impl TerminalManager {
-    pub fn new(database: Database, session_root: PathBuf) -> Result<Self> {
+    pub fn new(session_root: PathBuf) -> Result<Self> {
         let session_root = session_root
             .canonicalize()
             .with_context(|| format!("invalid session root {}", session_root.display()))?;
         Ok(Self {
             terminals: Arc::new(RwLock::new(HashMap::new())),
-            database,
             session_root,
         })
     }
 
-    pub fn list(&self) -> Result<Vec<TerminalInfo>> {
-        self.database.list_terminals()
+    pub fn list(&self) -> Vec<TerminalInfo> {
+        let mut terminals: Vec<_> = self
+            .terminals
+            .read()
+            .expect("terminal registry poisoned")
+            .values()
+            .map(|terminal| terminal.info())
+            .filter(|terminal| terminal.status == "running")
+            .collect();
+        terminals.sort_by(|left, right| left.id.cmp(&right.id));
+        terminals
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Terminal>> {
@@ -251,7 +257,7 @@ impl TerminalManager {
                 "client locale is missing, unavailable, or not UTF-8; using a server UTF-8 fallback"
             );
         }
-        let mut child = pty
+        let child = pty
             .slave
             .spawn_command(command)
             .with_context(|| format!("failed to spawn {}", argv[0]))?;
@@ -269,11 +275,6 @@ impl TerminalManager {
             rows,
             cols,
         };
-        if let Err(error) = self.database.insert_terminal(&info) {
-            let _ = child.kill();
-            return Err(error);
-        }
-
         let terminal = Arc::new(Terminal {
             info: RwLock::new(info),
             master: Mutex::new(pty.master),
@@ -282,14 +283,13 @@ impl TerminalManager {
             history: Mutex::new(initial_terminal_history(default_shell)),
             events,
             lease: Mutex::new(None),
-            database: self.database.clone(),
         });
         self.terminals
             .write()
             .expect("terminal registry poisoned")
             .insert(id, terminal.clone());
         start_reader(terminal.clone(), reader);
-        start_child_monitor(terminal.clone());
+        start_child_monitor(terminal.clone(), self.terminals.clone());
         Ok(terminal)
     }
 
@@ -577,8 +577,12 @@ fn start_reader(terminal: Arc<Terminal>, mut reader: Box<dyn Read + Send>) {
         .expect("failed to start PTY reader thread");
 }
 
-fn start_child_monitor(terminal: Arc<Terminal>) {
+fn start_child_monitor(
+    terminal: Arc<Terminal>,
+    terminals: Arc<RwLock<HashMap<String, Arc<Terminal>>>>,
+) {
     tokio::spawn(async move {
+        let terminal_id = terminal.info().id;
         loop {
             let result = terminal
                 .child
@@ -593,21 +597,27 @@ fn start_child_monitor(terminal: Arc<Terminal>) {
                         info.status = "exited".into();
                         info.exit_code = Some(code);
                     }
-                    let _ =
-                        terminal
-                            .database
-                            .update_status(&terminal.info().id, "exited", Some(code));
                     let _ = terminal.events.send(PtyEvent::Exited(code));
                     break;
                 }
                 Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
                 Err(error) => {
+                    terminal
+                        .info
+                        .write()
+                        .expect("terminal info poisoned")
+                        .status = "lost".into();
                     let message = format!("failed to wait for terminal: {error}");
                     let _ = terminal.events.send(PtyEvent::Error(message));
                     break;
                 }
             }
         }
+        tokio::time::sleep(EXITED_TERMINAL_RETENTION).await;
+        terminals
+            .write()
+            .expect("terminal registry poisoned")
+            .remove(&terminal_id);
     });
 }
 

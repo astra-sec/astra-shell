@@ -50,7 +50,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// List known terminals, including exited and daemon-lost records.
+    /// List terminals that are active in the current daemon or user worker.
     List,
     /// Create a terminal. Arguments after `--` are executed directly, without a shell.
     New(NewArgs),

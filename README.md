@@ -9,7 +9,7 @@ Astra Shell 是一个以 QUIC 连接多个持久 PTY 的远程终端原型。`as
 - OpenSSH 私钥、SSHSIG challenge-response 和 `authorized_keys`；
 - 客户端选择目标 Unix 用户，签名同时绑定用户名、服务实例和随机 challenge；
 - managed gateway 按 passwd 数据库查找用户及其 `~/.ssh/authorized_keys`；
-- 每个 UID 独立的降权 worker、Unix socket、SQLite 和 PTY；
+- 每个 UID 独立的降权 worker、Unix socket 和 PTY；
 - root gateway 不创建 PTY，只代理认证后的协议字节流；
 - 一条 QUIC 连接上的多个独立双向请求流；
 - 创建、列出、附着和关闭多个 PTY；
@@ -18,7 +18,7 @@ Astra Shell 是一个以 QUIC 连接多个持久 PTY 的远程终端原型。`as
 - 可靠、有序的输入、输出和 resize；
 - 单写者输入租约及 fencing ID、命令序列号；
 - 客户端断开后 PTY 继续运行，重新附着时恢复最近 1 MiB 原始输出；
-- SQLite 保存 Terminal 元数据和退出状态；
+- 活动 Terminal 只以内存中实际持有的 PTY 为准，不保存可能失真的 `running` 记录；
 - QUIC keepalive、15 秒认证超时，以及 gateway/worker 单实例进程锁；
 - 工作目录边界，子进程 cwd 不能逃出服务端配置的 `session-root`。
 
@@ -41,7 +41,7 @@ ssh-keygen -t ed25519 -N '' -f state/id_ed25519
 install -m 600 state/id_ed25519.pub state/authorized_keys
 ```
 
-服务端证书、私钥、`authorized_keys`、SQLite 和客户端测试密钥都在 `state/` 中。服务端状态目录会设置为 `0700`，秘密文件设置为 `0600`。`host-cert.der` 是服务端主机身份的一部分，客户端不再需要复制或显式传入它。
+服务端证书、私钥、`authorized_keys` 和客户端测试密钥都在 `state/` 中。服务端状态目录会设置为 `0700`，秘密文件设置为 `0600`。`host-cert.der` 是服务端主机身份的一部分，客户端不再需要复制或显式传入它。
 
 ## Rootless 单用户模式
 
@@ -146,12 +146,14 @@ gateway 会检查 HOME、`.ssh` 和授权文件的所有者，拒绝符号链接
 
 ```text
 state/users/1001/session.sock
-state/users/1001/astra.db
+state/users/1001/worker.pid
 state/users/1002/session.sock
-state/users/1002/astra.db
+state/users/1002/worker.pid
 ```
 
 用户 worker 不随 gateway 退出，因此 gateway 可以滚动重启而不关闭用户 PTY。非 root 也可以启动 `--managed` 做测试，但只能登录当前 UID，不能切换到其他账户。
+
+`list` 只返回对应 worker 当前实际持有且仍在运行的 Terminal。进程退出后，最终输出会在内存中短暂保留以完成已发起的 attach，随后记录被清理；worker 或 rootless daemon 重启后不会从磁盘恢复历史 Terminal。
 
 `--authorized-keys-dir DIR` 是测试/集中式密钥目录选项，此时 gateway 读取 `DIR/USERNAME`；生产默认应沿用各用户的 `~/.ssh/authorized_keys`。
 
@@ -165,7 +167,7 @@ cargo clippy --all-targets -- -D warnings
 ./scripts/managed-smoke.sh
 ```
 
-两个 smoke test 都只在 `.local-test/` 内生成一次性服务端、SSH 密钥、Astra known-hosts 和数据库。它们会验证首次 `accept-new`、后续严格主机校验以及显式证书 pin。Managed 测试还会验证目标 UID、跨账户拒绝、UTF-8 locale fallback、`TERM`/`IUTF8` 以及 gateway 重启后 PTY 恢复。
+两个 smoke test 都只在 `.local-test/` 内生成一次性服务端、SSH 密钥和 Astra known-hosts。它们会验证首次 `accept-new`、后续严格主机校验以及显式证书 pin。Managed 测试还会验证目标 UID、跨账户拒绝、UTF-8 locale fallback、`TERM`/`IUTF8` 以及 gateway 重启后 PTY 恢复。
 
 ## MVP 边界
 

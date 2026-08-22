@@ -14,6 +14,10 @@ export CARGO_TARGET_DIR="$repo_dir/target"
 cd "$repo_dir"
 cargo build --bins
 target/debug/astrad init --state-dir "$run_dir/server"
+if find "$run_dir/server" -type f -name '*.db' -print -quit | rg -q .; then
+  echo "astrad init unexpectedly created a database" >&2
+  exit 1
+fi
 ssh-keygen -q -t ed25519 -N '' -C astra-smoke -f "$run_dir/home/.ssh/id_ed25519"
 install -m 600 "$run_dir/home/.ssh/id_ed25519.pub" "$run_dir/server/authorized_keys"
 
@@ -92,6 +96,10 @@ fi
 same_connection="$("${client[@]}" new --name same-connection --attach -- /bin/echo SAME_CONNECTION)"
 if ! printf '%s' "$same_connection" | rg -q 'SAME_CONNECTION'; then
   echo "spawn and attach did not work over one QUIC connection" >&2
+  exit 1
+fi
+if "${client[@]}" list | rg -q 'same-connection'; then
+  echo "list returned an exited terminal" >&2
   exit 1
 fi
 

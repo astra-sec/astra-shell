@@ -544,7 +544,7 @@ PTY 尺寸由 lease owner 控制。只读客户端按本地 viewport 做裁剪�
 
 - worker daemonize 后持有 PTY master；
 - 在 `$XDG_RUNTIME_DIR/qterm/<uid>/workers/<terminal-id>.sock` 接受 sessiond；
-- 元数据写入 SQLite WAL，worker 另写最小 runtime manifest；
+- 活动状态只来自 worker socket 握手，worker 另写最小 runtime manifest 用于发现；
 - sessiond 重启扫描 socket/manifest，通过 Unix peer credentials 验证并重新注册；
 - worker 崩溃只影响一个 Terminal；
 - sessiond 可滚动升级，不关闭 PTY。
@@ -643,7 +643,7 @@ PTY 尺寸由 lease owner 控制。只读客户端按本地 viewport 做裁剪�
 | QUIC | Quinn + rustls | 多流、DATAGRAM、rebind、迁移、优先级、纯 Rust |
 | Control schema | Prost/Protobuf | 跨语言、可演进、Mosh 已验证此方向 |
 | 压缩 | zstd | 快照和历史块，设置严格大小上限 |
-| 元数据 | SQLite WAL | 每用户 daemon，事务、迁移和恢复简单 |
+| 活动注册表 | worker 内存 + Unix socket | PTY 持有者是唯一真相，避免持久状态与运行状态分叉 |
 | 终端引擎 | `wezterm-term` 首选，接口隔离 | MIT、成熟的 cell/scrollback/现代转义支持 |
 | PTY | Unix 原生封装；评估 `portable-pty` | 先保证 Unix 正确性，再扩展 ConPTY |
 | 桌面 UI | Tauri 2 + xterm.js 作为首个参考客户端 | 快速跨平台；client-core 保持 UI 无关 |
@@ -780,7 +780,7 @@ duplicate/reorder(datagrams) never regresses generation
 - sessiond 升级并重新接管 worker；
 - worker 输出时客户端离线，随后请求历史；
 - 同一 Terminal 两客户端争抢尺寸和输入租约；
-- 磁盘满、SQLite WAL 损坏、runtime socket 遗留；
+- runtime socket/manifest 遗留、worker 握手失败；
 - gateway draining 与版本滚动升级。
 
 ### 13.5 安全测试
@@ -880,7 +880,7 @@ duplicate/reorder(datagrams) never regresses generation
 - 一连接多 Terminal；
 - 可靠 Stream 输出、输入、resize、signal、exit status；
 - detach/attach 和可靠完整快照；
-- workspace、input lease、SQLite 元数据；
+- workspace、input lease、仅由活动 worker 构成的运行时注册表；
 - SSH stdio fallback；
 - 基础配额、日志和 `qterm doctor`。
 

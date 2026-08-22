@@ -19,7 +19,6 @@ use tracing::{info, warn};
 
 use crate::{
     accounts::{SystemAccount, effective_uid},
-    database::Database,
     process_lock::ProcessLock,
     server::handle_worker_request,
     terminal::TerminalManager,
@@ -220,12 +219,15 @@ fn install_child_credentials(command: &mut Command, account: &SystemAccount) {
     // child immediately before exec and cannot affect the gateway process.
     unsafe {
         command.pre_exec(move || {
+            #[cfg(target_vendor = "apple")]
             let group_count = groups.len().try_into().map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "supplementary group list is too large",
                 )
             })?;
+            #[cfg(not(target_vendor = "apple"))]
+            let group_count = groups.len();
             if nix::libc::setgroups(group_count, groups.as_ptr()) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -256,9 +258,7 @@ pub async fn serve_worker(
     let pid_file = state_dir.join("worker.pid");
     fs::write(&pid_file, format!("{}\n", std::process::id()))?;
     fs::set_permissions(&pid_file, fs::Permissions::from_mode(0o600))?;
-    let database = Database::open(state_dir.join("astra.db"))?;
-    database.mark_interrupted()?;
-    let manager = TerminalManager::new(database, session_root)?;
+    let manager = TerminalManager::new(session_root)?;
     match fs::remove_file(&socket) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

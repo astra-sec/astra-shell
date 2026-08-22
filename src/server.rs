@@ -15,7 +15,6 @@ use crate::{
     ALPN, PROTOCOL_VERSION,
     accounts::{SystemAccount, authorized_key_files, effective_uid},
     auth::{authentication_payload, verify_authorized_key, verify_authorized_keys},
-    database::Database,
     process_lock::ProcessLock,
     protocol::{
         AckResponse, AttachResponse, AuthResult, ErrorResponse, ListResponse, Response,
@@ -32,7 +31,6 @@ pub struct ServerPaths {
     pub cert: PathBuf,
     pub key: PathBuf,
     pub authorized_keys: PathBuf,
-    pub database: PathBuf,
     pub instance_id: PathBuf,
 }
 
@@ -43,7 +41,6 @@ impl ServerPaths {
             cert: state_dir.join("host-cert.der"),
             key: state_dir.join("host-key.der"),
             authorized_keys: state_dir.join("authorized_keys"),
-            database: state_dir.join("astra.db"),
             instance_id: state_dir.join("instance-id"),
             state_dir,
         }
@@ -128,7 +125,6 @@ pub fn initialize_state(paths: &ServerPaths) -> Result<()> {
             0o644,
         )?;
     }
-    Database::open(&paths.database)?;
     Ok(())
 }
 
@@ -189,21 +185,11 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     }
     let _daemon_lock = ProcessLock::acquire(&options.paths.state_dir.join("gateway.lock"))?;
     let mode = match options.mode {
-        ServerMode::Rootless { session_root } => {
-            let database = Database::open(&options.paths.database)?;
-            let interrupted = database.mark_interrupted()?;
-            if interrupted > 0 {
-                warn!(
-                    interrupted,
-                    "marked terminals from an earlier rootless daemon as lost"
-                );
-            }
-            ModeState::Rootless {
-                account: SystemAccount::current()?,
-                manager: TerminalManager::new(database, session_root)?,
-                authorized_keys: options.paths.authorized_keys.clone(),
-            }
-        }
+        ServerMode::Rootless { session_root } => ModeState::Rootless {
+            account: SystemAccount::current()?,
+            manager: TerminalManager::new(session_root)?,
+            authorized_keys: options.paths.authorized_keys.clone(),
+        },
         ServerMode::Managed {
             authorized_keys_directory,
             session_root_override,
@@ -543,7 +529,7 @@ where
     let request_id = request.request_id.clone();
     match request.command {
         Some(request::Command::List(_)) => {
-            let terminals = manager.list()?;
+            let terminals = manager.list();
             send_response(
                 &mut send,
                 request_id,
