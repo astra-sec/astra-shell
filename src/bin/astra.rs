@@ -2,6 +2,7 @@ use std::{
     io::{IsTerminal, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,8 +10,9 @@ use astra_shell::{
     client::{AstraClient, ServerTrust},
     known_hosts::{StrictHostKeyChecking, default_known_hosts_file},
     protocol::{
-        EnvironmentVariable, LOCALE_ENVIRONMENT_VARIABLES, Resize, SpawnRequest, TerminalCommand,
-        WireMessage, read_message, terminal_command, terminal_event, wire_message, write_message,
+        AttachResponse, EnvironmentVariable, LOCALE_ENVIRONMENT_VARIABLES, Resize, SpawnRequest,
+        TerminalCommand, WireMessage, read_message, terminal_command, terminal_event, wire_message,
+        write_message,
     },
 };
 use clap::{Args, Parser, Subcommand};
@@ -146,7 +148,7 @@ async fn run() -> Result<()> {
                     environment: client_locale_environment()?,
                 })
                 .await?;
-            attach_terminal(&client, terminal.id, false, false).await?;
+            attach_terminal(client, terminal.id, false, false).await?;
         }
         Some(Command::List { long }) => {
             let terminals = client.list().await?;
@@ -195,12 +197,12 @@ async fn run() -> Result<()> {
                 .await?;
             println!("{}", terminal_reference(&terminal));
             if attach {
-                attach_terminal(&client, terminal.id, false, false).await?;
+                attach_terminal(client, terminal.id, false, false).await?;
             }
         }
         Some(Command::Attach(arguments)) => {
             attach_terminal(
-                &client,
+                client,
                 arguments.terminal_id,
                 arguments.read_only,
                 arguments.takeover,
@@ -215,13 +217,13 @@ async fn run() -> Result<()> {
 }
 
 async fn attach_terminal(
-    client: &AstraClient,
+    mut client: AstraClient,
     terminal_selector: String,
     read_only: bool,
     takeover: bool,
 ) -> Result<()> {
     let (mut send, mut recv, attached) = client
-        .attach(terminal_selector, read_only, takeover)
+        .attach(terminal_selector, read_only, takeover, String::new())
         .await?;
     let terminal_id = attached
         .terminal
@@ -229,6 +231,7 @@ async fn attach_terminal(
         .context("server returned an attach response without terminal identity")?
         .id
         .clone();
+    let mut resume_token = attached.resume_token.clone();
     std::io::stdout().write_all(&attached.history)?;
     std::io::stdout().flush()?;
 
@@ -241,114 +244,223 @@ async fn attach_terminal(
     };
     let mut stdin = tokio::io::stdin();
     let mut input = [0_u8; 16 * 1024];
-    let mut sequence = 1_u64;
     let mut window_changes = window_change_source()?;
+    let mut lease_id = attached.lease_id;
 
-    if !read_only {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let _ = send_terminal_command(
-            &mut send,
-            TerminalCommand {
-                terminal_id: terminal_id.clone(),
-                lease_id: attached.lease_id.clone(),
-                sequence,
-                command: Some(terminal_command::Command::Resize(Resize {
-                    rows: rows as u32,
-                    cols: cols as u32,
-                })),
-            },
-        )
-        .await;
-        sequence += 1;
-    }
+    'attachment: loop {
+        let mut sequence = 1_u64;
+        let initial_disconnect = if !read_only {
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            match send_terminal_command(
+                &mut send,
+                TerminalCommand {
+                    terminal_id: terminal_id.clone(),
+                    lease_id: lease_id.clone(),
+                    sequence,
+                    command: Some(terminal_command::Command::Resize(Resize {
+                        rows: rows as u32,
+                        cols: cols as u32,
+                    })),
+                },
+            )
+            .await
+            {
+                Ok(()) => {
+                    sequence += 1;
+                    None
+                }
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
 
-    loop {
-        tokio::select! {
-            incoming = read_message(&mut recv) => {
-                match incoming? {
-                    Some(WireMessage { body: Some(wire_message::Body::TerminalEvent(event)) }) => {
-                        if event.terminal_id != terminal_id {
-                            bail!("server sent an event for the wrong terminal")
-                        }
-                        match event.event {
-                            Some(terminal_event::Event::Output(bytes)) => {
-                                std::io::stdout().write_all(&bytes)?;
-                                std::io::stdout().flush()?;
+        let disconnect = if let Some(error) = initial_disconnect {
+            error
+        } else {
+            loop {
+                let disconnect = tokio::select! {
+                    incoming = read_message(&mut recv) => {
+                        match incoming {
+                            Ok(Some(WireMessage { body: Some(wire_message::Body::TerminalEvent(event)) })) => {
+                                if event.terminal_id != terminal_id {
+                                    return Err(anyhow!("server sent an event for the wrong terminal"));
+                                }
+                                match event.event {
+                                    Some(terminal_event::Event::Output(bytes)) => {
+                                        std::io::stdout().write_all(&bytes)?;
+                                        std::io::stdout().flush()?;
+                                    }
+                                    Some(terminal_event::Event::Exited(code)) => {
+                                        eprintln!("\r\n[astra: terminal exited with status {code}]");
+                                        let _ = send.finish();
+                                        let _ = read_message(&mut recv).await;
+                                        return Ok(());
+                                    }
+                                    Some(terminal_event::Event::Error(message)) => {
+                                        eprintln!("\r\n[astra: {message}]");
+                                    }
+                                    None => {}
+                                }
+                                continue;
                             }
-                            Some(terminal_event::Event::Exited(code)) => {
-                                eprintln!("\r\n[astra: terminal exited with status {code}]");
-                                let _ = send.finish();
-                                let _ = read_message(&mut recv).await;
-                                break;
-                            }
-                            Some(terminal_event::Event::Error(message)) => {
-                                eprintln!("\r\n[astra: {message}]");
-                            }
-                            None => {}
+                            Ok(Some(_)) => return Err(anyhow!("unexpected message on attach stream")),
+                            Ok(None) => anyhow!("attachment stream ended"),
+                            Err(error) => error,
                         }
                     }
-                    Some(_) => bail!("unexpected message on attach stream"),
-                    None => break,
+                    read = stdin.read(&mut input), if !read_only => {
+                        let length = read?;
+                        if length == 0 || (interactive && input[..length].contains(&0x1d)) {
+                            let _ = send_terminal_command(
+                                &mut send,
+                                TerminalCommand {
+                                    terminal_id: terminal_id.clone(),
+                                    lease_id: lease_id.clone(),
+                                    sequence,
+                                    command: Some(terminal_command::Command::Detach(true)),
+                                },
+                            ).await;
+                            let _ = send.finish();
+                            return Ok(());
+                        }
+                        match send_terminal_command(
+                            &mut send,
+                            TerminalCommand {
+                                terminal_id: terminal_id.clone(),
+                                lease_id: lease_id.clone(),
+                                sequence,
+                                command: Some(terminal_command::Command::Input(input[..length].to_vec())),
+                            },
+                        ).await {
+                            Ok(()) => {
+                                sequence += 1;
+                                continue;
+                            }
+                            Err(error) => error,
+                        }
+                    }
+                    _ = wait_for_window_change(&mut window_changes), if interactive => {
+                        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                        match send_terminal_command(
+                            &mut send,
+                            TerminalCommand {
+                                terminal_id: terminal_id.clone(),
+                                lease_id: lease_id.clone(),
+                                sequence,
+                                command: Some(terminal_command::Command::Resize(Resize {
+                                    rows: rows as u32,
+                                    cols: cols as u32,
+                                })),
+                            },
+                        ).await {
+                            Ok(()) => {
+                                sequence += 1;
+                                continue;
+                            }
+                            Err(error) => error,
+                        }
+                    }
+                };
+                break disconnect;
+            }
+        };
+        eprintln!("\r\n[astra: connection lost ({disconnect:#}); reconnecting]");
+        let (next_client, next_send, next_recv, next_attached) = {
+            let reconnect = reconnect_terminal(&client, &terminal_id, read_only, &resume_token);
+            tokio::pin!(reconnect);
+            if read_only {
+                reconnect.await?
+            } else {
+                let mut warned_about_dropped_input = false;
+                loop {
+                    tokio::select! {
+                        result = &mut reconnect => break result?,
+                        read = stdin.read(&mut input) => {
+                            let length = read?;
+                            if length == 0
+                                || (interactive
+                                    && (input[..length].contains(&0x1d)
+                                        || input[..length].contains(&0x03)))
+                            {
+                                return Ok(());
+                            }
+                            if !warned_about_dropped_input {
+                                eprintln!(
+                                    "\r[astra: input entered while disconnected is being discarded]"
+                                );
+                                warned_about_dropped_input = true;
+                            }
+                        }
+                    }
                 }
             }
-            read = stdin.read(&mut input), if !read_only => {
-                let length = read?;
-                if length == 0 {
-                    let _ = send_terminal_command(
-                        &mut send,
-                        TerminalCommand {
-                            terminal_id: terminal_id.clone(),
-                            lease_id: attached.lease_id.clone(),
-                            sequence,
-                            command: Some(terminal_command::Command::Detach(true)),
-                        },
-                    ).await;
-                    let _ = send.finish();
-                    break;
+        };
+        client = next_client;
+        send = next_send;
+        recv = next_recv;
+        lease_id = next_attached.lease_id;
+        if !next_attached.resume_token.is_empty() {
+            resume_token = next_attached.resume_token;
+        }
+        if interactive {
+            // Rebuild the local emulator from the server's bounded history instead of appending
+            // a second copy of the screen after reconnecting.
+            std::io::stdout().write_all(b"\x1bc")?;
+        }
+        std::io::stdout().write_all(&next_attached.history)?;
+        std::io::stdout().flush()?;
+        continue 'attachment;
+    }
+}
+
+async fn reconnect_terminal(
+    previous: &AstraClient,
+    terminal_id: &str,
+    read_only: bool,
+    resume_token: &str,
+) -> Result<(
+    AstraClient,
+    quinn::SendStream,
+    quinn::RecvStream,
+    AttachResponse,
+)> {
+    let mut delay = Duration::from_millis(250);
+    loop {
+        match previous.reconnect().await {
+            Ok(client) => match client.list().await {
+                Ok(terminals) if !terminals.iter().any(|terminal| terminal.id == terminal_id) => {
+                    bail!("terminal is no longer active on the server")
                 }
-                if interactive && input[..length].contains(&0x1d) {
-                    let _ = send_terminal_command(
-                        &mut send,
-                        TerminalCommand {
-                            terminal_id: terminal_id.clone(),
-                            lease_id: attached.lease_id.clone(),
-                            sequence,
-                            command: Some(terminal_command::Command::Detach(true)),
-                        },
-                    ).await;
-                    let _ = send.finish();
-                    break;
+                Ok(_) => match client
+                    .attach(
+                        terminal_id.to_owned(),
+                        read_only,
+                        false,
+                        resume_token.to_owned(),
+                    )
+                    .await
+                {
+                    Ok((send, recv, attached)) => {
+                        return Ok((client, send, recv, attached));
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "\r[astra: server reachable; waiting to resume terminal ({error:#})]"
+                        );
+                    }
+                },
+                Err(error) => {
+                    eprintln!("\r[astra: reconnect check failed: {error:#}]");
                 }
-                send_terminal_command(
-                    &mut send,
-                    TerminalCommand {
-                        terminal_id: terminal_id.clone(),
-                        lease_id: attached.lease_id.clone(),
-                        sequence,
-                        command: Some(terminal_command::Command::Input(input[..length].to_vec())),
-                    },
-                ).await?;
-                sequence += 1;
-            }
-            _ = wait_for_window_change(&mut window_changes), if interactive => {
-                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                send_terminal_command(
-                    &mut send,
-                    TerminalCommand {
-                        terminal_id: terminal_id.clone(),
-                        lease_id: attached.lease_id.clone(),
-                        sequence,
-                        command: Some(terminal_command::Command::Resize(Resize {
-                            rows: rows as u32,
-                            cols: cols as u32,
-                        })),
-                    },
-                ).await?;
-                sequence += 1;
+            },
+            Err(error) => {
+                eprintln!("\r[astra: reconnect failed: {error:#}]");
             }
         }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(5));
     }
-    Ok(())
 }
 
 async fn send_terminal_command(

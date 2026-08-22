@@ -60,6 +60,10 @@ message AttachRequest {
   string terminal_id = 1;
   bool read_only = 2;
   bool takeover = 3;
+  // Opaque capability returned by a previous writable attach. A matching token safely resumes
+  // that writer while rotating the fencing lease ID, so delayed cleanup of the old stream cannot
+  // release the new attachment.
+  string resume_token = 4;
 }
 message CloseRequest { string terminal_id = 1; }
 
@@ -93,6 +97,8 @@ message AttachResponse {
   string lease_id = 2;
   bool read_only = 3;
   bytes history = 4;
+  // Stable across automatic reconnects for one writer; empty for read-only attachments.
+  string resume_token = 5;
 }
 message AckResponse { string message = 1; }
 message ErrorResponse {

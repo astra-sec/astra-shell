@@ -43,7 +43,13 @@ pub enum PtyEvent {
 #[derive(Debug)]
 struct Lease {
     id: String,
+    resume_token: String,
     last_sequence: u64,
+}
+
+pub struct LeaseGrant {
+    pub lease_id: String,
+    pub resume_token: String,
 }
 
 pub struct Terminal {
@@ -71,20 +77,53 @@ impl Terminal {
         (snapshot, receiver)
     }
 
-    pub fn acquire_lease(&self, read_only: bool, takeover: bool) -> Result<String> {
+    pub fn acquire_lease(
+        &self,
+        read_only: bool,
+        takeover: bool,
+        resume_token: &str,
+    ) -> Result<LeaseGrant> {
         if read_only {
-            return Ok(String::new());
+            return Ok(LeaseGrant {
+                lease_id: String::new(),
+                resume_token: String::new(),
+            });
         }
         let mut lease = self.lease.lock().expect("terminal lease poisoned");
+        if !resume_token.is_empty()
+            && lease
+                .as_ref()
+                .is_some_and(|current| current.resume_token == resume_token)
+        {
+            let lease_id = Uuid::new_v4().to_string();
+            *lease = Some(Lease {
+                id: lease_id.clone(),
+                resume_token: resume_token.to_owned(),
+                last_sequence: 0,
+            });
+            return Ok(LeaseGrant {
+                lease_id,
+                resume_token: resume_token.to_owned(),
+            });
+        }
         if lease.is_some() && !takeover {
             bail!("terminal already has an input lease owner; use --read-only or --takeover")
         }
-        let id = Uuid::new_v4().to_string();
+        let lease_id = Uuid::new_v4().to_string();
+        let resume_token = if lease.is_none() && !resume_token.is_empty() {
+            resume_token.to_owned()
+        } else {
+            Uuid::new_v4().to_string()
+        };
         *lease = Some(Lease {
-            id: id.clone(),
+            id: lease_id.clone(),
+            resume_token: resume_token.clone(),
             last_sequence: 0,
         });
-        Ok(id)
+        Ok(LeaseGrant {
+            lease_id,
+            resume_token,
+        })
     }
 
     pub fn release_lease(&self, lease_id: &str) {
@@ -677,6 +716,44 @@ mod tests {
         *manager.next_display_id.lock().unwrap() = u64::MAX;
         assert!(manager.allocate_display_id().is_err());
         assert_eq!(*manager.next_display_id.lock().unwrap(), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn resumes_matching_writer_by_rotating_lease_without_losing_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager::new(directory.path().to_path_buf()).unwrap();
+        let terminal = manager
+            .spawn(SpawnRequest {
+                name: "lease-test".into(),
+                argv: vec!["/bin/cat".into()],
+                cwd: String::new(),
+                rows: 24,
+                cols: 80,
+                term: "xterm-256color".into(),
+                environment: Vec::new(),
+            })
+            .unwrap();
+
+        let first = terminal.acquire_lease(false, false, "").unwrap();
+        let resumed = terminal
+            .acquire_lease(false, false, &first.resume_token)
+            .unwrap();
+        assert_ne!(first.lease_id, resumed.lease_id);
+        assert_eq!(first.resume_token, resumed.resume_token);
+        assert!(
+            terminal
+                .write_input(&first.lease_id, 1, b"stale\n")
+                .is_err()
+        );
+
+        terminal.release_lease(&first.lease_id);
+        assert!(terminal.acquire_lease(false, false, "").is_err());
+        terminal
+            .write_input(&resumed.lease_id, 1, b"resume\n")
+            .unwrap();
+
+        terminal.release_lease(&resumed.lease_id);
+        terminal.kill().unwrap();
     }
 
     #[test]

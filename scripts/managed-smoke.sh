@@ -21,7 +21,12 @@ install -m 600 "$run_dir/id_ed25519.pub" "$run_dir/authorized/$username"
 
 gateway_pid=""
 worker_pid=""
+live_attach_pid=""
 cleanup() {
+  if [[ -n "$live_attach_pid" ]]; then
+    kill "$live_attach_pid" 2>/dev/null || true
+    wait "$live_attach_pid" 2>/dev/null || true
+  fi
   if [[ -n "$gateway_pid" ]]; then
     kill "$gateway_pid" 2>/dev/null || true
     wait "$gateway_pid" 2>/dev/null || true
@@ -38,9 +43,10 @@ trap cleanup EXIT
 
 start_gateway() {
   local log_file="$1"
+  local requested_listen="${2:-127.0.0.1:0}"
   HOME="$run_dir/home" target/debug/astrad serve \
     --managed \
-    --listen 127.0.0.1:0 \
+    --listen "$requested_listen" \
     --state-dir "$run_dir/server" \
     --authorized-keys-dir "$run_dir/authorized" \
     --session-root "$repo_dir" >"$log_file" 2>&1 &
@@ -119,25 +125,43 @@ fi
 
 terminal_id="$(
   "${client[@]}" new --name gateway-restart -- \
-    /bin/sh -c 'echo BEFORE_GATEWAY_RESTART; sleep 2; echo AFTER_GATEWAY_RESTART; sleep 20'
+    /bin/sh -c 'echo BEFORE_GATEWAY_RESTART; sleep 3; echo AFTER_GATEWAY_RESTART; sleep 120'
 )"
-before="$(timeout 1s "${client[@]}" attach "$terminal_id" --read-only || true)"
-if ! printf '%s' "$before" | rg -q 'BEFORE_GATEWAY_RESTART'; then
-  echo "initial managed terminal output was not received" >&2
+{ sleep 40; } | timeout 35s "${client[@]}" attach "$terminal_id" \
+  >"$run_dir/live-attach.out" 2>"$run_dir/live-attach.err" &
+live_attach_pid=$!
+for _ in $(seq 1 50); do
+  if rg -q 'BEFORE_GATEWAY_RESTART' "$run_dir/live-attach.out"; then
+    break
+  fi
+  sleep 0.1
+done
+if ! rg -q 'BEFORE_GATEWAY_RESTART' "$run_dir/live-attach.out"; then
+  echo "live managed attachment did not receive initial output" >&2
   exit 1
 fi
 
+original_listen="$listen"
 kill "$gateway_pid"
 wait "$gateway_pid" 2>/dev/null || true
 gateway_pid=""
-sleep 3
+sleep 1
 
-start_gateway "$run_dir/gateway-2.log"
-after="$(timeout 1s "${client[@]}" attach "$terminal_id" --read-only || true)"
-if ! printf '%s' "$after" | rg -q 'AFTER_GATEWAY_RESTART'; then
-  echo "per-user worker did not survive gateway restart" >&2
+start_gateway "$run_dir/gateway-2.log" "$original_listen"
+for _ in $(seq 1 250); do
+  if rg -q 'AFTER_GATEWAY_RESTART' "$run_dir/live-attach.out"; then
+    break
+  fi
+  sleep 0.1
+done
+if ! rg -q 'AFTER_GATEWAY_RESTART' "$run_dir/live-attach.out"; then
+  echo "live client did not automatically recover after gateway restart" >&2
+  sed -n '1,120p' "$run_dir/live-attach.err" >&2
   exit 1
 fi
+kill "$live_attach_pid" 2>/dev/null || true
+wait "$live_attach_pid" 2>/dev/null || true
+live_attach_pid=""
 
 if HOME="$run_dir/home" XDG_CONFIG_HOME="$run_dir/home/.config" target/debug/astra \
   -p "${listen##*:}" \

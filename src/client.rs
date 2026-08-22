@@ -92,6 +92,16 @@ impl rustls::client::danger::ServerCertVerifier for DeferredServerVerification {
 pub struct AstraClient {
     _endpoint: quinn::Endpoint,
     connection: quinn::Connection,
+    reconnect: ReconnectConfig,
+}
+
+#[derive(Clone)]
+struct ReconnectConfig {
+    remote: SocketAddr,
+    server_name: String,
+    trust: ServerTrust,
+    identity: PathBuf,
+    username: String,
 }
 
 impl Drop for AstraClient {
@@ -108,7 +118,18 @@ impl AstraClient {
         identity: &Path,
         username: &str,
     ) -> Result<Self> {
-        let mut tls = match trust {
+        Self::connect_with_config(ReconnectConfig {
+            remote,
+            server_name: server_name.to_owned(),
+            trust: trust.clone(),
+            identity: identity.to_path_buf(),
+            username: username.to_owned(),
+        })
+        .await
+    }
+
+    async fn connect_with_config(reconnect: ReconnectConfig) -> Result<Self> {
+        let mut tls = match &reconnect.trust {
             ServerTrust::PinnedCertificate(server_certificate) => {
                 let mut roots = rustls::RootCertStore::empty();
                 roots
@@ -135,9 +156,14 @@ impl AstraClient {
             QuicClientConfig::try_from(tls).context("invalid QUIC client TLS configuration")?,
         ));
         let mut transport = quinn::TransportConfig::default();
-        transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+        transport.max_idle_timeout(Some(
+            std::time::Duration::from_secs(15)
+                .try_into()
+                .expect("15 second QUIC idle timeout is valid"),
+        ));
         client_config.transport_config(Arc::new(transport));
-        let bind: SocketAddr = if remote.is_ipv4() {
+        let bind: SocketAddr = if reconnect.remote.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
             "[::]:0".parse().unwrap()
@@ -145,26 +171,31 @@ impl AstraClient {
         let mut endpoint = quinn::Endpoint::client(bind)?;
         endpoint.set_default_client_config(client_config);
         let connection = endpoint
-            .connect(remote, server_name)?
+            .connect(reconnect.remote, &reconnect.server_name)?
             .await
-            .with_context(|| format!("failed to connect to {remote}"))?;
+            .with_context(|| format!("failed to connect to {}", reconnect.remote))?;
         if let ServerTrust::KnownHosts {
             host,
             port,
             file,
             policy,
-        } = trust
+        } = &reconnect.trust
             && let Err(error) =
                 verify_connection_certificate(&connection, host, *port, file, *policy)
         {
             connection.close(1_u32.into(), b"host certificate rejected");
             return Err(error);
         }
-        authenticate(&connection, identity, username).await?;
+        authenticate(&connection, &reconnect.identity, &reconnect.username).await?;
         Ok(Self {
             _endpoint: endpoint,
             connection,
+            reconnect,
         })
+    }
+
+    pub async fn reconnect(&self) -> Result<Self> {
+        Self::connect_with_config(self.reconnect.clone()).await
     }
 
     pub async fn list(&self) -> Result<Vec<crate::protocol::TerminalInfo>> {
@@ -209,6 +240,7 @@ impl AstraClient {
         terminal_id: String,
         read_only: bool,
         takeover: bool,
+        resume_token: String,
     ) -> Result<(quinn::SendStream, quinn::RecvStream, AttachResponse)> {
         let (mut send, mut recv) = self.connection.open_bi().await?;
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -220,6 +252,7 @@ impl AstraClient {
                     terminal_id,
                     read_only,
                     takeover,
+                    resume_token,
                 })),
             })),
         )

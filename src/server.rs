@@ -215,7 +215,12 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
         .context("server transport configuration is unexpectedly shared")?;
     transport.max_concurrent_bidi_streams(128_u32.into());
     transport.max_concurrent_uni_streams(0_u8.into());
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    transport.max_idle_timeout(Some(
+        std::time::Duration::from_secs(15)
+            .try_into()
+            .expect("15 second QUIC idle timeout is valid"),
+    ));
 
     let endpoint = quinn::Endpoint::server(server_config, options.listen)?;
     info!(listen = %endpoint.local_addr()?, "astrad listening");
@@ -591,6 +596,7 @@ where
                 request_id,
                 attach.read_only,
                 attach.takeover,
+                attach.resume_token,
                 send,
                 recv,
             )
@@ -616,6 +622,7 @@ async fn handle_attach<W, R>(
     request_id: String,
     read_only: bool,
     takeover: bool,
+    resume_token: String,
     mut send: W,
     mut recv: R,
 ) -> Result<()>
@@ -623,8 +630,8 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let lease_id = match terminal.acquire_lease(read_only, takeover) {
-        Ok(lease_id) => lease_id,
+    let lease = match terminal.acquire_lease(read_only, takeover, &resume_token) {
+        Ok(lease) => lease,
         Err(error) => {
             send_error(&mut send, request_id, "lease_conflict", error).await?;
             send.shutdown().await?;
@@ -638,9 +645,10 @@ where
         request_id,
         response::Result::Attach(AttachResponse {
             terminal: Some(info.clone()),
-            lease_id: lease_id.clone(),
+            lease_id: lease.lease_id.clone(),
             read_only,
             history,
+            resume_token: lease.resume_token.clone(),
         }),
     )
     .await?;
@@ -652,7 +660,7 @@ where
             terminal_event::Event::Exited(info.exit_code.unwrap_or(1)),
         )
         .await?;
-        terminal.release_lease(&lease_id);
+        terminal.release_lease(&lease.lease_id);
         send.shutdown().await?;
         return Ok(());
     }
@@ -733,7 +741,7 @@ where
         )
         .await;
     }
-    terminal.release_lease(&lease_id);
+    terminal.release_lease(&lease.lease_id);
     let _ = send.shutdown().await;
     result
 }

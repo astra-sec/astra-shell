@@ -146,6 +146,8 @@ pub struct AttachRequest {
     pub read_only: bool,
     #[prost(bool, tag = "3")]
     pub takeover: bool,
+    #[prost(string, tag = "4")]
+    pub resume_token: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -224,6 +226,8 @@ pub struct AttachResponse {
     pub read_only: bool,
     #[prost(bytes = "vec", tag = "4")]
     pub history: Vec<u8>,
+    #[prost(string, tag = "5")]
+    pub resume_token: String,
 }
 
 #[derive(Clone, PartialEq, Message)]

@@ -18,7 +18,7 @@ Astra Shell 是一个以 QUIC 连接多个持久 PTY 的远程终端原型。`as
 - 每个新 PTY 传递客户端 `TERM` 与白名单 `LANG`/`LANGUAGE`/`LC_*`，不可用时回退服务端 UTF-8 locale，并开启 `IUTF8` 输入处理；
 - 可靠、有序的输入、输出和 resize；
 - 单写者输入租约及 fencing ID、命令序列号；
-- 客户端断开后 PTY 继续运行，重新附着时恢复最近 1 MiB 原始输出；
+- 客户端断开后 PTY 继续运行；交互客户端会自动重连、重新认证并恢复最近 1 MiB 原始输出；
 - 活动 Terminal 只以内存中实际持有的 PTY 为准，不保存可能失真的 `running` 记录；
 - QUIC keepalive、15 秒认证超时，以及 gateway/worker 单实例进程锁；
 - 工作目录边界，子进程 cwd 不能逃出服务端配置的 `session-root`。
@@ -119,6 +119,8 @@ Rootless 模式使用 `state/authorized_keys`，daemon 只能代表启动它的 
 创建终端时，客户端会像 SSH 一样发送当前 `TERM` 和 locale。服务端只接受固定白名单中的 `LANG`、`LANGUAGE` 和标准 `LC_*`，不会接收 `PATH`、动态链接器或任意环境变量。客户端 locale 在服务端不存在或不是 UTF-8 时，服务端使用 `C.UTF-8`/`C.utf8` 等可用 UTF-8 locale；如果服务端完全没有 UTF-8 locale，则拒绝创建 PTY，并返回明确错误。
 
 交互附着时按 `Ctrl+]` 只分离客户端，不结束远端进程。`--read-only` 创建观察者；已有写入者时，可显式使用 `--takeover` 获取新的 fencing lease。
+
+连接中断时，`astra` 会按 250 ms 到 5 s 的退避间隔持续重连，并使用 canonical UUID 和服务端签发的 opaque resume token 恢复原来的写入权。每次恢复都会轮换 fencing lease ID，并从序列号 1 重新开始；旧连接迟到的命令和清理动作因此不能影响新连接。客户端会用服务端保存的有界 history 重建本地终端画面。由于断线瞬间无法可靠判断最后一次输入是否已经送达 PTY，Astra 不会自动重放离线输入，以免命令被执行两次。
 
 ## Managed 多用户模式
 
