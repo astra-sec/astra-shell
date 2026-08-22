@@ -6,7 +6,7 @@ Astra Shell 是一个以 QUIC 连接多个持久 PTY 的远程终端原型。`as
 
 - QUIC/TLS 1.3，ALPN 为 `astra/1`；
 - SSH 风格的主机证书 TOFU：首次连接确认，后续自动校验并拒绝证书变化；
-- OpenSSH 私钥、SSHSIG challenge-response 和 `authorized_keys`；
+- OpenSSH Ed25519/RSA 私钥、SSHSIG challenge-response 和 `authorized_keys`；
 - 客户端选择目标 Unix 用户，签名同时绑定用户名、服务实例和随机 challenge；
 - managed gateway 按 passwd 数据库查找用户及其 `~/.ssh/authorized_keys`；
 - 每个 UID 独立的降权 worker、Unix socket 和 PTY；
@@ -42,6 +42,14 @@ ssh-keygen -t ed25519 -N '' -f state/id_ed25519
 install -m 600 state/id_ed25519.pub state/authorized_keys
 ```
 
+也可以使用 RSA；Astra 的 RSA SSHSIG 使用 `rsa-sha2-512`，不会回退到旧的 SHA-1
+`ssh-rsa` 签名：
+
+```bash
+ssh-keygen -t rsa -b 3072 -N '' -f state/id_rsa
+install -m 600 state/id_rsa.pub state/authorized_keys
+```
+
 服务端证书、私钥、`authorized_keys` 和客户端测试密钥都在 `state/` 中。服务端状态目录会设置为 `0700`，秘密文件设置为 `0600`。`host-cert.der` 是服务端主机身份的一部分，客户端不再需要复制或显式传入它。
 
 ## Rootless 单用户模式
@@ -61,7 +69,7 @@ Rootless 模式使用 `state/authorized_keys`，daemon 只能代表启动它的 
 
 ### 启动客户端
 
-连接参数采用 SSH 风格的 `[USER@]HOST`、`-p PORT`、`-l USER` 和 `-i IDENTITY`。不写 `-i` 时自动使用 `~/.ssh/id_ed25519`；不写用户时使用 `USER`/`LOGNAME`。下面的开发凭据位于项目 `state/`，所以显式使用 `-i`：
+连接参数采用 SSH 风格的 `[USER@]HOST`、`-p PORT`、`-l USER` 和 `-i IDENTITY`。不写 `-i` 时依次尝试 `~/.ssh/id_ed25519` 和 `~/.ssh/id_rsa`；不写用户时使用 `USER`/`LOGNAME`。下面的开发凭据位于项目 `state/`，所以显式使用 `-i`：
 
 ```bash
 ./target/debug/astra \
@@ -145,7 +153,7 @@ sudo /home/mimi/astra-shell/target/debug/astrad serve \
   alice@SERVER_IP
 ```
 
-这里会自动选择本机的 `~/.ssh/id_ed25519`。需要指定另一把密钥时使用与 SSH 相同的 `-i /path/to/key`；`-l alice SERVER_IP` 与 `alice@SERVER_IP` 等价。
+这里会自动选择本机的 `~/.ssh/id_ed25519`，不存在时再尝试 `~/.ssh/id_rsa`。需要指定另一把密钥时使用与 SSH 相同的 `-i /path/to/key`；`-l alice SERVER_IP` 与 `alice@SERVER_IP` 等价。
 
 默认授权文件与 OpenSSH 一致：
 
@@ -187,7 +195,7 @@ cargo clippy --all-targets -- -D warnings
 
 - managed 模式已经按 Unix 账户、supplementary groups、GID 和 UID 隔离，但尚未接入 PAM、账户锁定/过期策略；
 - 尚未实现按来源地址的认证速率限制、连接配额和审计日志后端，公开暴露前仍需补齐并接受独立安全审计；
-- 认证兼容 OpenSSH Ed25519 密钥格式和 `authorized_keys`，客户端会自动选择 `~/.ssh/id_ed25519`，但暂不支持 ssh-agent、加密私钥、其他密钥算法、SSH 用户证书及 authorized_keys options；
+- 认证兼容 OpenSSH Ed25519/RSA 密钥格式和 `authorized_keys`，客户端会自动选择 `~/.ssh/id_ed25519` 或 `~/.ssh/id_rsa`，但暂不支持 ssh-agent、加密私钥、ECDSA、SSH 用户证书及 authorized_keys options；
 - QUIC 主机身份已经支持独立的 SSH 式 TOFU 文件，但当前 pin 的是完整自签名证书；正式的证书轮换机制尚未实现；
 - 保存的是有界原始输出，不是语义 screen/grid 快照；
 - 暂无 QUIC DATAGRAM 累计状态同步、预测、文件和端口通道；

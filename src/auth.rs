@@ -112,8 +112,26 @@ mod tests {
 
     #[test]
     fn accepts_authorized_signature_and_rejects_wrong_challenge() {
+        assert_authorized_round_trip(Algorithm::Ed25519);
+    }
+
+    #[test]
+    fn accepts_rsa_sha2_512_authorized_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let authorized = dir.path().join("authorized_keys");
+        fs::write(&authorized, RSA_AUTHORIZED_KEY).unwrap();
+
+        verify_authorized_key(&authorized, RSA_AUTHORIZED_KEY, RSA_SIGNATURE, b"challenge")
+            .unwrap();
+        assert!(
+            verify_authorized_key(&authorized, RSA_AUTHORIZED_KEY, RSA_SIGNATURE, b"other")
+                .is_err()
+        );
+    }
+
+    fn assert_authorized_round_trip(algorithm: Algorithm) {
         let mut rng = ssh_key::rand_core::OsRng;
-        let key = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+        let key = PrivateKey::random(&mut rng, algorithm).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let authorized = dir.path().join("authorized_keys");
         fs::write(&authorized, key.public_key().to_openssh().unwrap()).unwrap();
@@ -156,4 +174,21 @@ mod tests {
             authentication_payload(&challenge, "alice", "server-b")
         );
     }
+
+    const RSA_AUTHORIZED_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDEPC5SFWDm55oOA5bGB0lalZPTY8e8E9n2UwNVYFUYFHsDqk4TSebZsycRQj53mnRnnJJh3nIqwXpsc3hl53UqWDTc/jOnIl3ggakrpAdMBGDLw1x45TMQ7aULB3VbY5G9AIJfno5hi8r9NtB/xTmYxZUdhPHu/G/WgKhi1M+9Tq2aFAVbAjXsiPMpZ/KX/2e39SFWbyyuZeIjSDYZolLe0N+EVoUeGkEU8AB7QD1oFhLKfhzp4CgAl75/LUFbwjtf6x9JW0m52TQXktMPLnOHVrd9VN11GuCJMahFTRQjJCWg9DS8j07BIjB73a8EeDz1KvUBTgr7oMgMyPp/NDUL astra-rsa-test";
+
+    const RSA_SIGNATURE: &str = r#"-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAARcAAAAHc3NoLXJzYQAAAAMBAAEAAAEBAMQ8LlIVYObnmg4DlsYHSV
+qVk9Njx7wT2fZTA1VgVRgUewOqThNJ5tmzJxFCPneadGeckmHecirBemxzeGXndSpYNNz+
+M6ciXeCBqSukB0wEYMvDXHjlMxDtpQsHdVtjkb0Agl+ejmGLyv020H/FOZjFlR2E8e78b9
+aAqGLUz71OrZoUBVsCNeyI8yln8pf/Z7f1IVZvLK5l4iNINhmiUt7Q34RWhR4aQRTwAHtA
+PWgWEsp+HOngKACXvn8tQVvCO1/rH0lbSbnZNBeS0w8uc4dWt31U3XUa4IkxqEVNFCMkJa
+D0NLyPTsEiMHvdrwR4PPUq9QFOCvugyAzI+n80NQsAAAATYXN0cmEtc2hlbGwtYXV0aC12
+MQAAAAAAAAAGc2hhNTEyAAABFAAAAAxyc2Etc2hhMi01MTIAAAEAFSUQhyYw9m0gMP1My2
+F947VJ6rEabYarZKRImG95XLvvsLh+oton8ggJNTkIYX3GQM6UFm38eN/TQMF90Ls+idUt
+HAwl5EDXM7WYhFRaZEV8wiXxpHtcVTr3hRHasMAIJcK5VT0QWnww6b8z/aJsAzyv8dLtUr
+Ht/feM8HLlmJs0R+sC5gXrAgFGNSXT0UYvjpVX/SzZ8ykmWFm2k1r1ZCBYXvpytdFfPQew
+LYIqdhihuvMRihJPyqhXZGSrNVwkaTrtneyRFMi4Mad4rlHFFuPS4+q4msJ2FfhXGZh8+8
+r852yAd+Ic93alI6J1RtI6sI06Wv6nY+MfUg+LawwDAQ==
+-----END SSH SIGNATURE-----"#;
 }

@@ -37,7 +37,7 @@ struct Cli {
     /// Override Astra's known-hosts path (normally ~/.config/astra/known_hosts).
     #[arg(long)]
     known_hosts_file: Option<PathBuf>,
-    /// OpenSSH private key. Defaults to ~/.ssh/id_ed25519.
+    /// OpenSSH Ed25519 or RSA private key. Defaults to id_ed25519, then id_rsa.
     #[arg(short = 'i', long)]
     identity: Option<PathBuf>,
     /// Target Unix account, equivalent to the user in `ssh user@host`.
@@ -652,15 +652,16 @@ fn select_identity(explicit: Option<&Path>) -> Result<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .context("cannot locate the user home directory; pass an identity with -i")?;
-    let identity = home.join(".ssh/id_ed25519");
-    if identity.is_file() {
-        Ok(identity)
-    } else {
-        bail!(
-            "no supported default SSH identity found at {}; pass one with -i",
-            identity.display()
-        )
+    for name in ["id_ed25519", "id_rsa"] {
+        let identity = home.join(".ssh").join(name);
+        if identity.is_file() {
+            return Ok(identity);
+        }
     }
+    bail!(
+        "no supported default SSH identity found at {}/.ssh/id_ed25519 or id_rsa; pass one with -i",
+        home.display()
+    )
 }
 
 #[cfg(unix)]

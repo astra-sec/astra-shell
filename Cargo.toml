@@ -30,7 +30,7 @@ rand = "0.9"
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 sha2 = "0.10"
-ssh-key = { version = "0.6.7", features = ["ed25519", "getrandom"] }
+ssh-key = { version = "0.6.7", features = ["ed25519", "getrandom", "rsa"] }
 tokio = { version = "1.47", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
