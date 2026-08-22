@@ -1,12 +1,14 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     ffi::CString,
-    fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
+
+#[cfg(target_os = "linux")]
+use std::fs;
 
 use anyhow::{Context, Result, anyhow, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
