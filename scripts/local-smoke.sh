@@ -107,6 +107,16 @@ terminal_id="$(
   "${client[@]}" new --name smoke -- \
     /bin/sh -c 'echo BEFORE_DETACH; sleep 2; echo WHILE_DETACHED; sleep 20'
 )"
+if ! [[ "$terminal_id" =~ ^[1-9][0-9]*$ ]]; then
+  echo "new did not return a short numeric terminal ID" >&2
+  exit 1
+fi
+
+terminal_uuid="$("${client[@]}" list --long | awk -v id="$terminal_id" '$1 == id { print $2; exit }')"
+if ! [[ "$terminal_uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+  echo "list --long did not expose the canonical terminal UUID" >&2
+  exit 1
+fi
 
 before="$(timeout 1s "${client[@]}" attach "$terminal_id" --read-only || true)"
 if ! printf '%s' "$before" | rg -q 'BEFORE_DETACH'; then
@@ -115,7 +125,7 @@ if ! printf '%s' "$before" | rg -q 'BEFORE_DETACH'; then
 fi
 
 sleep 3
-after="$(timeout 1s "${client[@]}" attach "$terminal_id" --read-only || true)"
+after="$(timeout 1s "${client[@]}" attach "$terminal_uuid" --read-only || true)"
 if ! printf '%s' "$after" | rg -q 'WHILE_DETACHED'; then
   echo "detached terminal output was not recovered" >&2
   exit 1

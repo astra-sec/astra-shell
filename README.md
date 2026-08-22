@@ -13,6 +13,7 @@ Astra Shell 是一个以 QUIC 连接多个持久 PTY 的远程终端原型。`as
 - root gateway 不创建 PTY，只代理认证后的协议字节流；
 - 一条 QUIC 连接上的多个独立双向请求流；
 - 创建、列出、附着和关闭多个 PTY；
+- Terminal 内部使用 UUID 作为 canonical ID，同时提供当前用户 worker 内从 1 开始、只增不复用的短 ID；
 - Linux 默认 Shell 从 `/etc/os-release`、`/proc/sys/kernel/osrelease` 和服务端架构直接生成单行系统欢迎信息，不执行 MOTD 脚本；
 - 每个新 PTY 传递客户端 `TERM` 与白名单 `LANG`/`LANGUAGE`/`LC_*`，不可用时回退服务端 UTF-8 locale，并开启 `IUTF8` 输入处理；
 - 可靠、有序的输入、输出和 resize；
@@ -87,13 +88,22 @@ Rootless 模式使用 `state/authorized_keys`，daemon 只能代表启动它的 
   mimi@127.0.0.1 new --name logs -- /usr/bin/tail -f README.md
 ```
 
+`new` 默认输出面向用户的短 ID。`list` 同样默认显示短 ID；需要诊断或为客户端保存稳定身份时使用 `list --long` 查看 canonical UUID：
+
+```bash
+./target/debug/astra -p 4433 -i state/id_ed25519 mimi@127.0.0.1 list
+./target/debug/astra -p 4433 -i state/id_ed25519 mimi@127.0.0.1 list --long
+```
+
 重新附着：
 
 ```bash
 ./target/debug/astra -p 4433 \
   -i state/id_ed25519 \
-  mimi@127.0.0.1 attach TERMINAL_UUID
+  mimi@127.0.0.1 attach 1
 ```
+
+`attach` 和 `close` 同时接受短 ID 与 UUID。短 ID 只用于当前 host、Unix 用户和 worker 生命周期内的人工选择；客户端缓存与自动重连必须保存 UUID，避免 worker 重启后短 ID 重新从 1 开始时误附着到另一个 Terminal。
 
 无人值守的首次连接可以显式使用 SSH 同名策略；它只接受并记录新主机，绝不会覆盖已经变化的证书：
 

@@ -213,7 +213,7 @@ MVP 可先将 worker 作为 sessiond 内部 task；在公开测试前拆成独�
 ```text
 User
 └── Workspace (UUID, name, metadata, optional layout)
-    ├── Terminal (UUID, epoch, ProcessSpec, PTY, TerminalState)
+    ├── Terminal (UUID, display_id, epoch, ProcessSpec, PTY, TerminalState)
     ├── Terminal
     └── Task/Exec
 
@@ -225,7 +225,7 @@ Connection
 - `Terminal` 是持久 PTY 和进程，是最核心对象。
 - `Layout` 是客户端展示元数据；服务端可保存，但不能决定所有客户端必须显示哪个 pane。
 - `Attachment` 表示某客户端对某 Terminal 的一次观看/控制关系。
-- 所有持久对象使用随机 128 位 UUID；连接内可协商短 `u32 handle`，避免每个 DATAGRAM 携带 UUID。
+- 所有持久对象使用随机 128 位 UUID。Terminal 另有由每用户 sessiond/worker 分配、生命周期内只增不复用的 `u64 display_id`，仅供 CLI 和界面人工选择；客户端缓存与自动恢复始终使用 UUID。连接内仍可协商短 `u32 handle`，避免每个 DATAGRAM 携带 UUID。
 
 ### 4.3 生命周期
 

@@ -74,6 +74,7 @@ message Response {
   }
 }
 message TerminalInfo {
+  // Canonical identity. Clients must persist and use this for automatic resume.
   string id = 1;
   string name = 2;
   repeated string argv = 3;
@@ -82,6 +83,8 @@ message TerminalInfo {
   optional int32 exit_code = 6;
   uint32 rows = 7;
   uint32 cols = 8;
+  // Human-facing number scoped to one user worker lifecycle. Zero means absent.
+  uint64 display_id = 9;
 }
 message ListResponse { repeated TerminalInfo terminals = 1; }
 message SpawnResponse { TerminalInfo terminal = 1; }

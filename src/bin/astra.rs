@@ -51,13 +51,20 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// List terminals that are active in the current daemon or user worker.
-    List,
+    List {
+        /// Include canonical UUIDs used for automatic resume and diagnostics.
+        #[arg(long)]
+        long: bool,
+    },
     /// Create a terminal. Arguments after `--` are executed directly, without a shell.
     New(NewArgs),
-    /// Attach to a running terminal.
+    /// Attach to a running terminal by short ID or canonical UUID.
     Attach(AttachArgs),
-    /// Terminate a running terminal.
-    Close { terminal_id: String },
+    /// Terminate a running terminal by short ID or canonical UUID.
+    Close {
+        #[arg(value_name = "TERMINAL")]
+        terminal_id: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -78,6 +85,7 @@ struct NewArgs {
 
 #[derive(Debug, Args)]
 struct AttachArgs {
+    #[arg(value_name = "TERMINAL")]
     terminal_id: String,
     #[arg(long)]
     read_only: bool,
@@ -140,16 +148,31 @@ async fn run() -> Result<()> {
                 .await?;
             attach_terminal(&client, terminal.id, false, false).await?;
         }
-        Some(Command::List) => {
+        Some(Command::List { long }) => {
             let terminals = client.list().await?;
             if terminals.is_empty() {
                 println!("No terminals.");
-            } else {
-                println!("{:<36}  {:<12}  {:<8}  COMMAND", "ID", "NAME", "STATUS");
+            } else if long {
+                println!(
+                    "{:<6}  {:<36}  {:<12}  {:<8}  COMMAND",
+                    "ID", "UUID", "NAME", "STATUS"
+                );
                 for terminal in terminals {
                     println!(
-                        "{:<36}  {:<12}  {:<8}  {}",
+                        "{:<6}  {:<36}  {:<12}  {:<8}  {}",
+                        display_id(&terminal),
                         terminal.id,
+                        truncate(&terminal.name, 12),
+                        terminal.status,
+                        shell_join(&terminal.argv),
+                    );
+                }
+            } else {
+                println!("{:<6}  {:<12}  {:<8}  COMMAND", "ID", "NAME", "STATUS");
+                for terminal in terminals {
+                    println!(
+                        "{:<6}  {:<12}  {:<8}  {}",
+                        terminal_reference(&terminal),
                         truncate(&terminal.name, 12),
                         terminal.status,
                         shell_join(&terminal.argv),
@@ -170,7 +193,7 @@ async fn run() -> Result<()> {
                     environment: client_locale_environment()?,
                 })
                 .await?;
-            println!("{}", terminal.id);
+            println!("{}", terminal_reference(&terminal));
             if attach {
                 attach_terminal(&client, terminal.id, false, false).await?;
             }
@@ -193,13 +216,19 @@ async fn run() -> Result<()> {
 
 async fn attach_terminal(
     client: &AstraClient,
-    terminal_id: String,
+    terminal_selector: String,
     read_only: bool,
     takeover: bool,
 ) -> Result<()> {
     let (mut send, mut recv, attached) = client
-        .attach(terminal_id.clone(), read_only, takeover)
+        .attach(terminal_selector, read_only, takeover)
         .await?;
+    let terminal_id = attached
+        .terminal
+        .as_ref()
+        .context("server returned an attach response without terminal identity")?
+        .id
+        .clone();
     std::io::stdout().write_all(&attached.history)?;
     std::io::stdout().flush()?;
 
@@ -238,6 +267,9 @@ async fn attach_terminal(
             incoming = read_message(&mut recv) => {
                 match incoming? {
                     Some(WireMessage { body: Some(wire_message::Body::TerminalEvent(event)) }) => {
+                        if event.terminal_id != terminal_id {
+                            bail!("server sent an event for the wrong terminal")
+                        }
                         match event.event {
                             Some(terminal_event::Event::Output(bytes)) => {
                                 std::io::stdout().write_all(&bytes)?;
@@ -357,6 +389,20 @@ fn shell_join(arguments: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn display_id(terminal: &astra_shell::protocol::TerminalInfo) -> String {
+    match terminal.display_id {
+        0 => "-".into(),
+        display_id => display_id.to_string(),
+    }
+}
+
+fn terminal_reference(terminal: &astra_shell::protocol::TerminalInfo) -> String {
+    match terminal.display_id {
+        0 => terminal.id.clone(),
+        display_id => display_id.to_string(),
+    }
 }
 
 fn default_username() -> String {
@@ -561,7 +607,10 @@ mod tests {
         assert_eq!(cli.port, 4443);
         assert_eq!(cli.destination, "mimi@localhost");
         assert!(cli.server_cert.is_none());
-        assert!(matches!(cli.command, Some(Command::List)));
+        assert!(matches!(cli.command, Some(Command::List { long: false })));
+
+        let cli = Cli::try_parse_from(["astra", "mimi@localhost", "list", "--long"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::List { long: true })));
     }
 
     #[test]

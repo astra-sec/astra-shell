@@ -163,6 +163,7 @@ impl Terminal {
 #[derive(Clone)]
 pub struct TerminalManager {
     terminals: Arc<RwLock<HashMap<String, Arc<Terminal>>>>,
+    next_display_id: Arc<Mutex<u64>>,
     session_root: PathBuf,
 }
 
@@ -173,6 +174,7 @@ impl TerminalManager {
             .with_context(|| format!("invalid session root {}", session_root.display()))?;
         Ok(Self {
             terminals: Arc::new(RwLock::new(HashMap::new())),
+            next_display_id: Arc::new(Mutex::new(1)),
             session_root,
         })
     }
@@ -186,15 +188,19 @@ impl TerminalManager {
             .map(|terminal| terminal.info())
             .filter(|terminal| terminal.status == "running")
             .collect();
-        terminals.sort_by(|left, right| left.id.cmp(&right.id));
+        terminals.sort_by_key(|terminal| terminal.display_id);
         terminals
     }
 
-    pub fn get(&self, id: &str) -> Option<Arc<Terminal>> {
-        self.terminals
-            .read()
-            .expect("terminal registry poisoned")
-            .get(id)
+    pub fn get(&self, selector: &str) -> Option<Arc<Terminal>> {
+        let terminals = self.terminals.read().expect("terminal registry poisoned");
+        if let Some(terminal) = terminals.get(selector) {
+            return Some(terminal.clone());
+        }
+        let display_id = parse_display_id(selector)?;
+        terminals
+            .values()
+            .find(|terminal| terminal.info().display_id == display_id)
             .cloned()
     }
 
@@ -218,9 +224,10 @@ impl TerminalManager {
             bail!("argv[0] cannot be empty")
         }
 
+        let display_id = self.allocate_display_id()?;
         let id = Uuid::new_v4().to_string();
         let name = if request.name.is_empty() {
-            format!("terminal-{}", &id[..8])
+            format!("terminal-{display_id}")
         } else {
             request.name
         };
@@ -274,6 +281,7 @@ impl TerminalManager {
             exit_code: None,
             rows,
             cols,
+            display_id,
         };
         let terminal = Arc::new(Terminal {
             info: RwLock::new(info),
@@ -316,6 +324,23 @@ impl TerminalManager {
         }
         Ok(canonical)
     }
+
+    fn allocate_display_id(&self) -> Result<u64> {
+        let mut next = self
+            .next_display_id
+            .lock()
+            .expect("terminal display ID counter poisoned");
+        let display_id = *next;
+        *next = display_id
+            .checked_add(1)
+            .context("terminal display ID space exhausted")?;
+        Ok(display_id)
+    }
+}
+
+fn parse_display_id(selector: &str) -> Option<u64> {
+    let display_id = selector.parse().ok()?;
+    (display_id != 0).then_some(display_id)
 }
 
 fn initial_terminal_history(include_welcome: bool) -> VecDeque<u8> {
@@ -638,6 +663,31 @@ mod tests {
             .copied()
             .find(|value| locale_is_available(value))
             .expect("tests require a UTF-8 locale")
+    }
+
+    #[test]
+    fn allocates_nonzero_monotonic_display_ids_without_wrapping() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager::new(directory.path().to_path_buf()).unwrap();
+        assert_eq!(manager.allocate_display_id().unwrap(), 1);
+        assert_eq!(manager.allocate_display_id().unwrap(), 2);
+
+        *manager.next_display_id.lock().unwrap() = u64::MAX;
+        assert!(manager.allocate_display_id().is_err());
+        assert_eq!(*manager.next_display_id.lock().unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn accepts_only_nonzero_decimal_display_id_selectors() {
+        assert_eq!(parse_display_id("1"), Some(1));
+        assert_eq!(parse_display_id(&u64::MAX.to_string()), Some(u64::MAX));
+        assert_eq!(parse_display_id("0"), None);
+        assert_eq!(parse_display_id("-1"), None);
+        assert_eq!(parse_display_id("01x"), None);
+        assert_eq!(
+            parse_display_id("f3b5592c-1146-4f09-812e-c2621863c747"),
+            None
+        );
     }
 
     #[test]

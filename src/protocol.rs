@@ -198,6 +198,8 @@ pub struct TerminalInfo {
     pub rows: u32,
     #[prost(uint32, tag = "8")]
     pub cols: u32,
+    #[prost(uint64, tag = "9")]
+    pub display_id: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -340,4 +342,18 @@ where
     read_message(reader)
         .await?
         .context("peer closed the stream before sending a message")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_without_display_id_decodes_as_legacy_zero() {
+        // TerminalInfo{id: "legacy"} encoded before protobuf field 9 existed.
+        let encoded = [0x0a, 0x06, b'l', b'e', b'g', b'a', b'c', b'y'];
+        let terminal = TerminalInfo::decode(encoded.as_slice()).unwrap();
+        assert_eq!(terminal.id, "legacy");
+        assert_eq!(terminal.display_id, 0);
+    }
 }
