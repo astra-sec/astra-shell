@@ -13,6 +13,7 @@ Astra Shell 是一个以 QUIC 连接多个持久 PTY 的远程终端原型。`as
 - root gateway 不创建 PTY，只代理认证后的协议字节流；
 - 一条 QUIC 连接上的多个独立双向请求流；
 - 创建、列出、附着和关闭多个 PTY；
+- Linux 默认 Shell 从 `/etc/os-release`、`/proc/sys/kernel/osrelease` 和服务端架构直接生成单行系统欢迎信息，不执行 MOTD 脚本；
 - 每个新 PTY 传递客户端 `TERM` 与白名单 `LANG`/`LANGUAGE`/`LC_*`，不可用时回退服务端 UTF-8 locale，并开启 `IUTF8` 输入处理；
 - 可靠、有序的输入、输出和 resize；
 - 单写者输入租约及 fencing ID、命令序列号；

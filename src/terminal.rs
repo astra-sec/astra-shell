@@ -193,6 +193,7 @@ impl TerminalManager {
     }
 
     pub fn spawn(&self, request: SpawnRequest) -> Result<Arc<Terminal>> {
+        let default_shell = request.argv.is_empty();
         let rows = if request.rows == 0 { 24 } else { request.rows };
         let cols = if request.cols == 0 { 80 } else { request.cols };
         if !(1..=1000).contains(&rows) || !(1..=1000).contains(&cols) {
@@ -278,7 +279,7 @@ impl TerminalManager {
             master: Mutex::new(pty.master),
             writer: Mutex::new(writer),
             child: Mutex::new(child),
-            history: Mutex::new(VecDeque::with_capacity(HISTORY_LIMIT)),
+            history: Mutex::new(initial_terminal_history(default_shell)),
             events,
             lease: Mutex::new(None),
             database: self.database.clone(),
@@ -315,6 +316,86 @@ impl TerminalManager {
         }
         Ok(canonical)
     }
+}
+
+fn initial_terminal_history(include_welcome: bool) -> VecDeque<u8> {
+    let mut history = VecDeque::with_capacity(HISTORY_LIMIT);
+    if include_welcome && let Some(banner) = system_welcome_banner() {
+        history.extend(banner);
+    }
+    history
+}
+
+#[cfg(target_os = "linux")]
+fn system_welcome_banner() -> Option<Vec<u8>> {
+    let os_release = fs::read_to_string("/etc/os-release").ok()?;
+    let kernel_release = fs::read_to_string("/proc/sys/kernel/osrelease").ok()?;
+    build_welcome_banner(&os_release, &kernel_release, std::env::consts::ARCH)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn system_welcome_banner() -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn build_welcome_banner(
+    os_release: &str,
+    kernel_release: &str,
+    architecture: &str,
+) -> Option<Vec<u8>> {
+    let pretty_name = os_release_value(os_release, "PRETTY_NAME")?;
+    let kernel_release = safe_banner_field(kernel_release)?;
+    let architecture = safe_banner_field(architecture)?;
+    Some(
+        format!("Welcome to {pretty_name} (GNU/Linux {kernel_release} {architecture})\r\n\r\n")
+            .into_bytes(),
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn os_release_value(contents: &str, key: &str) -> Option<String> {
+    let encoded = contents.lines().find_map(|line| {
+        let (name, value) = line.split_once('=')?;
+        (name == key).then_some(value.trim())
+    })?;
+    if encoded.starts_with('"') != encoded.ends_with('"')
+        || encoded.starts_with('\'') != encoded.ends_with('\'')
+    {
+        return None;
+    }
+    let decoded = if encoded.len() >= 2 && encoded.starts_with('"') && encoded.ends_with('"') {
+        let mut value = String::with_capacity(encoded.len() - 2);
+        let mut escaped = false;
+        for character in encoded[1..encoded.len() - 1].chars() {
+            if escaped {
+                value.push(character);
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else {
+                value.push(character);
+            }
+        }
+        if escaped {
+            return None;
+        }
+        value
+    } else if encoded.len() >= 2 && encoded.starts_with('\'') && encoded.ends_with('\'') {
+        encoded[1..encoded.len() - 1].to_owned()
+    } else {
+        encoded.to_owned()
+    };
+    safe_banner_field(&decoded)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn safe_banner_field(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value.to_owned())
 }
 
 fn prepare_terminal_environment(
@@ -607,6 +688,30 @@ mod tests {
             .is_err()
         );
         assert!(prepare_terminal_environment("bad term", &[]).is_err());
+    }
+
+    #[test]
+    fn builds_linux_welcome_banner_from_system_metadata() {
+        let banner = build_welcome_banner(
+            "NAME=Ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.4 LTS\"\n",
+            "7.0.0-29-generic\n",
+            "x86_64",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(banner).unwrap(),
+            "Welcome to Ubuntu 24.04.4 LTS (GNU/Linux 7.0.0-29-generic x86_64)\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn rejects_multiline_or_oversized_banner_metadata() {
+        assert!(build_welcome_banner("PRETTY_NAME=Bad\u{7}Name", "1.0", "x86_64").is_none());
+        assert!(build_welcome_banner("PRETTY_NAME=Linux", "bad\nrelease\n", "x86_64").is_none());
+        assert!(
+            build_welcome_banner(&format!("PRETTY_NAME={}", "x".repeat(257)), "1.0", "x86_64")
+                .is_none()
+        );
     }
 
     #[cfg(unix)]
