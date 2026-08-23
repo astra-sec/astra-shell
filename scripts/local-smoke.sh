@@ -80,6 +80,85 @@ client=(
   "$(id -un)@127.0.0.1"
 )
 
+# Exercise Astra Files/1 through the real QUIC client and daemon, including a multi-chunk
+# upload, integrity-checked download, directory listing, rename, and cleanup.
+file_test_dir="$run_dir/file-transfer"
+remote_file="$file_test_dir/uploaded.bin"
+renamed_file="$file_test_dir/renamed.bin"
+downloaded_file="$run_dir/downloaded.bin"
+dd if=/dev/urandom of="$run_dir/source.bin" bs=65536 count=33 status=none
+"${client[@]}" files capabilities | rg -q '^Astra Files/1$'
+"${client[@]}" files mkdir "$file_test_dir" >/dev/null
+"${client[@]}" files put "$run_dir/source.bin" "$remote_file" >/dev/null
+cmp "$run_dir/source.bin" "$remote_file"
+"${client[@]}" files ls "$file_test_dir" | rg -q 'uploaded.bin'
+"${client[@]}" files get "$remote_file" "$downloaded_file" >/dev/null
+cmp "$run_dir/source.bin" "$downloaded_file"
+"${client[@]}" files mv "$remote_file" "$renamed_file" >/dev/null
+"${client[@]}" files rm "$renamed_file" >/dev/null
+"${client[@]}" files rm "$file_test_dir" >/dev/null
+
+# Kill and restart astrad after BeginUpload has created its private temporary file. The CLI must
+# reconnect, repeat BeginUpload with the same transfer ID, recover the on-disk committed offset,
+# and finish without retransmitting the whole file or exposing a partial destination.
+reconnect_dir="$run_dir/reconnect-transfer"
+reconnect_source="$run_dir/reconnect-source.bin"
+reconnect_remote="$reconnect_dir/resumed.bin"
+dd if=/dev/urandom of="$reconnect_source" bs=1048576 count=64 status=none
+"${client[@]}" files mkdir "$reconnect_dir" >/dev/null
+"${client[@]}" files put "$reconnect_source" "$reconnect_remote" \
+  >"$run_dir/reconnect-put.log" 2>&1 &
+transfer_pid=$!
+partial_upload=""
+partial_size=0
+for _ in $(seq 1 500); do
+  partial_upload="$(find "$reconnect_dir" -name '.astra-upload-*.part' -print -quit)"
+  if [[ -n "$partial_upload" ]]; then
+    partial_size="$(wc -c <"$partial_upload" | tr -d ' ')"
+    if [[ "$partial_size" -ge 8388608 ]]; then
+      break
+    fi
+  fi
+  sleep 0.01
+done
+if [[ -z "$partial_upload" || "$partial_size" -lt 8388608 || -e "$reconnect_remote" ]]; then
+  kill "$transfer_pid" 2>/dev/null || true
+  wait "$transfer_pid" 2>/dev/null || true
+  echo "could not interrupt an active Astra Files upload" >&2
+  exit 1
+fi
+kill -9 "$daemon_pid"
+wait "$daemon_pid" 2>/dev/null || true
+
+server_log="$run_dir/restarted-server.log"
+HOME="$run_dir/home" target/debug/astrad serve \
+  --listen "$listen" \
+  --state-dir "$run_dir/server" \
+  --session-root "$repo_dir" >"$server_log" 2>&1 &
+daemon_pid=$!
+for _ in $(seq 1 50); do
+  if rg -q '^LISTEN ' "$server_log"; then
+    break
+  fi
+  sleep 0.1
+done
+if ! rg -q '^LISTEN ' "$server_log"; then
+  echo "astrad did not restart during file resume test; see $server_log" >&2
+  exit 1
+fi
+if ! wait "$transfer_pid"; then
+  cat "$run_dir/reconnect-put.log" >&2
+  echo "file upload did not recover after astrad restart" >&2
+  exit 1
+fi
+cmp "$reconnect_source" "$reconnect_remote"
+if find "$reconnect_dir" -name '.astra-upload-*.part' -print -quit | rg -q .; then
+  echo "completed resumed upload left a temporary file behind" >&2
+  exit 1
+fi
+"${client[@]}" files rm "$reconnect_remote" >/dev/null
+"${client[@]}" files rm "$reconnect_dir" >/dev/null
+
 # Keep strict, explicitly provisioned certificate pinning working for automation.
 HOME="$run_dir/home" XDG_CONFIG_HOME="$run_dir/home/.config" target/debug/astra \
   -p "${listen##*:}" \

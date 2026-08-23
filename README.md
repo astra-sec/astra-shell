@@ -19,6 +19,7 @@ Astra Shell 是一个以 QUIC 连接多个持久 PTY 的远程终端原型。`as
 - 可靠、有序的输入、输出和 resize；
 - 单写者输入租约及 fencing ID、命令序列号；
 - 客户端断开后 PTY 继续运行；交互客户端会自动重连、重新认证并恢复最近 1 MiB 原始输出；
+- Astra Files/1 文件协议：目录分页、元数据、创建/删除/重命名，以及带 SHA-256、断点续传和原子提交的上传下载；
 - 活动 Terminal 只以内存中实际持有的 PTY 为准，不保存可能失真的 `running` 记录；
 - QUIC keepalive、15 秒认证超时，以及 gateway/worker 单实例进程锁；
 - 工作目录边界，子进程 cwd 不能逃出服务端配置的 `session-root`。
@@ -130,6 +131,30 @@ Rootless 模式使用 `state/authorized_keys`，daemon 只能代表启动它的 
 
 连接中断时，`astra` 会按 250 ms 到 5 s 的退避间隔持续重连，并使用 canonical UUID 和服务端签发的 opaque resume token 恢复原来的写入权。每次恢复都会轮换 fencing lease ID，并从序列号 1 重新开始；旧连接迟到的命令和清理动作因此不能影响新连接。客户端会用服务端保存的有界 history 重建本地终端画面。由于断线瞬间无法可靠判断最后一次输入是否已经送达 PTY，Astra 不会自动重放离线输入，以免命令被执行两次。
 
+## Astra Files/1
+
+文件操作复用终端所在的同一条认证 QUIC 连接，但每个请求使用独立、低于终端优先级的双向 Stream。它不是 SFTP：协议以稳定传输 ID、幂等 offset chunk 和文件快照为核心，因此 QUIC 连接完全失效后仍能在新连接上恢复。
+
+```bash
+# 查看能力、目录和元数据
+astra -p 4433 mimi@HOST files capabilities
+astra -p 4433 mimi@HOST files ls .
+astra -p 4433 mimi@HOST files stat README.md
+
+# 上传、下载和基本管理
+astra -p 4433 mimi@HOST files put ./local.tar remote.tar
+astra -p 4433 mimi@HOST files get remote.tar ./downloaded.tar
+astra -p 4433 mimi@HOST files mkdir artifacts
+astra -p 4433 mimi@HOST files mv remote.tar artifacts/remote.tar
+astra -p 4433 mimi@HOST files rm artifacts/remote.tar
+```
+
+目标已存在时默认拒绝覆盖；`put`、`get` 和 `mv` 可显式传 `--overwrite`。上传先写入目标目录中的私有 `.astra-upload-<transfer-id>.part`，每块校验 SHA-256；重连时客户端用相同 transfer ID 查询服务端实际 committed offset。完成后服务端校验整个文件、执行 `fsync` 并在同一目录内原子 rename。
+
+下载写入本地 `<name>.astra-part`，并保存对应 snapshot sidecar。客户端或网络中断后，只有远端文件的 inode、大小和修改时间快照仍一致时才继续；所有块和最终文件都会校验 SHA-256。远端文件发生变化时停止续传，不会把两个版本拼接在一起。
+
+远端路径限制在 `astrad --session-root` 内，拒绝 `..` 和通过符号链接逃出根目录；文件操作在 rootless daemon 当前 UID 或 managed 模式的非特权用户 worker 中执行，不在 root gateway 中执行。Unix 路径在线路上使用 bytes，因此非 UTF-8 文件名仍可寻址。
+
 ## Managed 多用户模式
 
 Managed 模式使用系统 passwd 数据库和每个用户自己的 SSH 授权文件。真正服务多个 UID 时，gateway 必须由 root 启动：
@@ -198,7 +223,7 @@ cargo clippy --all-targets -- -D warnings
 - 认证兼容 OpenSSH Ed25519/RSA 密钥格式和 `authorized_keys`，客户端会自动选择 `~/.ssh/id_ed25519` 或 `~/.ssh/id_rsa`，但暂不支持 ssh-agent、加密私钥、ECDSA、SSH 用户证书及 authorized_keys options；
 - QUIC 主机身份已经支持独立的 SSH 式 TOFU 文件，但当前 pin 的是完整自签名证书；正式的证书轮换机制尚未实现；
 - 保存的是有界原始输出，不是语义 screen/grid 快照；
-- 暂无 QUIC DATAGRAM 累计状态同步、预测、文件和端口通道；
+- 暂无 QUIC DATAGRAM 累计状态同步、预测和端口转发；Astra Files/1 已支持单文件传输和基本目录操作，但尚未提供递归目录同步、稀疏文件、ACL/xattr 和 GUI；
 - 暂无 SSH stdio fallback；
 - rootless 模式的 PTY 仍由 gateway 进程持有；managed 模式已经使用可跨 gateway 重启存活的独立用户 worker，但尚未提供正式的 worker 停止/升级管理命令。
 

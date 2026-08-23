@@ -15,6 +15,7 @@ use crate::{
     ALPN, PROTOCOL_VERSION,
     accounts::{SystemAccount, authorized_key_files, effective_uid},
     auth::{authentication_payload, verify_authorized_key, verify_authorized_keys},
+    files::{FileResult, FileService},
     process_lock::ProcessLock,
     protocol::{
         AckResponse, AttachResponse, AuthResult, ErrorResponse, ListResponse, Response,
@@ -76,6 +77,7 @@ enum ModeState {
     Rootless {
         account: SystemAccount,
         manager: TerminalManager,
+        files: FileService,
         authorized_keys: PathBuf,
     },
     Managed {
@@ -86,7 +88,10 @@ enum ModeState {
 
 #[derive(Clone)]
 enum ConnectionBackend {
-    Local(TerminalManager),
+    Local {
+        manager: TerminalManager,
+        files: FileService,
+    },
     Worker {
         router: Arc<WorkerRouter>,
         account: SystemAccount,
@@ -185,11 +190,15 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     }
     let _daemon_lock = ProcessLock::acquire(&options.paths.state_dir.join("gateway.lock"))?;
     let mode = match options.mode {
-        ServerMode::Rootless { session_root } => ModeState::Rootless {
-            account: SystemAccount::current()?,
-            manager: TerminalManager::new(session_root)?,
-            authorized_keys: options.paths.authorized_keys.clone(),
-        },
+        ServerMode::Rootless { session_root } => {
+            let files = FileService::new(session_root.clone())?;
+            ModeState::Rootless {
+                account: SystemAccount::current()?,
+                manager: TerminalManager::new(session_root)?,
+                files,
+                authorized_keys: options.paths.authorized_keys.clone(),
+            }
+        }
         ServerMode::Managed {
             authorized_keys_directory,
             session_root_override,
@@ -326,21 +335,32 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
     info!(%remote, %username, %fingerprint, "client authenticated");
 
     loop {
-        let (send, recv) = match connection.accept_bi().await {
+        let (send, mut recv) = match connection.accept_bi().await {
             Ok(stream) => stream,
             Err(quinn::ConnectionError::ApplicationClosed { .. }) => return Ok(()),
             Err(error) => return Err(error.into()),
         };
         let backend = backend.clone();
         tokio::spawn(async move {
-            let result = match backend {
-                ConnectionBackend::Local(manager) => {
-                    handle_worker_request(manager, send, recv).await
+            let result: Result<()> = async {
+                let first_message = read_message(&mut recv)
+                    .await?
+                    .context("request stream ended before its first message")?;
+                if is_file_request(&first_message) {
+                    send.set_priority(-10)?;
                 }
-                ConnectionBackend::Worker { router, account } => {
-                    router.proxy_stream(&account, send, recv).await
+                match backend {
+                    ConnectionBackend::Local { manager, files } => {
+                        handle_worker_message(manager, files, send, recv, first_message).await
+                    }
+                    ConnectionBackend::Worker { router, account } => {
+                        router
+                            .proxy_stream(&account, send, recv, first_message)
+                            .await
+                    }
                 }
-            };
+            }
+            .await;
             if let Err(error) = result {
                 warn!(%error, "request stream failed");
             }
@@ -482,6 +502,7 @@ fn authenticate_user(
         ModeState::Rootless {
             account,
             manager,
+            files,
             authorized_keys,
         } => {
             if username != account.username {
@@ -493,7 +514,13 @@ fn authenticate_user(
             }
             let fingerprint =
                 verify_authorized_key(authorized_keys, public_key, signature_pem, payload)?;
-            Ok((fingerprint, ConnectionBackend::Local(manager.clone())))
+            Ok((
+                fingerprint,
+                ConnectionBackend::Local {
+                    manager: manager.clone(),
+                    files: files.clone(),
+                },
+            ))
         }
         ModeState::Managed {
             router,
@@ -518,17 +545,35 @@ fn authenticate_user(
 
 pub(crate) async fn handle_worker_request<W, R>(
     manager: TerminalManager,
-    mut send: W,
+    files: FileService,
+    send: W,
     mut recv: R,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let request = match read_message(&mut recv).await? {
-        Some(WireMessage {
+    let first_message = read_message(&mut recv)
+        .await?
+        .context("request stream ended before its first message")?;
+    handle_worker_message(manager, files, send, recv, first_message).await
+}
+
+async fn handle_worker_message<W, R>(
+    manager: TerminalManager,
+    files: FileService,
+    mut send: W,
+    recv: R,
+    first_message: WireMessage,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let request = match first_message {
+        WireMessage {
             body: Some(wire_message::Body::Request(request)),
-        }) => request,
+        } => request,
         _ => bail!("expected Request as first stream message"),
     };
     let request_id = request.request_id.clone();
@@ -603,6 +648,121 @@ where
             .await?;
             return Ok(());
         }
+        Some(request::Command::FileCapabilities(_)) => {
+            send_response(
+                &mut send,
+                request_id,
+                response::Result::FileCapabilities(files.capabilities()),
+            )
+            .await?;
+        }
+        Some(request::Command::FileStat(stat)) => {
+            let service = files.clone();
+            let result = tokio::task::spawn_blocking(move || service.stat(stat)).await?;
+            send_file_result(&mut send, request_id, result, response::Result::FileStat).await?;
+        }
+        Some(request::Command::FileList(list)) => {
+            let service = files.clone();
+            let result = tokio::task::spawn_blocking(move || service.list(list)).await?;
+            send_file_result(&mut send, request_id, result, response::Result::FileList).await?;
+        }
+        Some(request::Command::BeginUpload(begin)) => {
+            let service = files.clone();
+            let result = tokio::task::spawn_blocking(move || service.begin_upload(begin)).await?;
+            send_file_result(
+                &mut send,
+                request_id,
+                result,
+                response::Result::UploadStatus,
+            )
+            .await?;
+        }
+        Some(request::Command::WriteFileChunk(chunk)) => {
+            let service = files.clone();
+            let result = tokio::task::spawn_blocking(move || service.write_chunk(chunk)).await?;
+            send_file_result(
+                &mut send,
+                request_id,
+                result,
+                response::Result::UploadStatus,
+            )
+            .await?;
+        }
+        Some(request::Command::QueryUpload(query)) => {
+            let service = files.clone();
+            let result =
+                tokio::task::spawn_blocking(move || service.query_upload(&query.transfer_id))
+                    .await?;
+            send_file_result(
+                &mut send,
+                request_id,
+                result,
+                response::Result::UploadStatus,
+            )
+            .await?;
+        }
+        Some(request::Command::CommitUpload(commit)) => {
+            let service = files.clone();
+            let result =
+                tokio::task::spawn_blocking(move || service.commit_upload(&commit.transfer_id))
+                    .await?;
+            send_file_result(
+                &mut send,
+                request_id,
+                result,
+                response::Result::UploadStatus,
+            )
+            .await?;
+        }
+        Some(request::Command::AbortUpload(abort)) => {
+            let service = files.clone();
+            let result =
+                tokio::task::spawn_blocking(move || service.abort_upload(&abort.transfer_id))
+                    .await?;
+            send_file_result(
+                &mut send,
+                request_id,
+                result,
+                response::Result::UploadStatus,
+            )
+            .await?;
+        }
+        Some(request::Command::BeginDownload(begin)) => {
+            let service = files.clone();
+            let result = tokio::task::spawn_blocking(move || service.begin_download(begin)).await?;
+            send_file_result(
+                &mut send,
+                request_id,
+                result,
+                response::Result::BeginDownload,
+            )
+            .await?;
+        }
+        Some(request::Command::ReadFileChunk(chunk)) => {
+            let service = files.clone();
+            let result = tokio::task::spawn_blocking(move || service.read_chunk(chunk)).await?;
+            send_file_result(&mut send, request_id, result, response::Result::FileChunk).await?;
+        }
+        Some(request::Command::MakeDirectory(directory)) => {
+            let service = files.clone();
+            let result =
+                tokio::task::spawn_blocking(move || service.make_directory(&directory.path))
+                    .await?;
+            send_file_ack(&mut send, request_id, result, "directory created").await?;
+        }
+        Some(request::Command::RemoveFile(remove)) => {
+            let service = files.clone();
+            let result = tokio::task::spawn_blocking(move || service.remove(&remove.path)).await?;
+            send_file_ack(&mut send, request_id, result, "file removed").await?;
+        }
+        Some(request::Command::RenameFile(rename)) => {
+            let service = files.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                service.rename(&rename.source, &rename.destination, rename.overwrite)
+            })
+            .await?;
+            send_file_ack(&mut send, request_id, result, "file renamed").await?;
+        }
         None => {
             send_error(
                 &mut send,
@@ -615,6 +775,75 @@ where
     }
     send.shutdown().await?;
     Ok(())
+}
+
+fn is_file_request(message: &WireMessage) -> bool {
+    matches!(
+        message,
+        WireMessage {
+            body: Some(wire_message::Body::Request(crate::protocol::Request {
+                command: Some(
+                    request::Command::FileCapabilities(_)
+                        | request::Command::FileStat(_)
+                        | request::Command::FileList(_)
+                        | request::Command::BeginUpload(_)
+                        | request::Command::WriteFileChunk(_)
+                        | request::Command::QueryUpload(_)
+                        | request::Command::CommitUpload(_)
+                        | request::Command::AbortUpload(_)
+                        | request::Command::BeginDownload(_)
+                        | request::Command::ReadFileChunk(_)
+                        | request::Command::MakeDirectory(_)
+                        | request::Command::RemoveFile(_)
+                        | request::Command::RenameFile(_)
+                ),
+                ..
+            })),
+        }
+    )
+}
+
+async fn send_file_result<W, T>(
+    send: &mut W,
+    request_id: String,
+    result: FileResult<T>,
+    wrap: impl FnOnce(T) -> response::Result,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match result {
+        Ok(value) => send_response(send, request_id, wrap(value)).await,
+        Err(error) => {
+            tracing::error!(error = %error, code = error.code, "file request failed");
+            send_response(
+                send,
+                request_id,
+                response::Result::Error(ErrorResponse {
+                    code: error.code.into(),
+                    message: error.message,
+                }),
+            )
+            .await
+        }
+    }
+}
+
+async fn send_file_ack<W>(
+    send: &mut W,
+    request_id: String,
+    result: FileResult<()>,
+    message: &str,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    send_file_result(send, request_id, result, |_| {
+        response::Result::Ack(AckResponse {
+            message: message.into(),
+        })
+    })
+    .await
 }
 
 async fn handle_attach<W, R>(

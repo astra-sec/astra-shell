@@ -233,6 +233,10 @@ impl TerminalManager {
         terminals
     }
 
+    pub fn session_root(&self) -> &Path {
+        &self.session_root
+    }
+
     pub fn get(&self, selector: &str) -> Option<Arc<Terminal>> {
         let terminals = self.terminals.read().expect("terminal registry poisoned");
         if let Some(terminal) = terminals.get(selector) {

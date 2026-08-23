@@ -89,7 +89,10 @@ pub struct AuthResult {
 pub struct Request {
     #[prost(string, tag = "1")]
     pub request_id: String,
-    #[prost(oneof = "request::Command", tags = "10, 11, 12, 13")]
+    #[prost(
+        oneof = "request::Command",
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26"
+    )]
     pub command: Option<request::Command>,
 }
 
@@ -106,6 +109,32 @@ pub mod request {
         Attach(AttachRequest),
         #[prost(message, tag = "13")]
         Close(CloseRequest),
+        #[prost(message, tag = "14")]
+        FileCapabilities(FileCapabilitiesRequest),
+        #[prost(message, tag = "15")]
+        FileStat(FileStatRequest),
+        #[prost(message, tag = "16")]
+        FileList(FileListRequest),
+        #[prost(message, tag = "17")]
+        BeginUpload(BeginUploadRequest),
+        #[prost(message, tag = "18")]
+        WriteFileChunk(WriteFileChunkRequest),
+        #[prost(message, tag = "19")]
+        QueryUpload(QueryUploadRequest),
+        #[prost(message, tag = "20")]
+        CommitUpload(CommitUploadRequest),
+        #[prost(message, tag = "21")]
+        AbortUpload(AbortUploadRequest),
+        #[prost(message, tag = "22")]
+        BeginDownload(BeginDownloadRequest),
+        #[prost(message, tag = "23")]
+        ReadFileChunk(ReadFileChunkRequest),
+        #[prost(message, tag = "24")]
+        MakeDirectory(MakeDirectoryRequest),
+        #[prost(message, tag = "25")]
+        RemoveFile(RemoveFileRequest),
+        #[prost(message, tag = "26")]
+        RenameFile(RenameFileRequest),
     }
 }
 
@@ -157,10 +186,122 @@ pub struct CloseRequest {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct FileCapabilitiesRequest {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FileStatRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub path: Vec<u8>,
+    #[prost(bool, tag = "2")]
+    pub follow_symlinks: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FileListRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub path: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub cursor: Vec<u8>,
+    #[prost(uint32, tag = "3")]
+    pub limit: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct BeginUploadRequest {
+    #[prost(string, tag = "1")]
+    pub transfer_id: String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub path: Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub size: u64,
+    #[prost(bytes = "vec", tag = "4")]
+    pub sha256: Vec<u8>,
+    #[prost(bool, tag = "5")]
+    pub overwrite: bool,
+    #[prost(uint32, tag = "6")]
+    pub mode: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct WriteFileChunkRequest {
+    #[prost(string, tag = "1")]
+    pub transfer_id: String,
+    #[prost(uint64, tag = "2")]
+    pub offset: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub data: Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub sha256: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct QueryUploadRequest {
+    #[prost(string, tag = "1")]
+    pub transfer_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CommitUploadRequest {
+    #[prost(string, tag = "1")]
+    pub transfer_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AbortUploadRequest {
+    #[prost(string, tag = "1")]
+    pub transfer_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct BeginDownloadRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub path: Vec<u8>,
+    #[prost(bool, tag = "2")]
+    pub want_sha256: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ReadFileChunkRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub path: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub snapshot: Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub offset: u64,
+    #[prost(uint32, tag = "4")]
+    pub length: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MakeDirectoryRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub path: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RemoveFileRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub path: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RenameFileRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub source: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub destination: Vec<u8>,
+    #[prost(bool, tag = "3")]
+    pub overwrite: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct Response {
     #[prost(string, tag = "1")]
     pub request_id: String,
-    #[prost(oneof = "response::Result", tags = "10, 11, 12, 13, 14")]
+    #[prost(
+        oneof = "response::Result",
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
+    )]
     pub result: Option<response::Result>,
 }
 
@@ -179,7 +320,111 @@ pub mod response {
         Ack(AckResponse),
         #[prost(message, tag = "14")]
         Error(ErrorResponse),
+        #[prost(message, tag = "15")]
+        FileCapabilities(FileCapabilitiesResponse),
+        #[prost(message, tag = "16")]
+        FileStat(FileStatResponse),
+        #[prost(message, tag = "17")]
+        FileList(FileListResponse),
+        #[prost(message, tag = "18")]
+        UploadStatus(UploadStatusResponse),
+        #[prost(message, tag = "19")]
+        BeginDownload(BeginDownloadResponse),
+        #[prost(message, tag = "20")]
+        FileChunk(FileChunkResponse),
     }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FileCapabilitiesResponse {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(uint32, tag = "2")]
+    pub max_chunk_size: u32,
+    #[prost(bool, tag = "3")]
+    pub resumable_uploads: bool,
+    #[prost(bool, tag = "4")]
+    pub atomic_upload_commit: bool,
+    #[prost(bool, tag = "5")]
+    pub chunk_sha256: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum FileKind {
+    Unspecified = 0,
+    Regular = 1,
+    Directory = 2,
+    Symlink = 3,
+    Other = 4,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FileMetadata {
+    #[prost(bytes = "vec", tag = "1")]
+    pub path: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub name: Vec<u8>,
+    #[prost(enumeration = "FileKind", tag = "3")]
+    pub kind: i32,
+    #[prost(uint64, tag = "4")]
+    pub size: u64,
+    #[prost(uint32, tag = "5")]
+    pub mode: u32,
+    #[prost(int64, tag = "6")]
+    pub modified_unix_ns: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FileStatResponse {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: Option<FileMetadata>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FileListResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub entries: Vec<FileMetadata>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub next_cursor: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct UploadStatusResponse {
+    #[prost(string, tag = "1")]
+    pub transfer_id: String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub path: Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub size: u64,
+    #[prost(uint64, tag = "4")]
+    pub committed_offset: u64,
+    #[prost(string, tag = "5")]
+    pub state: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct BeginDownloadResponse {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: Option<FileMetadata>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub snapshot: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub sha256: Vec<u8>,
+    #[prost(uint32, tag = "4")]
+    pub max_chunk_size: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FileChunkResponse {
+    #[prost(uint64, tag = "1")]
+    pub offset: u64,
+    #[prost(bytes = "vec", tag = "2")]
+    pub data: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub sha256: Vec<u8>,
+    #[prost(bool, tag = "4")]
+    pub eof: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]

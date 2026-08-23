@@ -1,23 +1,28 @@
 use std::{
+    fs,
     io::{IsTerminal, Write},
     net::SocketAddr,
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use astra_shell::{
-    client::{AstraClient, ServerTrust},
+    client::{AstraClient, ServerResponseError, ServerTrust},
     known_hosts::{StrictHostKeyChecking, default_known_hosts_file},
     protocol::{
-        AttachResponse, EnvironmentVariable, LOCALE_ENVIRONMENT_VARIABLES, Resize, SpawnRequest,
-        TerminalCommand, WireMessage, read_message, terminal_command, terminal_event, wire_message,
-        write_message,
+        AttachResponse, BeginDownloadResponse, BeginUploadRequest, EnvironmentVariable, FileKind,
+        FileMetadata, LOCALE_ENVIRONMENT_VARIABLES, ReadFileChunkRequest, Resize, SpawnRequest,
+        TerminalCommand, WireMessage, WriteFileChunkRequest, read_message, terminal_command,
+        terminal_event, wire_message, write_message,
     },
 };
 use clap::{Args, Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use tokio::io::AsyncReadExt;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "astra", version, about = "Astra persistent terminal client")]
@@ -66,6 +71,57 @@ enum Command {
     Close {
         #[arg(value_name = "TERMINAL")]
         terminal_id: String,
+    },
+    /// Browse and transfer files through Astra Files/1 on the existing QUIC connection.
+    #[command(name = "files", alias = "file")]
+    Files(FileArgs),
+}
+
+#[derive(Debug, Args)]
+struct FileArgs {
+    #[command(subcommand)]
+    command: FileCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum FileCommand {
+    /// Show the server's Astra Files protocol capabilities.
+    Capabilities,
+    /// List a remote directory.
+    Ls {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Show metadata for a remote path.
+    Stat {
+        path: PathBuf,
+        #[arg(long)]
+        no_follow: bool,
+    },
+    /// Upload a local file with automatic reconnect and resume.
+    Put {
+        local: PathBuf,
+        remote: PathBuf,
+        #[arg(short, long)]
+        overwrite: bool,
+    },
+    /// Download a remote file with automatic reconnect and resume.
+    Get {
+        remote: PathBuf,
+        local: Option<PathBuf>,
+        #[arg(short, long)]
+        overwrite: bool,
+    },
+    /// Create a remote directory.
+    Mkdir { path: PathBuf },
+    /// Remove a remote file, symlink, or empty directory.
+    Rm { path: PathBuf },
+    /// Rename a remote file or directory.
+    Mv {
+        source: PathBuf,
+        destination: PathBuf,
+        #[arg(short, long)]
+        overwrite: bool,
     },
 }
 
@@ -212,7 +268,438 @@ async fn run() -> Result<()> {
         Some(Command::Close { terminal_id }) => {
             println!("{}", client.close(terminal_id).await?)
         }
+        Some(Command::Files(arguments)) => run_file_command(client, arguments.command).await?,
     }
+    Ok(())
+}
+
+async fn run_file_command(mut client: AstraClient, command: FileCommand) -> Result<()> {
+    match command {
+        FileCommand::Capabilities => {
+            let capabilities = client.file_capabilities().await?;
+            println!("Astra Files/{}", capabilities.version);
+            println!("max chunk: {} bytes", capabilities.max_chunk_size);
+            println!("resumable uploads: {}", capabilities.resumable_uploads);
+            println!(
+                "atomic upload commit: {}",
+                capabilities.atomic_upload_commit
+            );
+            println!("chunk SHA-256: {}", capabilities.chunk_sha256);
+        }
+        FileCommand::Ls { path } => {
+            let path = remote_path_bytes(&path);
+            let mut cursor = Vec::new();
+            loop {
+                let page = client.file_list(path.clone(), cursor, 200).await?;
+                for entry in page.entries {
+                    print_file_metadata(&entry);
+                }
+                if page.next_cursor.is_empty() {
+                    break;
+                }
+                cursor = page.next_cursor;
+            }
+        }
+        FileCommand::Stat { path, no_follow } => {
+            let stat = client
+                .file_stat(remote_path_bytes(&path), !no_follow)
+                .await?;
+            let metadata = stat
+                .metadata
+                .context("server returned an empty file stat response")?;
+            print_file_metadata(&metadata);
+            println!("path: {}", String::from_utf8_lossy(&metadata.path));
+            println!("modified: {} ns since epoch", metadata.modified_unix_ns);
+        }
+        FileCommand::Put {
+            local,
+            remote,
+            overwrite,
+        } => upload_file(&mut client, &local, &remote, overwrite).await?,
+        FileCommand::Get {
+            remote,
+            local,
+            overwrite,
+        } => {
+            let local = match local {
+                Some(path) => path,
+                None => PathBuf::from(
+                    remote
+                        .file_name()
+                        .context("remote path has no file name; provide a local destination")?,
+                ),
+            };
+            download_file(&mut client, &remote, &local, overwrite).await?;
+        }
+        FileCommand::Mkdir { path } => {
+            println!("{}", client.make_directory(remote_path_bytes(&path)).await?);
+        }
+        FileCommand::Rm { path } => {
+            println!("{}", client.remove_file(remote_path_bytes(&path)).await?);
+        }
+        FileCommand::Mv {
+            source,
+            destination,
+            overwrite,
+        } => {
+            println!(
+                "{}",
+                client
+                    .rename_file(
+                        remote_path_bytes(&source),
+                        remote_path_bytes(&destination),
+                        overwrite,
+                    )
+                    .await?
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn upload_file(
+    client: &mut AstraClient,
+    local: &Path,
+    remote: &Path,
+    overwrite: bool,
+) -> Result<()> {
+    let metadata = fs::metadata(local)
+        .with_context(|| format!("failed to inspect local file {}", local.display()))?;
+    if !metadata.is_file() {
+        bail!("{} is not a regular file", local.display())
+    }
+    let local_path = local.to_path_buf();
+    let expected_sha256 =
+        tokio::task::spawn_blocking(move || sha256_local_file(&local_path)).await??;
+    let capabilities = client.file_capabilities().await?;
+    if capabilities.version != 1
+        || !capabilities.resumable_uploads
+        || !capabilities.atomic_upload_commit
+        || !capabilities.chunk_sha256
+    {
+        bail!("server does not provide the required Astra Files/1 upload capabilities")
+    }
+    let chunk_size = usize::try_from(capabilities.max_chunk_size)
+        .unwrap_or(1024 * 1024)
+        .clamp(1, 1024 * 1024);
+    let request = BeginUploadRequest {
+        transfer_id: Uuid::new_v4().to_string(),
+        path: remote_path_bytes(remote),
+        size: metadata.len(),
+        sha256: expected_sha256,
+        overwrite,
+        mode: metadata.permissions().mode() & 0o777,
+    };
+    let mut status = begin_upload_with_reconnect(client, &request).await?;
+    if status.state == "completed" {
+        println!("already uploaded: {}", remote.display());
+        return Ok(());
+    }
+    let mut file = tokio::fs::File::open(local)
+        .await
+        .with_context(|| format!("failed to open local file {}", local.display()))?;
+    let mut offset = status.committed_offset;
+    while offset < request.size {
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let remaining =
+            usize::try_from((request.size - offset).min(chunk_size as u64)).unwrap_or(chunk_size);
+        let mut data = vec![0_u8; remaining];
+        file.read_exact(&mut data).await.with_context(|| {
+            format!(
+                "local file {} changed while being uploaded",
+                local.display()
+            )
+        })?;
+        let chunk = WriteFileChunkRequest {
+            transfer_id: request.transfer_id.clone(),
+            offset,
+            sha256: Sha256::digest(&data).to_vec(),
+            data,
+        };
+        status = write_chunk_with_reconnect(client, &request, chunk).await?;
+        offset = status.committed_offset;
+        eprint!(
+            "\rUploading {}: {offset}/{} bytes",
+            local.display(),
+            request.size
+        );
+        std::io::stderr().flush()?;
+    }
+    let committed = commit_upload_with_reconnect(client, &request).await?;
+    eprintln!();
+    if committed.state != "completed" {
+        bail!("server did not complete upload {}", request.transfer_id)
+    }
+    println!("uploaded {} -> {}", local.display(), remote.display());
+    Ok(())
+}
+
+async fn download_file(
+    client: &mut AstraClient,
+    remote: &Path,
+    local: &Path,
+    overwrite: bool,
+) -> Result<()> {
+    if local.exists() && !overwrite {
+        bail!(
+            "local destination {} already exists; pass --overwrite to replace it",
+            local.display()
+        )
+    }
+    let remote_path = remote_path_bytes(remote);
+    let mut download = begin_download_with_reconnect(client, remote_path.clone()).await?;
+    let metadata = download
+        .metadata
+        .clone()
+        .context("server returned download metadata without a file")?;
+    if FileKind::try_from(metadata.kind).unwrap_or(FileKind::Unspecified) != FileKind::Regular {
+        bail!("remote path {} is not a regular file", remote.display())
+    }
+    if download.sha256.len() != 32 || download.snapshot.len() != 32 {
+        bail!("server returned incomplete download integrity metadata")
+    }
+    let (temporary, snapshot_file) = download_temporary_paths(local)?;
+    prepare_download_temporary(&temporary, &snapshot_file, &download.snapshot).await?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&temporary)
+        .await
+        .with_context(|| format!("failed to open {}", temporary.display()))?;
+    let mut offset = file.metadata().await?.len();
+    if offset > metadata.size {
+        file.set_len(0).await?;
+        offset = 0;
+    }
+    let chunk_size = usize::try_from(download.max_chunk_size)
+        .unwrap_or(1024 * 1024)
+        .clamp(1, 1024 * 1024);
+    while offset < metadata.size {
+        let request = ReadFileChunkRequest {
+            path: remote_path.clone(),
+            snapshot: download.snapshot.clone(),
+            offset,
+            length: u32::try_from(chunk_size).unwrap_or(1024 * 1024),
+        };
+        let (next_download, chunk) =
+            read_chunk_with_reconnect(client, remote_path.clone(), &download, request).await?;
+        download = next_download;
+        if chunk.offset != offset || chunk.data.is_empty() {
+            bail!("server returned a non-progressing download chunk")
+        }
+        if Sha256::digest(&chunk.data).as_slice() != chunk.sha256.as_slice() {
+            bail!("downloaded chunk failed SHA-256 verification")
+        }
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        file.write_all(&chunk.data).await?;
+        offset += chunk.data.len() as u64;
+        eprint!(
+            "\rDownloading {}: {offset}/{} bytes",
+            remote.display(),
+            metadata.size
+        );
+        std::io::stderr().flush()?;
+    }
+    file.sync_all().await?;
+    drop(file);
+    let verify_path = temporary.clone();
+    let local_sha256 =
+        tokio::task::spawn_blocking(move || sha256_local_file(&verify_path)).await??;
+    if local_sha256 != download.sha256 {
+        bail!("complete download failed SHA-256 verification; partial file was retained")
+    }
+    fs::set_permissions(
+        &temporary,
+        fs::Permissions::from_mode(metadata.mode & 0o777),
+    )?;
+    fs::rename(&temporary, local).with_context(|| {
+        format!(
+            "failed to commit download {} to {}",
+            temporary.display(),
+            local.display()
+        )
+    })?;
+    let _ = fs::remove_file(snapshot_file);
+    eprintln!();
+    println!("downloaded {} -> {}", remote.display(), local.display());
+    Ok(())
+}
+
+async fn begin_upload_with_reconnect(
+    client: &mut AstraClient,
+    request: &BeginUploadRequest,
+) -> Result<astra_shell::protocol::UploadStatusResponse> {
+    loop {
+        match client.begin_upload(request.clone()).await {
+            Ok(status) => return Ok(status),
+            Err(error) if is_server_error(&error) => return Err(error),
+            Err(error) => reconnect_file_client(client, &error).await?,
+        }
+    }
+}
+
+async fn write_chunk_with_reconnect(
+    client: &mut AstraClient,
+    begin: &BeginUploadRequest,
+    chunk: WriteFileChunkRequest,
+) -> Result<astra_shell::protocol::UploadStatusResponse> {
+    match client.write_file_chunk(chunk).await {
+        Ok(status) => Ok(status),
+        Err(error) if is_server_error(&error) => Err(error),
+        Err(error) => {
+            reconnect_file_client(client, &error).await?;
+            begin_upload_with_reconnect(client, begin).await
+        }
+    }
+}
+
+async fn commit_upload_with_reconnect(
+    client: &mut AstraClient,
+    begin: &BeginUploadRequest,
+) -> Result<astra_shell::protocol::UploadStatusResponse> {
+    loop {
+        match client.commit_upload(begin.transfer_id.clone()).await {
+            Ok(status) => return Ok(status),
+            Err(error) if is_server_error(&error) => return Err(error),
+            Err(error) => {
+                reconnect_file_client(client, &error).await?;
+                let status = begin_upload_with_reconnect(client, begin).await?;
+                if status.state == "completed" {
+                    return Ok(status);
+                }
+            }
+        }
+    }
+}
+
+async fn begin_download_with_reconnect(
+    client: &mut AstraClient,
+    path: Vec<u8>,
+) -> Result<BeginDownloadResponse> {
+    loop {
+        match client.begin_download(path.clone(), true).await {
+            Ok(download) => return Ok(download),
+            Err(error) if is_server_error(&error) => return Err(error),
+            Err(error) => reconnect_file_client(client, &error).await?,
+        }
+    }
+}
+
+async fn read_chunk_with_reconnect(
+    client: &mut AstraClient,
+    path: Vec<u8>,
+    download: &BeginDownloadResponse,
+    request: ReadFileChunkRequest,
+) -> Result<(
+    BeginDownloadResponse,
+    astra_shell::protocol::FileChunkResponse,
+)> {
+    let mut current = download.clone();
+    loop {
+        match client.read_file_chunk(request.clone()).await {
+            Ok(chunk) => return Ok((current, chunk)),
+            Err(error) if is_server_error(&error) => return Err(error),
+            Err(error) => {
+                reconnect_file_client(client, &error).await?;
+                let resumed = begin_download_with_reconnect(client, path.clone()).await?;
+                if resumed.snapshot != download.snapshot || resumed.sha256 != download.sha256 {
+                    bail!("remote file changed while reconnecting; download was not resumed")
+                }
+                current = resumed;
+            }
+        }
+    }
+}
+
+async fn reconnect_file_client(client: &mut AstraClient, error: &anyhow::Error) -> Result<()> {
+    eprintln!("\n[astra: file connection lost ({error:#}); reconnecting]");
+    let mut delay = Duration::from_millis(250);
+    loop {
+        match client.reconnect().await {
+            Ok(next) => {
+                *client = next;
+                eprintln!("[astra: file connection restored]");
+                return Ok(());
+            }
+            Err(error) => eprintln!("[astra: file reconnect failed: {error:#}]"),
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(5));
+    }
+}
+
+fn is_server_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ServerResponseError>().is_some()
+}
+
+fn remote_path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_bytes().to_vec()
+}
+
+fn print_file_metadata(metadata: &FileMetadata) {
+    let kind = match FileKind::try_from(metadata.kind).unwrap_or(FileKind::Unspecified) {
+        FileKind::Regular => '-',
+        FileKind::Directory => 'd',
+        FileKind::Symlink => 'l',
+        FileKind::Other | FileKind::Unspecified => '?',
+    };
+    println!(
+        "{}{mode:03o}  {size:>12}  {name}",
+        kind,
+        mode = metadata.mode & 0o777,
+        size = metadata.size,
+        name = String::from_utf8_lossy(&metadata.name),
+    );
+}
+
+fn sha256_local_file(path: &Path) -> Result<Vec<u8>> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open {} for checksum", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let length = std::io::Read::read(&mut file, &mut buffer)?;
+        if length == 0 {
+            break;
+        }
+        digest.update(&buffer[..length]);
+    }
+    Ok(digest.finalize().to_vec())
+}
+
+fn download_temporary_paths(destination: &Path) -> Result<(PathBuf, PathBuf)> {
+    let name = destination
+        .file_name()
+        .context("local download destination has no file name")?;
+    let parent = destination.parent().unwrap_or(Path::new("."));
+    let mut temporary_name = name.to_os_string();
+    temporary_name.push(".astra-part");
+    let temporary = parent.join(temporary_name);
+    let mut snapshot_name = temporary.as_os_str().to_os_string();
+    snapshot_name.push(".snapshot");
+    Ok((temporary, PathBuf::from(snapshot_name)))
+}
+
+async fn prepare_download_temporary(
+    temporary: &Path,
+    snapshot_file: &Path,
+    snapshot: &[u8],
+) -> Result<()> {
+    let reusable = match tokio::fs::read(snapshot_file).await {
+        Ok(existing) => existing == snapshot && temporary.is_file(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if !reusable {
+        match tokio::fs::remove_file(temporary).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    tokio::fs::write(snapshot_file, snapshot).await?;
     Ok(())
 }
 

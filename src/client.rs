@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fmt, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -14,10 +14,29 @@ use crate::{
     auth::{authentication_payload, sign_challenge},
     known_hosts::{StrictHostKeyChecking, verify_server_certificate},
     protocol::{
-        AttachRequest, AttachResponse, CloseRequest, ListRequest, Request, Response, SpawnRequest,
-        WireMessage, read_message, request, response, wire_message, write_message,
+        AbortUploadRequest, AttachRequest, AttachResponse, BeginDownloadRequest,
+        BeginDownloadResponse, BeginUploadRequest, CloseRequest, CommitUploadRequest,
+        FileCapabilitiesRequest, FileCapabilitiesResponse, FileChunkResponse, FileListRequest,
+        FileListResponse, FileStatRequest, FileStatResponse, ListRequest, MakeDirectoryRequest,
+        QueryUploadRequest, ReadFileChunkRequest, RemoveFileRequest, RenameFileRequest, Request,
+        Response, SpawnRequest, UploadStatusResponse, WireMessage, WriteFileChunkRequest,
+        read_message, request, response, wire_message, write_message,
     },
 };
+
+#[derive(Debug)]
+pub struct ServerResponseError {
+    pub code: String,
+    pub message: String,
+}
+
+impl fmt::Display for ServerResponseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ServerResponseError {}
 
 #[derive(Clone, Debug)]
 pub enum ServerTrust {
@@ -202,9 +221,7 @@ impl AstraClient {
         let response = self.unary(request::Command::List(ListRequest {})).await?;
         match response.result {
             Some(response::Result::List(list)) => Ok(list.terminals),
-            Some(response::Result::Error(error)) => {
-                bail!("{}: {}", error.code, error.message)
-            }
+            Some(response::Result::Error(error)) => Err(server_response_error(error)),
             _ => bail!("server returned the wrong response to list"),
         }
     }
@@ -215,9 +232,7 @@ impl AstraClient {
             Some(response::Result::Spawn(spawn)) => spawn
                 .terminal
                 .context("server returned an empty spawn response"),
-            Some(response::Result::Error(error)) => {
-                bail!("{}: {}", error.code, error.message)
-            }
+            Some(response::Result::Error(error)) => Err(server_response_error(error)),
             _ => bail!("server returned the wrong response to spawn"),
         }
     }
@@ -228,9 +243,7 @@ impl AstraClient {
             .await?;
         match response.result {
             Some(response::Result::Ack(ack)) => Ok(ack.message),
-            Some(response::Result::Error(error)) => {
-                bail!("{}: {}", error.code, error.message)
-            }
+            Some(response::Result::Error(error)) => Err(server_response_error(error)),
             _ => bail!("server returned the wrong response to close"),
         }
     }
@@ -260,15 +273,189 @@ impl AstraClient {
         let response = require_response(&mut recv, &request_id).await?;
         match response.result {
             Some(response::Result::Attach(attach)) => Ok((send, recv, attach)),
-            Some(response::Result::Error(error)) => {
-                bail!("{}: {}", error.code, error.message)
-            }
+            Some(response::Result::Error(error)) => Err(server_response_error(error)),
             _ => bail!("server returned the wrong response to attach"),
         }
     }
 
+    pub async fn file_capabilities(&self) -> Result<FileCapabilitiesResponse> {
+        let response = self
+            .file_unary(request::Command::FileCapabilities(
+                FileCapabilitiesRequest {},
+            ))
+            .await?;
+        match response.result {
+            Some(response::Result::FileCapabilities(capabilities)) => Ok(capabilities),
+            Some(response::Result::Error(error)) => Err(server_response_error(error)),
+            _ => bail!("server returned the wrong response to file capabilities"),
+        }
+    }
+
+    pub async fn file_stat(
+        &self,
+        path: Vec<u8>,
+        follow_symlinks: bool,
+    ) -> Result<FileStatResponse> {
+        let response = self
+            .file_unary(request::Command::FileStat(FileStatRequest {
+                path,
+                follow_symlinks,
+            }))
+            .await?;
+        match response.result {
+            Some(response::Result::FileStat(stat)) => Ok(stat),
+            Some(response::Result::Error(error)) => Err(server_response_error(error)),
+            _ => bail!("server returned the wrong response to file stat"),
+        }
+    }
+
+    pub async fn file_list(
+        &self,
+        path: Vec<u8>,
+        cursor: Vec<u8>,
+        limit: u32,
+    ) -> Result<FileListResponse> {
+        let response = self
+            .file_unary(request::Command::FileList(FileListRequest {
+                path,
+                cursor,
+                limit,
+            }))
+            .await?;
+        match response.result {
+            Some(response::Result::FileList(list)) => Ok(list),
+            Some(response::Result::Error(error)) => Err(server_response_error(error)),
+            _ => bail!("server returned the wrong response to file list"),
+        }
+    }
+
+    pub async fn begin_upload(&self, request: BeginUploadRequest) -> Result<UploadStatusResponse> {
+        self.upload_status(request::Command::BeginUpload(request))
+            .await
+    }
+
+    pub async fn write_file_chunk(
+        &self,
+        request: WriteFileChunkRequest,
+    ) -> Result<UploadStatusResponse> {
+        self.upload_status(request::Command::WriteFileChunk(request))
+            .await
+    }
+
+    pub async fn query_upload(&self, transfer_id: String) -> Result<UploadStatusResponse> {
+        self.upload_status(request::Command::QueryUpload(QueryUploadRequest {
+            transfer_id,
+        }))
+        .await
+    }
+
+    pub async fn commit_upload(&self, transfer_id: String) -> Result<UploadStatusResponse> {
+        self.upload_status(request::Command::CommitUpload(CommitUploadRequest {
+            transfer_id,
+        }))
+        .await
+    }
+
+    pub async fn abort_upload(&self, transfer_id: String) -> Result<UploadStatusResponse> {
+        self.upload_status(request::Command::AbortUpload(AbortUploadRequest {
+            transfer_id,
+        }))
+        .await
+    }
+
+    pub async fn begin_download(
+        &self,
+        path: Vec<u8>,
+        want_sha256: bool,
+    ) -> Result<BeginDownloadResponse> {
+        let response = self
+            .file_unary(request::Command::BeginDownload(BeginDownloadRequest {
+                path,
+                want_sha256,
+            }))
+            .await?;
+        match response.result {
+            Some(response::Result::BeginDownload(download)) => Ok(download),
+            Some(response::Result::Error(error)) => Err(server_response_error(error)),
+            _ => bail!("server returned the wrong response to begin download"),
+        }
+    }
+
+    pub async fn read_file_chunk(
+        &self,
+        request: ReadFileChunkRequest,
+    ) -> Result<FileChunkResponse> {
+        let response = self
+            .file_unary(request::Command::ReadFileChunk(request))
+            .await?;
+        match response.result {
+            Some(response::Result::FileChunk(chunk)) => Ok(chunk),
+            Some(response::Result::Error(error)) => Err(server_response_error(error)),
+            _ => bail!("server returned the wrong response to file read"),
+        }
+    }
+
+    pub async fn make_directory(&self, path: Vec<u8>) -> Result<String> {
+        self.file_ack(request::Command::MakeDirectory(MakeDirectoryRequest {
+            path,
+        }))
+        .await
+    }
+
+    pub async fn remove_file(&self, path: Vec<u8>) -> Result<String> {
+        self.file_ack(request::Command::RemoveFile(RemoveFileRequest { path }))
+            .await
+    }
+
+    pub async fn rename_file(
+        &self,
+        source: Vec<u8>,
+        destination: Vec<u8>,
+        overwrite: bool,
+    ) -> Result<String> {
+        self.file_ack(request::Command::RenameFile(RenameFileRequest {
+            source,
+            destination,
+            overwrite,
+        }))
+        .await
+    }
+
+    async fn upload_status(&self, command: request::Command) -> Result<UploadStatusResponse> {
+        let response = self.file_unary(command).await?;
+        match response.result {
+            Some(response::Result::UploadStatus(status)) => Ok(status),
+            Some(response::Result::Error(error)) => Err(server_response_error(error)),
+            _ => bail!("server returned the wrong response to upload operation"),
+        }
+    }
+
+    async fn file_ack(&self, command: request::Command) -> Result<String> {
+        let response = self.file_unary(command).await?;
+        match response.result {
+            Some(response::Result::Ack(ack)) => Ok(ack.message),
+            Some(response::Result::Error(error)) => Err(server_response_error(error)),
+            _ => bail!("server returned the wrong response to file operation"),
+        }
+    }
+
     async fn unary(&self, command: request::Command) -> Result<Response> {
+        self.unary_with_priority(command, 0).await
+    }
+
+    async fn file_unary(&self, command: request::Command) -> Result<Response> {
+        // Quinn schedules higher numeric priorities first. File traffic stays below terminal
+        // streams so a large upload cannot make interactive input feel sluggish.
+        self.unary_with_priority(command, -10).await
+    }
+
+    async fn unary_with_priority(
+        &self,
+        command: request::Command,
+        priority: i32,
+    ) -> Result<Response> {
         let (mut send, mut recv) = self.connection.open_bi().await?;
+        send.set_priority(priority)?;
         let request_id = uuid::Uuid::new_v4().to_string();
         write_message(
             &mut send,
@@ -281,6 +468,14 @@ impl AstraClient {
         send.finish()?;
         require_response(&mut recv, &request_id).await
     }
+}
+
+fn server_response_error(error: crate::protocol::ErrorResponse) -> anyhow::Error {
+    ServerResponseError {
+        code: error.code,
+        message: error.message,
+    }
+    .into()
 }
 
 fn verify_connection_certificate(

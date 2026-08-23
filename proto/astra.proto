@@ -40,6 +40,19 @@ message Request {
     SpawnRequest spawn = 11;
     AttachRequest attach = 12;
     CloseRequest close = 13;
+    FileCapabilitiesRequest file_capabilities = 14;
+    FileStatRequest file_stat = 15;
+    FileListRequest file_list = 16;
+    BeginUploadRequest begin_upload = 17;
+    WriteFileChunkRequest write_file_chunk = 18;
+    QueryUploadRequest query_upload = 19;
+    CommitUploadRequest commit_upload = 20;
+    AbortUploadRequest abort_upload = 21;
+    BeginDownloadRequest begin_download = 22;
+    ReadFileChunkRequest read_file_chunk = 23;
+    MakeDirectoryRequest make_directory = 24;
+    RemoveFileRequest remove_file = 25;
+    RenameFileRequest rename_file = 26;
   }
 }
 message ListRequest {}
@@ -67,6 +80,53 @@ message AttachRequest {
 }
 message CloseRequest { string terminal_id = 1; }
 
+// Astra Files/1 uses stable client-generated transfer IDs and offset-addressed chunks rather than
+// connection-scoped file handles. Repeating BeginUpload or WriteFileChunk after reconnect is safe.
+message FileCapabilitiesRequest {}
+message FileStatRequest {
+  bytes path = 1;
+  bool follow_symlinks = 2;
+}
+message FileListRequest {
+  bytes path = 1;
+  bytes cursor = 2;
+  uint32 limit = 3;
+}
+message BeginUploadRequest {
+  string transfer_id = 1;
+  bytes path = 2;
+  uint64 size = 3;
+  bytes sha256 = 4;
+  bool overwrite = 5;
+  uint32 mode = 6;
+}
+message WriteFileChunkRequest {
+  string transfer_id = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bytes sha256 = 4;
+}
+message QueryUploadRequest { string transfer_id = 1; }
+message CommitUploadRequest { string transfer_id = 1; }
+message AbortUploadRequest { string transfer_id = 1; }
+message BeginDownloadRequest {
+  bytes path = 1;
+  bool want_sha256 = 2;
+}
+message ReadFileChunkRequest {
+  bytes path = 1;
+  bytes snapshot = 2;
+  uint64 offset = 3;
+  uint32 length = 4;
+}
+message MakeDirectoryRequest { bytes path = 1; }
+message RemoveFileRequest { bytes path = 1; }
+message RenameFileRequest {
+  bytes source = 1;
+  bytes destination = 2;
+  bool overwrite = 3;
+}
+
 message Response {
   string request_id = 1;
   oneof result {
@@ -75,6 +135,12 @@ message Response {
     AttachResponse attach = 12;
     AckResponse ack = 13;
     ErrorResponse error = 14;
+    FileCapabilitiesResponse file_capabilities = 15;
+    FileStatResponse file_stat = 16;
+    FileListResponse file_list = 17;
+    UploadStatusResponse upload_status = 18;
+    BeginDownloadResponse begin_download = 19;
+    FileChunkResponse file_chunk = 20;
   }
 }
 message TerminalInfo {
@@ -104,6 +170,54 @@ message AckResponse { string message = 1; }
 message ErrorResponse {
   string code = 1;
   string message = 2;
+}
+
+message FileCapabilitiesResponse {
+  uint32 version = 1;
+  uint32 max_chunk_size = 2;
+  bool resumable_uploads = 3;
+  bool atomic_upload_commit = 4;
+  bool chunk_sha256 = 5;
+}
+enum FileKind {
+  FILE_KIND_UNSPECIFIED = 0;
+  FILE_KIND_REGULAR = 1;
+  FILE_KIND_DIRECTORY = 2;
+  FILE_KIND_SYMLINK = 3;
+  FILE_KIND_OTHER = 4;
+}
+message FileMetadata {
+  // Unix paths are bytes so names that are not valid UTF-8 remain addressable.
+  bytes path = 1;
+  bytes name = 2;
+  FileKind kind = 3;
+  uint64 size = 4;
+  uint32 mode = 5;
+  int64 modified_unix_ns = 6;
+}
+message FileStatResponse { FileMetadata metadata = 1; }
+message FileListResponse {
+  repeated FileMetadata entries = 1;
+  bytes next_cursor = 2;
+}
+message UploadStatusResponse {
+  string transfer_id = 1;
+  bytes path = 2;
+  uint64 size = 3;
+  uint64 committed_offset = 4;
+  string state = 5;
+}
+message BeginDownloadResponse {
+  FileMetadata metadata = 1;
+  bytes snapshot = 2;
+  bytes sha256 = 3;
+  uint32 max_chunk_size = 4;
+}
+message FileChunkResponse {
+  uint64 offset = 1;
+  bytes data = 2;
+  bytes sha256 = 3;
+  bool eof = 4;
 }
 
 message TerminalCommand {

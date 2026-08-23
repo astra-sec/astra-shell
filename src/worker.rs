@@ -19,7 +19,9 @@ use tracing::{info, warn};
 
 use crate::{
     accounts::{SystemAccount, effective_uid},
+    files::FileService,
     process_lock::ProcessLock,
+    protocol::{WireMessage, write_message},
     server::handle_worker_request,
     terminal::TerminalManager,
 };
@@ -49,9 +51,11 @@ impl WorkerRouter {
         account: &SystemAccount,
         mut quic_send: quinn::SendStream,
         mut quic_recv: quinn::RecvStream,
+        first_message: WireMessage,
     ) -> Result<()> {
         let worker = self.connect(account).await?;
         let (mut worker_recv, mut worker_send) = worker.into_split();
+        write_message(&mut worker_send, &first_message).await?;
         let client_to_worker = async {
             copy(&mut quic_recv, &mut worker_send).await?;
             worker_send.shutdown().await
@@ -259,6 +263,7 @@ pub async fn serve_worker(
     fs::write(&pid_file, format!("{}\n", std::process::id()))?;
     fs::set_permissions(&pid_file, fs::Permissions::from_mode(0o600))?;
     let manager = TerminalManager::new(session_root)?;
+    let files = FileService::new(manager.session_root().to_path_buf())?;
     match fs::remove_file(&socket) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -270,9 +275,10 @@ pub async fn serve_worker(
     loop {
         let (stream, _) = listener.accept().await?;
         let manager = manager.clone();
+        let files = files.clone();
         tokio::spawn(async move {
             let (recv, send) = stream.into_split();
-            if let Err(error) = handle_worker_request(manager, send, recv).await {
+            if let Err(error) = handle_worker_request(manager, files, send, recv).await {
                 warn!(%error, "worker request failed");
             }
         });

@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod auth;
 pub mod client;
+pub mod files;
 pub mod known_hosts;
 pub(crate) mod process_lock;
 pub mod protocol;

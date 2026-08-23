@@ -84,6 +84,15 @@ start_gateway() {
 start_gateway "$run_dir/gateway-1.log"
 "${client[@]}" list >/dev/null
 
+managed_remote_dir=".local-test/$(basename "$run_dir")/managed-files"
+dd if=/dev/urandom of="$run_dir/managed-source.bin" bs=1048576 count=2 status=none
+"${client[@]}" files mkdir "$managed_remote_dir"
+"${client[@]}" files put "$run_dir/managed-source.bin" "$managed_remote_dir/source.bin"
+"${client[@]}" files get "$managed_remote_dir/source.bin" "$run_dir/managed-downloaded.bin"
+cmp "$run_dir/managed-source.bin" "$run_dir/managed-downloaded.bin"
+"${client[@]}" files rm "$managed_remote_dir/source.bin"
+"${client[@]}" files rm "$managed_remote_dir"
+
 unicode_output="$(
   { sleep 1; } | \
     LC_ALL=astra_MISSING.UTF-8 TERM=astra-test-256color \
