@@ -1,0 +1,31 @@
+[Unit]
+Description=Astra Shell multi-user QUIC gateway
+Documentation=https://github.com/astra-sec/astra-shell
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/home/mimi/astra-shell
+Environment=RUST_LOG=astra_shell=info
+ExecStart=/usr/local/sbin/astrad serve --managed --listen 0.0.0.0:4433 --state-dir /home/mimi/astra-shell/state
+Restart=on-failure
+RestartSec=2s
+
+# Managed workers own the users' PTYs and deliberately outlive gateway restarts.
+KillMode=process
+TimeoutStopSec=10s
+
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

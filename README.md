@@ -198,6 +198,28 @@ state/users/1002/worker.pid
 
 用户 worker 不随 gateway 退出，因此 gateway 可以滚动重启而不关闭用户 PTY。非 root 也可以启动 `--managed` 做测试，但只能登录当前 UID，不能切换到其他账户。
 
+### systemd 服务
+
+仓库提供了 [`contrib/systemd/astrad.service`](contrib/systemd/astrad.service)。不要让 root 服务直接执行普通用户可修改的 `target/debug/astrad`；先安装一份 root 所有的可执行文件，再安装 unit：
+
+```bash
+cargo build --bin astrad
+sudo install -o root -g root -m 0755 target/debug/astrad /usr/local/sbin/astrad
+sudo install -o root -g root -m 0644 \
+  contrib/systemd/astrad.service /etc/systemd/system/astrad.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now astrad.service
+```
+
+查看状态和日志：
+
+```bash
+systemctl status astrad.service
+journalctl -u astrad.service -f
+```
+
+unit 的 `KillMode=process` 是 managed 模式的持久会话语义所必需的：停止或重启 gateway 时只终止主进程，不误杀已经降权且持有 PTY 的用户 worker。修改 unit 中的监听地址、状态目录或工作目录后，需要执行 `sudo systemctl daemon-reload && sudo systemctl restart astrad.service`。
+
 `list` 只返回对应 worker 当前实际持有且仍在运行的 Terminal。进程退出后，最终输出会在内存中短暂保留以完成已发起的 attach，随后记录被清理；worker 或 rootless daemon 重启后不会从磁盘恢复历史 Terminal。
 
 `--authorized-keys-dir DIR` 是测试/集中式密钥目录选项，此时 gateway 读取 `DIR/USERNAME`；生产默认应沿用各用户的 `~/.ssh/authorized_keys`。
