@@ -36,6 +36,7 @@ tokio = { version = "1.47", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.18", features = ["v4"] }
+vt100 = "0.16.2"
 
 [dev-dependencies]
 tempfile = "3.21"

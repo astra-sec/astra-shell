@@ -624,6 +624,28 @@ where
                 .await?
             }
         },
+        Some(request::Command::RenameTerminal(rename)) => match manager.get(&rename.terminal_id) {
+            Some(terminal) => {
+                terminal.rename(rename.name);
+                send_response(
+                    &mut send,
+                    request_id,
+                    response::Result::Ack(AckResponse {
+                        message: "terminal renamed".into(),
+                    }),
+                )
+                .await?;
+            }
+            None => {
+                send_error(
+                    &mut send,
+                    request_id,
+                    "not_found",
+                    anyhow!("terminal is not active"),
+                )
+                .await?
+            }
+        },
         Some(request::Command::Attach(attach)) => {
             let Some(terminal) = manager.get(&attach.terminal_id) else {
                 send_error(
@@ -903,7 +925,7 @@ where
             return Ok(());
         }
     };
-    let (history, mut events) = terminal.snapshot_and_subscribe();
+    let (snapshot, mut events) = terminal.snapshot_and_subscribe();
     let info = terminal.info();
     send_response(
         &mut send,
@@ -912,8 +934,9 @@ where
             terminal: Some(info.clone()),
             lease_id: lease.lease_id.clone(),
             read_only,
-            history,
+            history: Vec::new(),
             resume_token: lease.resume_token.clone(),
+            snapshot: Some(snapshot),
         }),
     )
     .await?;
@@ -982,15 +1005,26 @@ where
                                 terminal_event::Event::Error(message),
                             ).await?;
                         }
-                        Err(broadcast_error) => {
+                        Ok(PtyEvent::Interactive(interactive)) => {
                             write_terminal_event(
                                 &mut send,
                                 &info.id,
-                                terminal_event::Event::Error(format!(
-                                    "attachment fell behind terminal output: {broadcast_error}"
-                                )),
+                                terminal_event::Event::Interactive(interactive),
                             ).await?;
                         }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // A tmux-style authoritative grid lets a slow client
+                            // recover exactly instead of continuing after a gap
+                            // in the byte stream.
+                            let (snapshot, replacement) = terminal.snapshot_and_subscribe();
+                            events = replacement;
+                            write_terminal_event(
+                                &mut send,
+                                &info.id,
+                                terminal_event::Event::Snapshot(snapshot),
+                            ).await?;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }

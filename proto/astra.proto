@@ -55,6 +55,7 @@ message Request {
     RenameFileRequest rename_file = 26;
     GitStatusRequest git_status = 27;
     WatchFilesRequest watch_files = 28;
+    RenameTerminalRequest rename_terminal = 29;
   }
 }
 message ListRequest {}
@@ -81,6 +82,11 @@ message AttachRequest {
   string resume_token = 4;
 }
 message CloseRequest { string terminal_id = 1; }
+message RenameTerminalRequest {
+  string terminal_id = 1;
+  // Empty clears the user-defined name and restores the program-reported title in clients.
+  string name = 2;
+}
 
 // Astra Files/1 uses stable client-generated transfer IDs and offset-addressed chunks rather than
 // connection-scoped file handles. Repeating BeginUpload or WriteFileChunk after reconnect is safe.
@@ -161,9 +167,21 @@ message TerminalInfo {
   uint32 cols = 8;
   // Human-facing number scoped to one user worker lifecycle. Zero means absent.
   uint64 display_id = 9;
+  // User-defined persistent label. Absent means clients should use the program-reported title.
+  optional string custom_name = 10;
+  optional bool interactive = 11;
 }
 message ListResponse { repeated TerminalInfo terminals = 1; }
 message SpawnResponse { TerminalInfo terminal = 1; }
+message TerminalSnapshot {
+  uint32 rows = 1;
+  uint32 cols = 2;
+  // Escape sequences that reconstruct the authoritative visible screen.
+  bytes contents = 3;
+  bool alternate_screen = 4;
+  // Normal-screen backing grid while contents represents the alternate screen.
+  bytes normal_contents = 5;
+}
 message AttachResponse {
   TerminalInfo terminal = 1;
   string lease_id = 2;
@@ -171,6 +189,7 @@ message AttachResponse {
   bytes history = 4;
   // Stable across automatic reconnects for one writer; empty for read-only attachments.
   string resume_token = 5;
+  TerminalSnapshot snapshot = 6;
 }
 message AckResponse { string message = 1; }
 message ErrorResponse {
@@ -270,5 +289,7 @@ message TerminalEvent {
     bytes output = 10;
     int32 exited = 11;
     string error = 12;
+    bool interactive = 13;
+    TerminalSnapshot snapshot = 14;
   }
 }

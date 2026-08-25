@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap},
     ffi::CString,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -17,10 +17,12 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::protocol::{
-    EnvironmentVariable, LOCALE_ENVIRONMENT_VARIABLES, SpawnRequest, TerminalInfo,
+    EnvironmentVariable, LOCALE_ENVIRONMENT_VARIABLES, SpawnRequest, TerminalInfo, TerminalSnapshot,
 };
 
-const HISTORY_LIMIT: usize = 1024 * 1024;
+// Match tmux's default history-limit: enough context for normal use without
+// letting many wide panes retain unbounded cell grids.
+const SCREEN_SCROLLBACK_ROWS: usize = 2_000;
 const EXITED_TERMINAL_RETENTION: Duration = Duration::from_secs(60);
 const MAX_TERM_LENGTH: usize = 64;
 const MAX_LOCALE_VALUE_LENGTH: usize = 256;
@@ -38,6 +40,7 @@ pub enum PtyEvent {
     Output(Vec<u8>),
     Exited(i32),
     Error(String),
+    Interactive(bool),
 }
 
 #[derive(Debug)]
@@ -57,7 +60,11 @@ pub struct Terminal {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn Child + Send>>,
-    history: Mutex<VecDeque<u8>>,
+    shell_pid: Option<i32>,
+    // Like tmux's pane grid, this parser is the daemon's authoritative terminal
+    // state. Attachments receive a rendering of this grid instead of replaying
+    // an arbitrary suffix of the PTY byte stream.
+    screen: Mutex<vt100::Parser>,
     events: broadcast::Sender<PtyEvent>,
     lease: Mutex<Option<Lease>>,
 }
@@ -67,14 +74,22 @@ impl Terminal {
         self.info.read().expect("terminal info poisoned").clone()
     }
 
-    pub fn snapshot_and_subscribe(&self) -> (Vec<u8>, broadcast::Receiver<PtyEvent>) {
+    pub fn rename(&self, name: String) {
+        let cleaned = name.trim();
+        self.info
+            .write()
+            .expect("terminal info poisoned")
+            .custom_name = (!cleaned.is_empty()).then(|| cleaned.to_owned());
+    }
+
+    pub fn snapshot_and_subscribe(&self) -> (TerminalSnapshot, broadcast::Receiver<PtyEvent>) {
         // The PTY reader publishes while holding this same lock. Subscribing
-        // before copying therefore gives an atomic boundary: bytes are either
-        // in the snapshot or in the receiver, never lost or duplicated.
-        let history = self.history.lock().expect("terminal history poisoned");
+        // before rendering therefore gives an atomic boundary: output is
+        // represented either by the snapshot or by the receiver, never lost
+        // or duplicated.
+        let mut screen = self.screen.lock().expect("terminal screen poisoned");
         let receiver = self.events.subscribe();
-        let snapshot = history.iter().copied().collect();
-        (snapshot, receiver)
+        (render_snapshot(&mut screen), receiver)
     }
 
     pub fn acquire_lease(
@@ -153,6 +168,11 @@ impl Terminal {
             bail!("terminal dimensions must be between 1 and 1000")
         }
         let mut lease = self.validate_lease(lease_id, sequence)?;
+        // Resize the server grid before notifying the PTY. The foreground
+        // process may redraw immediately after TIOCSWINSZ, and those bytes must
+        // be parsed using the new geometry.
+        let mut screen = self.screen.lock().expect("terminal screen poisoned");
+        screen.screen_mut().set_size(rows as u16, cols as u16);
         self.master
             .lock()
             .expect("terminal master poisoned")
@@ -171,6 +191,7 @@ impl Terminal {
             .as_mut()
             .expect("validated lease disappeared")
             .last_sequence = sequence;
+        drop(screen);
         Ok(())
     }
 
@@ -313,6 +334,7 @@ impl TerminalManager {
             .slave
             .spawn_command(command)
             .with_context(|| format!("failed to spawn {}", argv[0]))?;
+        let shell_pid = child.process_id().map(|pid| pid as i32);
         drop(pty.slave);
         let reader = pty.master.try_clone_reader()?;
         let writer = pty.master.take_writer()?;
@@ -327,13 +349,16 @@ impl TerminalManager {
             rows,
             cols,
             display_id,
+            custom_name: None,
+            interactive: Some(true),
         };
         let terminal = Arc::new(Terminal {
             info: RwLock::new(info),
             master: Mutex::new(pty.master),
             writer: Mutex::new(writer),
             child: Mutex::new(child),
-            history: Mutex::new(initial_terminal_history(default_shell)),
+            shell_pid,
+            screen: Mutex::new(initial_terminal_screen(rows, cols, default_shell)),
             events,
             lease: Mutex::new(None),
         });
@@ -343,6 +368,7 @@ impl TerminalManager {
             .insert(id, terminal.clone());
         start_reader(terminal.clone(), reader);
         start_child_monitor(terminal.clone(), self.terminals.clone());
+        start_foreground_monitor(terminal.clone());
         Ok(terminal)
     }
 
@@ -383,17 +409,74 @@ impl TerminalManager {
     }
 }
 
+fn start_foreground_monitor(terminal: Arc<Terminal>) {
+    tokio::spawn(async move {
+        let Some(shell_pid) = terminal.shell_pid else {
+            return;
+        };
+        loop {
+            if terminal.info().status != "running" {
+                return;
+            }
+            let interactive = terminal
+                .master
+                .lock()
+                .expect("terminal master poisoned")
+                .process_group_leader()
+                .is_some_and(|foreground_pid| foreground_pid == shell_pid);
+            let changed = {
+                let mut info = terminal.info.write().expect("terminal info poisoned");
+                let changed = info.interactive != Some(interactive);
+                info.interactive = Some(interactive);
+                changed
+            };
+            if changed {
+                let _ = terminal.events.send(PtyEvent::Interactive(interactive));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+}
+
 fn parse_display_id(selector: &str) -> Option<u64> {
     let display_id = selector.parse().ok()?;
     (display_id != 0).then_some(display_id)
 }
 
-fn initial_terminal_history(include_welcome: bool) -> VecDeque<u8> {
-    let mut history = VecDeque::with_capacity(HISTORY_LIMIT);
+fn initial_terminal_screen(rows: u32, cols: u32, include_welcome: bool) -> vt100::Parser {
+    let mut screen = vt100::Parser::new(rows as u16, cols as u16, SCREEN_SCROLLBACK_ROWS);
     if include_welcome && let Some(banner) = system_welcome_banner() {
-        history.extend(banner);
+        screen.process(&banner);
     }
-    history
+    screen
+}
+
+fn render_snapshot(parser: &mut vt100::Parser) -> TerminalSnapshot {
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    let alternate_screen = screen.alternate_screen();
+    let contents = screen.state_formatted();
+    // vt100 intentionally exposes only the active grid. Leave through 1049 so
+    // the normal grid's saved cursor and attributes are restored, render it,
+    // then switch back through mode 47 (which does not clear the alternate
+    // grid) and replay its already-captured state. This preserves both grids
+    // and the exact state that a later 1049l must restore.
+    let normal_contents = if alternate_screen {
+        parser.process(b"\x1b[?1049l");
+        let normal = parser.screen().state_formatted();
+        parser.process(b"\x1b[?47h");
+        parser.process(&contents);
+        normal
+    } else {
+        Vec::new()
+    };
+    TerminalSnapshot {
+        rows: u32::from(rows),
+        cols: u32::from(cols),
+        contents,
+        alternate_screen,
+        normal_contents,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -626,15 +709,8 @@ fn start_reader(terminal: Arc<Terminal>, mut reader: Box<dyn Read + Send>) {
                     Ok(0) => break,
                     Ok(length) => {
                         let chunk = buffer[..length].to_vec();
-                        let mut history =
-                            terminal.history.lock().expect("terminal history poisoned");
-                        let overflow = history
-                            .len()
-                            .saturating_add(chunk.len())
-                            .saturating_sub(HISTORY_LIMIT);
-                        let to_trim = overflow.min(history.len());
-                        history.drain(..to_trim);
-                        history.extend(&chunk);
+                        let mut screen = terminal.screen.lock().expect("terminal screen poisoned");
+                        screen.process(&chunk);
                         let _ = terminal.events.send(PtyEvent::Output(chunk));
                     }
                     Err(error) => {
@@ -695,6 +771,48 @@ fn start_child_monitor(
 mod tests {
     use super::*;
 
+    fn restore_snapshot(snapshot: &TerminalSnapshot) -> vt100::Parser {
+        let mut restored = vt100::Parser::new(
+            snapshot.rows as u16,
+            snapshot.cols as u16,
+            SCREEN_SCROLLBACK_ROWS,
+        );
+        restored.process(b"\x1bc");
+        if snapshot.alternate_screen {
+            restored.process(&snapshot.normal_contents);
+            restored.process(b"\x1b[?1049h");
+        }
+        restored.process(&snapshot.contents);
+        restored
+    }
+
+    fn assert_active_screens_equal(left: &vt100::Parser, right: &vt100::Parser) {
+        let left = left.screen();
+        let right = right.screen();
+        assert_eq!(left.size(), right.size());
+        assert_eq!(left.contents(), right.contents());
+        assert_eq!(left.cursor_position(), right.cursor_position());
+        assert_eq!(left.alternate_screen(), right.alternate_screen());
+        assert_eq!(left.application_keypad(), right.application_keypad());
+        assert_eq!(left.application_cursor(), right.application_cursor());
+        assert_eq!(left.bracketed_paste(), right.bracketed_paste());
+        assert_eq!(left.mouse_protocol_mode(), right.mouse_protocol_mode());
+        assert_eq!(
+            left.mouse_protocol_encoding(),
+            right.mouse_protocol_encoding()
+        );
+        assert_eq!(left.fgcolor(), right.fgcolor());
+        assert_eq!(left.bgcolor(), right.bgcolor());
+        assert_eq!(left.bold(), right.bold());
+        assert_eq!(left.italic(), right.italic());
+        for row in 0..left.size().0 {
+            assert_eq!(left.row_wrapped(row), right.row_wrapped(row));
+            for col in 0..left.size().1 {
+                assert_eq!(left.cell(row, col), right.cell(row, col));
+            }
+        }
+    }
+
     fn variable(name: &str, value: &str) -> EnvironmentVariable {
         EnvironmentVariable {
             name: name.into(),
@@ -720,6 +838,47 @@ mod tests {
         *manager.next_display_id.lock().unwrap() = u64::MAX;
         assert!(manager.allocate_display_id().is_err());
         assert_eq!(*manager.next_display_id.lock().unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn snapshot_round_trips_full_screen_tui_wide_cells_modes_and_resize() {
+        let mut source = vt100::Parser::new(8, 30, SCREEN_SCROLLBACK_ROWS);
+        source.process(b"\x1b[2J\x1b[Hshell history\r\n$ codex");
+        source.process(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[1;36mCodex\x1b[0m");
+        source.screen_mut().set_size(10, 36);
+        source.process(b"\x1b[2J\x1b[H\x1b[1;36mCodex\x1b[0m\r\n");
+        // Split a multi-byte wide character exactly as separate PTY reads can.
+        let wide = "状态：运行中 ✅".as_bytes();
+        source.process(&wide[..4]);
+        source.process(&wide[4..]);
+        source.process(
+            b"\x1b[5;4H\x1b[38;5;214mworking\x1b[3m...\x1b[?1h\x1b[?2004h\x1b[?1002h\x1b[?1006h",
+        );
+
+        let snapshot = render_snapshot(&mut source);
+        let mut restored = restore_snapshot(&snapshot);
+        assert!(snapshot.alternate_screen);
+        assert!(!snapshot.normal_contents.is_empty());
+        assert_active_screens_equal(&source, &restored);
+
+        // The hidden normal grid must also survive. This is what becomes
+        // visible when Codex/vim exits its alternate screen after reconnect.
+        source.process(b"\x1b[?1049l");
+        restored.process(b"\x1b[?1049l");
+        assert_active_screens_equal(&source, &restored);
+    }
+
+    #[test]
+    fn snapshot_replaces_stale_client_contents_instead_of_replaying_history() {
+        let mut source = vt100::Parser::new(4, 16, SCREEN_SCROLLBACK_ROWS);
+        source.process(b"\x1b[2J\x1b[2;3Hauthoritative");
+        let snapshot = render_snapshot(&mut source);
+
+        let mut restored = vt100::Parser::new(4, 16, SCREEN_SCROLLBACK_ROWS);
+        restored.process(b"stale client data\r\nthat must vanish");
+        restored.process(b"\x1bc");
+        restored.process(&snapshot.contents);
+        assert_active_screens_equal(&source, &restored);
     }
 
     #[tokio::test]

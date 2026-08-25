@@ -91,7 +91,7 @@ pub struct Request {
     pub request_id: String,
     #[prost(
         oneof = "request::Command",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29"
     )]
     pub command: Option<request::Command>,
 }
@@ -139,6 +139,8 @@ pub mod request {
         GitStatus(GitStatusRequest),
         #[prost(message, tag = "28")]
         WatchFiles(WatchFilesRequest),
+        #[prost(message, tag = "29")]
+        RenameTerminal(RenameTerminalRequest),
     }
 }
 
@@ -187,6 +189,14 @@ pub struct AttachRequest {
 pub struct CloseRequest {
     #[prost(string, tag = "1")]
     pub terminal_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RenameTerminalRequest {
+    #[prost(string, tag = "1")]
+    pub terminal_id: String,
+    #[prost(string, tag = "2")]
+    pub name: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -513,6 +523,10 @@ pub struct TerminalInfo {
     pub cols: u32,
     #[prost(uint64, tag = "9")]
     pub display_id: u64,
+    #[prost(string, optional, tag = "10")]
+    pub custom_name: Option<String>,
+    #[prost(bool, optional, tag = "11")]
+    pub interactive: Option<bool>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -528,6 +542,20 @@ pub struct SpawnResponse {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct TerminalSnapshot {
+    #[prost(uint32, tag = "1")]
+    pub rows: u32,
+    #[prost(uint32, tag = "2")]
+    pub cols: u32,
+    #[prost(bytes = "vec", tag = "3")]
+    pub contents: Vec<u8>,
+    #[prost(bool, tag = "4")]
+    pub alternate_screen: bool,
+    #[prost(bytes = "vec", tag = "5")]
+    pub normal_contents: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct AttachResponse {
     #[prost(message, optional, tag = "1")]
     pub terminal: Option<TerminalInfo>,
@@ -539,6 +567,8 @@ pub struct AttachResponse {
     pub history: Vec<u8>,
     #[prost(string, tag = "5")]
     pub resume_token: String,
+    #[prost(message, optional, tag = "6")]
+    pub snapshot: Option<TerminalSnapshot>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -593,11 +623,13 @@ pub struct Resize {
 pub struct TerminalEvent {
     #[prost(string, tag = "1")]
     pub terminal_id: String,
-    #[prost(oneof = "terminal_event::Event", tags = "10, 11, 12")]
+    #[prost(oneof = "terminal_event::Event", tags = "10, 11, 12, 13, 14")]
     pub event: Option<terminal_event::Event>,
 }
 
 pub mod terminal_event {
+    use super::TerminalSnapshot;
+
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Event {
         #[prost(bytes, tag = "10")]
@@ -606,6 +638,10 @@ pub mod terminal_event {
         Exited(i32),
         #[prost(string, tag = "12")]
         Error(String),
+        #[prost(bool, tag = "13")]
+        Interactive(bool),
+        #[prost(message, tag = "14")]
+        Snapshot(TerminalSnapshot),
     }
 }
 

@@ -14,8 +14,8 @@ use astra_shell::{
     protocol::{
         AttachResponse, BeginDownloadResponse, BeginUploadRequest, EnvironmentVariable, FileKind,
         FileMetadata, LOCALE_ENVIRONMENT_VARIABLES, ReadFileChunkRequest, Resize, SpawnRequest,
-        TerminalCommand, WireMessage, WriteFileChunkRequest, read_message, terminal_command,
-        terminal_event, wire_message, write_message,
+        TerminalCommand, TerminalSnapshot, WireMessage, WriteFileChunkRequest, read_message,
+        terminal_command, terminal_event, wire_message, write_message,
     },
 };
 use clap::{Args, Parser, Subcommand};
@@ -719,8 +719,7 @@ async fn attach_terminal(
         .id
         .clone();
     let mut resume_token = attached.resume_token.clone();
-    std::io::stdout().write_all(&attached.history)?;
-    std::io::stdout().flush()?;
+    render_attached_screen(&attached, false)?;
 
     let interactive = std::io::stdin().is_terminal() && !read_only;
     let _raw_guard = if interactive {
@@ -786,6 +785,10 @@ async fn attach_terminal(
                                     }
                                     Some(terminal_event::Event::Error(message)) => {
                                         eprintln!("\r\n[astra: {message}]");
+                                    }
+                                    Some(terminal_event::Event::Interactive(_)) => {}
+                                    Some(terminal_event::Event::Snapshot(snapshot)) => {
+                                        render_snapshot_to_stdout(&snapshot, true)?;
                                     }
                                     None => {}
                                 }
@@ -886,19 +889,39 @@ async fn attach_terminal(
         client = next_client;
         send = next_send;
         recv = next_recv;
-        lease_id = next_attached.lease_id;
+        lease_id = next_attached.lease_id.clone();
         if !next_attached.resume_token.is_empty() {
-            resume_token = next_attached.resume_token;
+            resume_token = next_attached.resume_token.clone();
         }
-        if interactive {
-            // Rebuild the local emulator from the server's bounded history instead of appending
-            // a second copy of the screen after reconnecting.
-            std::io::stdout().write_all(b"\x1bc")?;
-        }
-        std::io::stdout().write_all(&next_attached.history)?;
-        std::io::stdout().flush()?;
+        render_attached_screen(&next_attached, interactive)?;
         continue 'attachment;
     }
+}
+
+fn render_attached_screen(attached: &AttachResponse, reset: bool) -> Result<()> {
+    if let Some(snapshot) = &attached.snapshot {
+        render_snapshot_to_stdout(snapshot, true)
+    } else {
+        if reset {
+            std::io::stdout().write_all(b"\x1bc")?;
+        }
+        std::io::stdout().write_all(&attached.history)?;
+        std::io::stdout().flush()?;
+        Ok(())
+    }
+}
+
+fn render_snapshot_to_stdout(snapshot: &TerminalSnapshot, reset: bool) -> Result<()> {
+    if reset {
+        std::io::stdout().write_all(b"\x1bc")?;
+    }
+    if snapshot.alternate_screen {
+        std::io::stdout().write_all(&snapshot.normal_contents)?;
+        std::io::stdout().write_all(b"\x1b[?1049h")?;
+    }
+    std::io::stdout().write_all(&snapshot.contents)?;
+    std::io::stdout().flush()?;
+    Ok(())
 }
 
 async fn reconnect_terminal(
