@@ -10,6 +10,7 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use sha2::{Digest, Sha256};
@@ -18,7 +19,8 @@ use uuid::Uuid;
 use crate::protocol::{
     BeginDownloadRequest, BeginDownloadResponse, BeginUploadRequest, FileCapabilitiesResponse,
     FileChunkResponse, FileKind, FileListRequest, FileListResponse, FileMetadata, FileStatRequest,
-    FileStatResponse, ReadFileChunkRequest, UploadStatusResponse, WriteFileChunkRequest,
+    FileStatResponse, GitFileStatus, GitStatusRequest, GitStatusResponse, ReadFileChunkRequest,
+    UploadStatusResponse, WriteFileChunkRequest,
 };
 
 pub const FILE_PROTOCOL_VERSION: u32 = 1;
@@ -26,6 +28,8 @@ pub const MAX_FILE_CHUNK_SIZE: usize = 1024 * 1024;
 const MAX_DIRECTORY_PAGE_SIZE: usize = 500;
 const MAX_REMOTE_PATH_SIZE: usize = 16 * 1024;
 const MAX_TRACKED_UPLOADS: usize = 128;
+const MAX_GIT_STATUS_SIZE: usize = 4 * 1024 * 1024;
+const MAX_GIT_STATUS_ENTRIES: usize = 20_000;
 
 #[derive(Debug)]
 pub struct FileServiceError {
@@ -222,6 +226,54 @@ impl FileService {
             entries: page,
             next_cursor,
         })
+    }
+
+    pub async fn git_status(&self, request: GitStatusRequest) -> FileResult<GitStatusResponse> {
+        let project = self.resolve_existing(&request.path, true)?;
+        if !project.is_dir() {
+            return Err(FileServiceError::new(
+                "invalid",
+                format!("{} is not a directory", project.display()),
+            ));
+        }
+
+        let root_output = run_git(&project, &["rev-parse", "--show-toplevel"]).await?;
+        let root_bytes = trim_ascii_whitespace(&root_output.stdout);
+        let repository = PathBuf::from(OsString::from_vec(root_bytes.to_vec()))
+            .canonicalize()
+            .map_err(|error| FileServiceError::io("cannot resolve Git repository root", error))?;
+        let relative_root = repository.strip_prefix(self.root.as_path()).map_err(|_| {
+            FileServiceError::new(
+                "permission_denied",
+                "Git repository is outside the file root",
+            )
+        })?;
+        let repository_root = if relative_root.as_os_str().is_empty() {
+            b".".to_vec()
+        } else {
+            relative_root.as_os_str().as_bytes().to_vec()
+        };
+
+        let status_output = run_git(
+            &project,
+            &[
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "-z",
+                "--untracked-files=all",
+                "--",
+                ".",
+            ],
+        )
+        .await?;
+        if status_output.stdout.len() > MAX_GIT_STATUS_SIZE {
+            return Err(FileServiceError::new(
+                "quota",
+                "Git status output exceeds 4 MiB",
+            ));
+        }
+        parse_git_status(repository_root, &status_output.stdout)
     }
 
     pub fn begin_upload(&self, request: BeginUploadRequest) -> FileResult<UploadStatusResponse> {
@@ -735,6 +787,143 @@ impl FileService {
     }
 }
 
+async fn run_git(directory: &Path, arguments: &[&str]) -> FileResult<std::process::Output> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(directory)
+        .args(arguments)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .map_err(|_| FileServiceError::new("timeout", "Git status exceeded 5 seconds"))?
+        .map_err(|error| FileServiceError::io("cannot execute Git", error))?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let code = if output.status.code() == Some(128) {
+        "not_found"
+    } else {
+        "git"
+    };
+    Err(FileServiceError::new(
+        code,
+        if message.is_empty() {
+            "Git command failed".into()
+        } else {
+            message
+        },
+    ))
+}
+
+fn parse_git_status(repository_root: Vec<u8>, output: &[u8]) -> FileResult<GitStatusResponse> {
+    let records = output.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let mut response = GitStatusResponse {
+        repository_root,
+        branch: String::new(),
+        detached: false,
+        ahead: 0,
+        behind: 0,
+        files: Vec::new(),
+    };
+    let mut index = 0;
+    while index < records.len() {
+        let record = records[index];
+        index += 1;
+        if record.is_empty() {
+            continue;
+        }
+        if let Some(value) = record.strip_prefix(b"# branch.head ") {
+            if value == b"(detached)" {
+                response.detached = true;
+            } else {
+                response.branch = String::from_utf8_lossy(value).into_owned();
+            }
+            continue;
+        }
+        if let Some(value) = record.strip_prefix(b"# branch.ab ") {
+            let fields = value.split(|byte| *byte == b' ').collect::<Vec<_>>();
+            for field in fields {
+                if let Some(ahead) = field.strip_prefix(b"+") {
+                    response.ahead = parse_git_count(ahead);
+                } else if let Some(behind) = field.strip_prefix(b"-") {
+                    response.behind = parse_git_count(behind);
+                }
+            }
+            continue;
+        }
+
+        let parsed = if record.starts_with(b"1 ") {
+            parse_tracked_git_record(record, 9, Vec::new())
+        } else if record.starts_with(b"2 ") {
+            let original_path = if let Some(original_path) = records.get(index) {
+                index += 1;
+                original_path.to_vec()
+            } else {
+                Vec::new()
+            };
+            parse_tracked_git_record(record, 10, original_path)
+        } else if record.starts_with(b"u ") {
+            parse_tracked_git_record(record, 11, Vec::new())
+        } else if let Some(path) = record.strip_prefix(b"? ") {
+            Some(GitFileStatus {
+                path: path.to_vec(),
+                index_status: "?".into(),
+                worktree_status: "?".into(),
+                original_path: Vec::new(),
+            })
+        } else {
+            None
+        };
+        if let Some(file) = parsed {
+            response.files.push(file);
+            if response.files.len() > MAX_GIT_STATUS_ENTRIES {
+                return Err(FileServiceError::new(
+                    "quota",
+                    format!("Git status exceeds {MAX_GIT_STATUS_ENTRIES} entries"),
+                ));
+            }
+        }
+    }
+    Ok(response)
+}
+
+fn parse_tracked_git_record(
+    record: &[u8],
+    field_count: usize,
+    original_path: Vec<u8>,
+) -> Option<GitFileStatus> {
+    let fields = record
+        .splitn(field_count, |byte| *byte == b' ')
+        .collect::<Vec<_>>();
+    let status = *fields.get(1)?;
+    let path = fields.last()?.to_vec();
+    Some(GitFileStatus {
+        path,
+        index_status: status.first().copied().map(char::from)?.to_string(),
+        worktree_status: status.get(1).copied().map(char::from)?.to_string(),
+        original_path,
+    })
+}
+
+fn parse_git_count(value: &[u8]) -> u32 {
+    String::from_utf8_lossy(value).parse().unwrap_or(0)
+}
+
+fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
 fn validate_transfer_id(transfer_id: &str) -> FileResult<()> {
     let parsed = Uuid::parse_str(transfer_id)
         .map_err(|_| FileServiceError::new("invalid", "transfer ID must be a UUID"))?;
@@ -1032,5 +1221,25 @@ mod tests {
                 .code,
             "invalid"
         );
+    }
+
+    #[test]
+    fn parses_porcelain_v2_branch_counts_and_file_states() {
+        let output = b"# branch.oid abcdef\0# branch.head main\0# branch.ab +2 -3\0\
+1 .M N... 100644 100644 100644 abc abc src/main.rs\0\
+? notes.txt\0\
+2 R. N... 100644 100644 100644 abc def R100 src/new.rs\0src/old.rs\0";
+        let status = parse_git_status(b"project".to_vec(), output).unwrap();
+
+        assert_eq!(status.repository_root, b"project");
+        assert_eq!(status.branch, "main");
+        assert_eq!(status.ahead, 2);
+        assert_eq!(status.behind, 3);
+        assert_eq!(status.files.len(), 3);
+        assert_eq!(status.files[0].path, b"src/main.rs");
+        assert_eq!(status.files[0].worktree_status, "M");
+        assert_eq!(status.files[1].index_status, "?");
+        assert_eq!(status.files[2].path, b"src/new.rs");
+        assert_eq!(status.files[2].original_path, b"src/old.rs");
     }
 }

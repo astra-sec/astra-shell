@@ -91,7 +91,7 @@ pub struct Request {
     pub request_id: String,
     #[prost(
         oneof = "request::Command",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27"
     )]
     pub command: Option<request::Command>,
 }
@@ -135,6 +135,8 @@ pub mod request {
         RemoveFile(RemoveFileRequest),
         #[prost(message, tag = "26")]
         RenameFile(RenameFileRequest),
+        #[prost(message, tag = "27")]
+        GitStatus(GitStatusRequest),
     }
 }
 
@@ -295,12 +297,18 @@ pub struct RenameFileRequest {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct GitStatusRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub path: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct Response {
     #[prost(string, tag = "1")]
     pub request_id: String,
     #[prost(
         oneof = "response::Result",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
     )]
     pub result: Option<response::Result>,
 }
@@ -332,6 +340,8 @@ pub mod response {
         BeginDownload(BeginDownloadResponse),
         #[prost(message, tag = "20")]
         FileChunk(FileChunkResponse),
+        #[prost(message, tag = "21")]
+        GitStatus(GitStatusResponse),
     }
 }
 
@@ -425,6 +435,34 @@ pub struct FileChunkResponse {
     pub sha256: Vec<u8>,
     #[prost(bool, tag = "4")]
     pub eof: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GitFileStatus {
+    #[prost(bytes = "vec", tag = "1")]
+    pub path: Vec<u8>,
+    #[prost(string, tag = "2")]
+    pub index_status: String,
+    #[prost(string, tag = "3")]
+    pub worktree_status: String,
+    #[prost(bytes = "vec", tag = "4")]
+    pub original_path: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GitStatusResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub repository_root: Vec<u8>,
+    #[prost(string, tag = "2")]
+    pub branch: String,
+    #[prost(bool, tag = "3")]
+    pub detached: bool,
+    #[prost(uint32, tag = "4")]
+    pub ahead: u32,
+    #[prost(uint32, tag = "5")]
+    pub behind: u32,
+    #[prost(message, repeated, tag = "6")]
+    pub files: Vec<GitFileStatus>,
 }
 
 #[derive(Clone, PartialEq, Message)]

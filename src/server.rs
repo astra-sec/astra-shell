@@ -666,6 +666,10 @@ where
             let result = tokio::task::spawn_blocking(move || service.list(list)).await?;
             send_file_result(&mut send, request_id, result, response::Result::FileList).await?;
         }
+        Some(request::Command::GitStatus(status)) => {
+            let result = files.git_status(status).await;
+            send_file_result(&mut send, request_id, result, response::Result::GitStatus).await?;
+        }
         Some(request::Command::BeginUpload(begin)) => {
             let service = files.clone();
             let result = tokio::task::spawn_blocking(move || service.begin_upload(begin)).await?;
@@ -796,6 +800,7 @@ fn is_file_request(message: &WireMessage) -> bool {
                         | request::Command::MakeDirectory(_)
                         | request::Command::RemoveFile(_)
                         | request::Command::RenameFile(_)
+                        | request::Command::GitStatus(_)
                 ),
                 ..
             })),

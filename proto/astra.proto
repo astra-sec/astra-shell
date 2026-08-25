@@ -53,6 +53,7 @@ message Request {
     MakeDirectoryRequest make_directory = 24;
     RemoveFileRequest remove_file = 25;
     RenameFileRequest rename_file = 26;
+    GitStatusRequest git_status = 27;
   }
 }
 message ListRequest {}
@@ -126,6 +127,7 @@ message RenameFileRequest {
   bytes destination = 2;
   bool overwrite = 3;
 }
+message GitStatusRequest { bytes path = 1; }
 
 message Response {
   string request_id = 1;
@@ -141,6 +143,7 @@ message Response {
     UploadStatusResponse upload_status = 18;
     BeginDownloadResponse begin_download = 19;
     FileChunkResponse file_chunk = 20;
+    GitStatusResponse git_status = 21;
   }
 }
 message TerminalInfo {
@@ -218,6 +221,21 @@ message FileChunkResponse {
   bytes data = 2;
   bytes sha256 = 3;
   bool eof = 4;
+}
+message GitFileStatus {
+  // Path relative to repository_root. Status uses Git porcelain-v2 XY characters.
+  bytes path = 1;
+  string index_status = 2;
+  string worktree_status = 3;
+  bytes original_path = 4;
+}
+message GitStatusResponse {
+  bytes repository_root = 1;
+  string branch = 2;
+  bool detached = 3;
+  uint32 ahead = 4;
+  uint32 behind = 5;
+  repeated GitFileStatus files = 6;
 }
 
 message TerminalCommand {
