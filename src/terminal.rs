@@ -26,6 +26,7 @@ const SCREEN_SCROLLBACK_ROWS: usize = 2_000;
 const EXITED_TERMINAL_RETENTION: Duration = Duration::from_secs(60);
 const MAX_TERM_LENGTH: usize = 64;
 const MAX_LOCALE_VALUE_LENGTH: usize = 256;
+const MAX_PROGRAM_TITLE_LENGTH: usize = 512;
 const SAFE_BASE_ENVIRONMENT: &[&str] = &["HOME", "USER", "LOGNAME", "SHELL", "PATH"];
 const UTF8_LOCALE_FALLBACKS: &[&str] = &["C.UTF-8", "C.utf8", "UTF-8", "en_US.UTF-8"];
 
@@ -34,6 +35,19 @@ struct PreparedTerminalEnvironment {
     locale: Vec<EnvironmentVariable>,
     used_locale_fallback: bool,
 }
+
+#[derive(Default)]
+struct TerminalCallbacks {
+    program_title: Option<String>,
+}
+
+impl vt100::Callbacks for TerminalCallbacks {
+    fn set_window_title(&mut self, _screen: &mut vt100::Screen, title: &[u8]) {
+        self.program_title = clean_program_title(title);
+    }
+}
+
+type TerminalParser = vt100::Parser<TerminalCallbacks>;
 
 #[derive(Clone, Debug)]
 pub enum PtyEvent {
@@ -64,14 +78,27 @@ pub struct Terminal {
     // Like tmux's pane grid, this parser is the daemon's authoritative terminal
     // state. Attachments receive a rendering of this grid instead of replaying
     // an arbitrary suffix of the PTY byte stream.
-    screen: Mutex<vt100::Parser>,
+    screen: Mutex<TerminalParser>,
     events: broadcast::Sender<PtyEvent>,
     lease: Mutex<Option<Lease>>,
 }
 
 impl Terminal {
     pub fn info(&self) -> TerminalInfo {
-        self.info.read().expect("terminal info poisoned").clone()
+        // Lock in the same screen -> info order used by resize so title reads
+        // cannot deadlock with a concurrent geometry update.
+        let program_title = self
+            .screen
+            .lock()
+            .expect("terminal screen poisoned")
+            .callbacks()
+            .program_title
+            .clone();
+        let mut info = self.info.read().expect("terminal info poisoned").clone();
+        if let Some(program_title) = program_title {
+            info.name = program_title;
+        }
+        info
     }
 
     pub fn rename(&self, name: String) {
@@ -443,15 +470,20 @@ fn parse_display_id(selector: &str) -> Option<u64> {
     (display_id != 0).then_some(display_id)
 }
 
-fn initial_terminal_screen(rows: u32, cols: u32, include_welcome: bool) -> vt100::Parser {
-    let mut screen = vt100::Parser::new(rows as u16, cols as u16, SCREEN_SCROLLBACK_ROWS);
+fn initial_terminal_screen(rows: u32, cols: u32, include_welcome: bool) -> TerminalParser {
+    let mut screen = TerminalParser::new_with_callbacks(
+        rows as u16,
+        cols as u16,
+        SCREEN_SCROLLBACK_ROWS,
+        TerminalCallbacks::default(),
+    );
     if include_welcome && let Some(banner) = system_welcome_banner() {
         screen.process(&banner);
     }
     screen
 }
 
-fn render_snapshot(parser: &mut vt100::Parser) -> TerminalSnapshot {
+fn render_snapshot(parser: &mut TerminalParser) -> TerminalSnapshot {
     let screen = parser.screen();
     let (rows, cols) = screen.size();
     let alternate_screen = screen.alternate_screen();
@@ -477,6 +509,17 @@ fn render_snapshot(parser: &mut vt100::Parser) -> TerminalSnapshot {
         alternate_screen,
         normal_contents,
     }
+}
+
+fn clean_program_title(title: &[u8]) -> Option<String> {
+    let title = String::from_utf8_lossy(title);
+    let cleaned: String = title
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_PROGRAM_TITLE_LENGTH)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 #[cfg(target_os = "linux")]
@@ -771,11 +814,12 @@ fn start_child_monitor(
 mod tests {
     use super::*;
 
-    fn restore_snapshot(snapshot: &TerminalSnapshot) -> vt100::Parser {
-        let mut restored = vt100::Parser::new(
+    fn restore_snapshot(snapshot: &TerminalSnapshot) -> TerminalParser {
+        let mut restored = TerminalParser::new_with_callbacks(
             snapshot.rows as u16,
             snapshot.cols as u16,
             SCREEN_SCROLLBACK_ROWS,
+            TerminalCallbacks::default(),
         );
         restored.process(b"\x1bc");
         if snapshot.alternate_screen {
@@ -786,7 +830,7 @@ mod tests {
         restored
     }
 
-    fn assert_active_screens_equal(left: &vt100::Parser, right: &vt100::Parser) {
+    fn assert_active_screens_equal(left: &TerminalParser, right: &TerminalParser) {
         let left = left.screen();
         let right = right.screen();
         assert_eq!(left.size(), right.size());
@@ -842,7 +886,12 @@ mod tests {
 
     #[test]
     fn snapshot_round_trips_full_screen_tui_wide_cells_modes_and_resize() {
-        let mut source = vt100::Parser::new(8, 30, SCREEN_SCROLLBACK_ROWS);
+        let mut source = TerminalParser::new_with_callbacks(
+            8,
+            30,
+            SCREEN_SCROLLBACK_ROWS,
+            TerminalCallbacks::default(),
+        );
         source.process(b"\x1b[2J\x1b[Hshell history\r\n$ codex");
         source.process(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[1;36mCodex\x1b[0m");
         source.screen_mut().set_size(10, 36);
@@ -870,15 +919,42 @@ mod tests {
 
     #[test]
     fn snapshot_replaces_stale_client_contents_instead_of_replaying_history() {
-        let mut source = vt100::Parser::new(4, 16, SCREEN_SCROLLBACK_ROWS);
+        let mut source = TerminalParser::new_with_callbacks(
+            4,
+            16,
+            SCREEN_SCROLLBACK_ROWS,
+            TerminalCallbacks::default(),
+        );
         source.process(b"\x1b[2J\x1b[2;3Hauthoritative");
         let snapshot = render_snapshot(&mut source);
 
-        let mut restored = vt100::Parser::new(4, 16, SCREEN_SCROLLBACK_ROWS);
+        let mut restored = TerminalParser::new_with_callbacks(
+            4,
+            16,
+            SCREEN_SCROLLBACK_ROWS,
+            TerminalCallbacks::default(),
+        );
         restored.process(b"stale client data\r\nthat must vanish");
         restored.process(b"\x1bc");
         restored.process(&snapshot.contents);
         assert_active_screens_equal(&source, &restored);
+    }
+
+    #[test]
+    fn captures_and_sanitizes_program_reported_terminal_titles() {
+        let mut parser = initial_terminal_screen(24, 80, false);
+        parser.process(b"\x1b]0;xy@rome:~/Projects/astra\x07");
+        assert_eq!(
+            parser.callbacks().program_title.as_deref(),
+            Some("xy@rome:~/Projects/astra")
+        );
+
+        assert_eq!(
+            clean_program_title(b"  Codex\x01 Session  ").as_deref(),
+            Some("Codex Session")
+        );
+        parser.process(b"\x1b]2;   \x07");
+        assert_eq!(parser.callbacks().program_title, None);
     }
 
     #[tokio::test]
