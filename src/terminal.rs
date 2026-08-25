@@ -57,6 +57,11 @@ pub enum PtyEvent {
     Interactive(bool),
 }
 
+#[derive(Clone, Debug)]
+pub struct LeaseEvent {
+    pub revoked_lease_id: String,
+}
+
 #[derive(Debug)]
 struct Lease {
     id: String,
@@ -80,6 +85,7 @@ pub struct Terminal {
     // an arbitrary suffix of the PTY byte stream.
     screen: Mutex<TerminalParser>,
     events: broadcast::Sender<PtyEvent>,
+    lease_events: broadcast::Sender<LeaseEvent>,
     lease: Mutex<Option<Lease>>,
 }
 
@@ -119,6 +125,10 @@ impl Terminal {
         (render_snapshot(&mut screen), receiver)
     }
 
+    pub fn subscribe_to_leases(&self) -> broadcast::Receiver<LeaseEvent> {
+        self.lease_events.subscribe()
+    }
+
     pub fn acquire_lease(
         &self,
         read_only: bool,
@@ -132,6 +142,7 @@ impl Terminal {
             });
         }
         let mut lease = self.lease.lock().expect("terminal lease poisoned");
+        let revoked_lease_id = lease.as_ref().map(|lease| lease.id.clone());
         if !resume_token.is_empty()
             && lease
                 .as_ref()
@@ -143,6 +154,9 @@ impl Terminal {
                 resume_token: resume_token.to_owned(),
                 last_sequence: 0,
             });
+            if let Some(revoked_lease_id) = revoked_lease_id {
+                let _ = self.lease_events.send(LeaseEvent { revoked_lease_id });
+            }
             return Ok(LeaseGrant {
                 lease_id,
                 resume_token: resume_token.to_owned(),
@@ -162,10 +176,23 @@ impl Terminal {
             resume_token: resume_token.clone(),
             last_sequence: 0,
         });
+        if let Some(revoked_lease_id) = revoked_lease_id {
+            let _ = self.lease_events.send(LeaseEvent { revoked_lease_id });
+        }
         Ok(LeaseGrant {
             lease_id,
             resume_token,
         })
+    }
+
+    pub fn owns_lease(&self, lease_id: &str) -> bool {
+        !lease_id.is_empty()
+            && self
+                .lease
+                .lock()
+                .expect("terminal lease poisoned")
+                .as_ref()
+                .is_some_and(|lease| lease.id == lease_id)
     }
 
     pub fn release_lease(&self, lease_id: &str) {
@@ -374,6 +401,7 @@ impl TerminalManager {
         let reader = pty.master.try_clone_reader()?;
         let writer = pty.master.take_writer()?;
         let (events, _) = broadcast::channel(1024);
+        let (lease_events, _) = broadcast::channel(16);
         let info = TerminalInfo {
             id: id.clone(),
             name,
@@ -395,6 +423,7 @@ impl TerminalManager {
             shell_pid,
             screen: Mutex::new(initial_terminal_screen(rows, cols, default_shell)),
             events,
+            lease_events,
             lease: Mutex::new(None),
         });
         self.terminals
@@ -983,11 +1012,16 @@ mod tests {
         assert!(manager.has_active_terminals());
 
         let first = terminal.acquire_lease(false, false, "").unwrap();
+        let mut lease_events = terminal.subscribe_to_leases();
         let resumed = terminal
             .acquire_lease(false, false, &first.resume_token)
             .unwrap();
+        let revoked = lease_events.recv().await.unwrap();
+        assert_eq!(revoked.revoked_lease_id, first.lease_id);
         assert_ne!(first.lease_id, resumed.lease_id);
         assert_eq!(first.resume_token, resumed.resume_token);
+        assert!(!terminal.owns_lease(&first.lease_id));
+        assert!(terminal.owns_lease(&resumed.lease_id));
         assert!(
             terminal
                 .write_input(&first.lease_id, 1, b"stale\n")

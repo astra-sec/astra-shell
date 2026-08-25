@@ -732,10 +732,11 @@ async fn attach_terminal(
     let mut input = [0_u8; 16 * 1024];
     let mut window_changes = window_change_source()?;
     let mut lease_id = attached.lease_id;
+    let mut writable = !read_only;
 
     'attachment: loop {
         let mut sequence = 1_u64;
-        let initial_disconnect = if !read_only {
+        let initial_disconnect = if writable {
             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
             match send_terminal_command(
                 &mut send,
@@ -790,6 +791,12 @@ async fn attach_terminal(
                                     Some(terminal_event::Event::Snapshot(snapshot)) => {
                                         render_snapshot_to_stdout(&snapshot, true)?;
                                     }
+                                    Some(terminal_event::Event::LeaseChanged(change)) => {
+                                        writable = !change.read_only;
+                                        if change.read_only {
+                                            eprintln!("\r\n[astra: input lease was taken over; continuing read-only]");
+                                        }
+                                    }
                                     None => {}
                                 }
                                 continue;
@@ -799,7 +806,7 @@ async fn attach_terminal(
                             Err(error) => error,
                         }
                     }
-                    read = stdin.read(&mut input), if !read_only => {
+                    read = stdin.read(&mut input), if writable => {
                         let length = read?;
                         if length == 0 || (interactive && input[..length].contains(&0x1d)) {
                             let _ = send_terminal_command(
@@ -830,7 +837,7 @@ async fn attach_terminal(
                             Err(error) => error,
                         }
                     }
-                    _ = wait_for_window_change(&mut window_changes), if interactive => {
+                    _ = wait_for_window_change(&mut window_changes), if interactive && writable => {
                         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                         match send_terminal_command(
                             &mut send,
@@ -857,9 +864,11 @@ async fn attach_terminal(
         };
         eprintln!("\r\n[astra: connection lost ({disconnect:#}); reconnecting]");
         let (next_client, next_send, next_recv, next_attached) = {
-            let reconnect = reconnect_terminal(&client, &terminal_id, read_only, &resume_token);
+            let reconnect_read_only = !writable;
+            let reconnect =
+                reconnect_terminal(&client, &terminal_id, reconnect_read_only, &resume_token);
             tokio::pin!(reconnect);
-            if read_only {
+            if reconnect_read_only {
                 reconnect.await?
             } else {
                 let mut warned_about_dropped_input = false;

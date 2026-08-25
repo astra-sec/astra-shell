@@ -623,12 +623,12 @@ pub struct Resize {
 pub struct TerminalEvent {
     #[prost(string, tag = "1")]
     pub terminal_id: String,
-    #[prost(oneof = "terminal_event::Event", tags = "10, 11, 12, 13, 14")]
+    #[prost(oneof = "terminal_event::Event", tags = "10, 11, 12, 13, 14, 15")]
     pub event: Option<terminal_event::Event>,
 }
 
 pub mod terminal_event {
-    use super::TerminalSnapshot;
+    use super::{LeaseChanged, TerminalSnapshot};
 
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Event {
@@ -642,7 +642,17 @@ pub mod terminal_event {
         Interactive(bool),
         #[prost(message, tag = "14")]
         Snapshot(TerminalSnapshot),
+        #[prost(message, tag = "15")]
+        LeaseChanged(LeaseChanged),
     }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct LeaseChanged {
+    #[prost(bool, tag = "1")]
+    pub read_only: bool,
+    #[prost(string, tag = "2")]
+    pub reason: String,
 }
 
 impl WireMessage {

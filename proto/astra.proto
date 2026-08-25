@@ -291,5 +291,10 @@ message TerminalEvent {
     string error = 12;
     bool interactive = 13;
     TerminalSnapshot snapshot = 14;
+    LeaseChanged lease_changed = 15;
   }
+}
+message LeaseChanged {
+  bool read_only = 1;
+  string reason = 2;
 }

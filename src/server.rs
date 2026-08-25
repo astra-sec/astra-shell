@@ -18,9 +18,9 @@ use crate::{
     files::{FileResult, FileService},
     process_lock::ProcessLock,
     protocol::{
-        AckResponse, AttachResponse, AuthResult, ErrorResponse, ListResponse, Response,
-        ServerHello, SpawnResponse, TerminalEvent, WireMessage, read_message, request, response,
-        terminal_command, terminal_event, wire_message, write_message,
+        AckResponse, AttachResponse, AuthResult, ErrorResponse, LeaseChanged, ListResponse,
+        Response, ServerHello, SpawnResponse, TerminalEvent, WireMessage, read_message, request,
+        response, terminal_command, terminal_event, wire_message, write_message,
     },
     terminal::{PtyEvent, Terminal, TerminalManager},
     worker::WorkerRouter,
@@ -923,6 +923,7 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    let mut lease_events = terminal.subscribe_to_leases();
     let lease = match terminal.acquire_lease(read_only, takeover, &resume_token) {
         Ok(lease) => lease,
         Err(error) => {
@@ -970,9 +971,11 @@ where
                             }
                             match command.command {
                                 Some(terminal_command::Command::Input(bytes)) => {
+                                    if !terminal.owns_lease(&lease.lease_id) { continue; }
                                     terminal.write_input(&command.lease_id, command.sequence, &bytes)?;
                                 }
                                 Some(terminal_command::Command::Resize(size)) => {
+                                    if !terminal.owns_lease(&lease.lease_id) { continue; }
                                     terminal.resize(
                                         &command.lease_id,
                                         command.sequence,
@@ -985,6 +988,22 @@ where
                         }
                         Some(_) => bail!("unexpected message on attach stream"),
                         None => break,
+                    }
+                }
+                lease_event = lease_events.recv(), if !lease.lease_id.is_empty() => {
+                    match lease_event {
+                        Ok(event) if event.revoked_lease_id == lease.lease_id => {
+                            write_terminal_event(
+                                &mut send,
+                                &info.id,
+                                terminal_event::Event::LeaseChanged(LeaseChanged {
+                                    read_only: true,
+                                    reason: "taken_over".into(),
+                                }),
+                            ).await?;
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                     }
                 }
                 event = events.recv() => {
