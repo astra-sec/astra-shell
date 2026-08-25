@@ -54,6 +54,7 @@ message Request {
     RemoveFileRequest remove_file = 25;
     RenameFileRequest rename_file = 26;
     GitStatusRequest git_status = 27;
+    WatchFilesRequest watch_files = 28;
   }
 }
 message ListRequest {}
@@ -128,6 +129,7 @@ message RenameFileRequest {
   bool overwrite = 3;
 }
 message GitStatusRequest { bytes path = 1; }
+message WatchFilesRequest { repeated bytes paths = 1; }
 
 message Response {
   string request_id = 1;
@@ -144,6 +146,7 @@ message Response {
     BeginDownloadResponse begin_download = 19;
     FileChunkResponse file_chunk = 20;
     GitStatusResponse git_status = 21;
+    FileChangesResponse file_changes = 22;
   }
 }
 message TerminalInfo {
@@ -181,6 +184,7 @@ message FileCapabilitiesResponse {
   bool resumable_uploads = 3;
   bool atomic_upload_commit = 4;
   bool chunk_sha256 = 5;
+  bool file_watch_events = 6;
 }
 enum FileKind {
   FILE_KIND_UNSPECIFIED = 0;
@@ -236,6 +240,14 @@ message GitStatusResponse {
   uint32 ahead = 4;
   uint32 behind = 5;
   repeated GitFileStatus files = 6;
+}
+message FileChange {
+  bytes path = 1;
+  string kind = 2;
+}
+message FileChangesResponse {
+  repeated FileChange changes = 1;
+  bool rescan_required = 2;
 }
 
 message TerminalCommand {

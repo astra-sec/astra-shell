@@ -91,7 +91,7 @@ pub struct Request {
     pub request_id: String,
     #[prost(
         oneof = "request::Command",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28"
     )]
     pub command: Option<request::Command>,
 }
@@ -137,6 +137,8 @@ pub mod request {
         RenameFile(RenameFileRequest),
         #[prost(message, tag = "27")]
         GitStatus(GitStatusRequest),
+        #[prost(message, tag = "28")]
+        WatchFiles(WatchFilesRequest),
     }
 }
 
@@ -303,12 +305,18 @@ pub struct GitStatusRequest {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct WatchFilesRequest {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    pub paths: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct Response {
     #[prost(string, tag = "1")]
     pub request_id: String,
     #[prost(
         oneof = "response::Result",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22"
     )]
     pub result: Option<response::Result>,
 }
@@ -342,6 +350,8 @@ pub mod response {
         FileChunk(FileChunkResponse),
         #[prost(message, tag = "21")]
         GitStatus(GitStatusResponse),
+        #[prost(message, tag = "22")]
+        FileChanges(FileChangesResponse),
     }
 }
 
@@ -357,6 +367,8 @@ pub struct FileCapabilitiesResponse {
     pub atomic_upload_commit: bool,
     #[prost(bool, tag = "5")]
     pub chunk_sha256: bool,
+    #[prost(bool, tag = "6")]
+    pub file_watch_events: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -463,6 +475,22 @@ pub struct GitStatusResponse {
     pub behind: u32,
     #[prost(message, repeated, tag = "6")]
     pub files: Vec<GitFileStatus>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FileChange {
+    #[prost(bytes = "vec", tag = "1")]
+    pub path: Vec<u8>,
+    #[prost(string, tag = "2")]
+    pub kind: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FileChangesResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub changes: Vec<FileChange>,
+    #[prost(bool, tag = "2")]
+    pub rescan_required: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]

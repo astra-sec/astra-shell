@@ -670,6 +670,36 @@ where
             let result = files.git_status(status).await;
             send_file_result(&mut send, request_id, result, response::Result::GitStatus).await?;
         }
+        Some(request::Command::WatchFiles(watch)) => {
+            let mut subscription = match files.watch_files(watch) {
+                Ok(subscription) => subscription,
+                Err(error) => {
+                    send_file_result(
+                        &mut send,
+                        request_id,
+                        Err(error),
+                        response::Result::FileChanges,
+                    )
+                    .await?;
+                    send.shutdown().await?;
+                    return Ok(());
+                }
+            };
+            loop {
+                let changes = subscription.next().await;
+                let failed = changes.is_err();
+                send_file_result(
+                    &mut send,
+                    request_id.clone(),
+                    changes,
+                    response::Result::FileChanges,
+                )
+                .await?;
+                if failed {
+                    break;
+                }
+            }
+        }
         Some(request::Command::BeginUpload(begin)) => {
             let service = files.clone();
             let result = tokio::task::spawn_blocking(move || service.begin_upload(begin)).await?;
@@ -801,6 +831,7 @@ fn is_file_request(message: &WireMessage) -> bool {
                         | request::Command::RemoveFile(_)
                         | request::Command::RenameFile(_)
                         | request::Command::GitStatus(_)
+                        | request::Command::WatchFiles(_)
                 ),
                 ..
             })),

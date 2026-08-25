@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     fmt,
     fs::{self, File, OpenOptions},
@@ -13,14 +13,17 @@ use std::{
     time::Duration,
 };
 
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::protocol::{
     BeginDownloadRequest, BeginDownloadResponse, BeginUploadRequest, FileCapabilitiesResponse,
-    FileChunkResponse, FileKind, FileListRequest, FileListResponse, FileMetadata, FileStatRequest,
-    FileStatResponse, GitFileStatus, GitStatusRequest, GitStatusResponse, ReadFileChunkRequest,
-    UploadStatusResponse, WriteFileChunkRequest,
+    FileChange, FileChangesResponse, FileChunkResponse, FileKind, FileListRequest,
+    FileListResponse, FileMetadata, FileStatRequest, FileStatResponse, GitFileStatus,
+    GitStatusRequest, GitStatusResponse, ReadFileChunkRequest, UploadStatusResponse,
+    WatchFilesRequest, WriteFileChunkRequest,
 };
 
 pub const FILE_PROTOCOL_VERSION: u32 = 1;
@@ -30,6 +33,9 @@ const MAX_REMOTE_PATH_SIZE: usize = 16 * 1024;
 const MAX_TRACKED_UPLOADS: usize = 128;
 const MAX_GIT_STATUS_SIZE: usize = 4 * 1024 * 1024;
 const MAX_GIT_STATUS_ENTRIES: usize = 20_000;
+const MAX_WATCHED_FILES: usize = 128;
+const MAX_FILE_CHANGES_PER_EVENT: usize = 1_024;
+const FILE_CHANGE_COALESCE_DELAY: Duration = Duration::from_millis(75);
 
 #[derive(Debug)]
 pub struct FileServiceError {
@@ -66,6 +72,79 @@ impl fmt::Display for FileServiceError {
 impl std::error::Error for FileServiceError {}
 
 pub type FileResult<T> = std::result::Result<T, FileServiceError>;
+
+pub struct FileChangeSubscription {
+    _watcher: RecommendedWatcher,
+    receiver: mpsc::UnboundedReceiver<notify::Result<Event>>,
+    requested_paths: HashMap<PathBuf, Vec<u8>>,
+}
+
+impl FileChangeSubscription {
+    pub async fn next(&mut self) -> FileResult<FileChangesResponse> {
+        loop {
+            let event = self.receiver.recv().await.ok_or_else(|| {
+                FileServiceError::new("watch", "filesystem watcher stopped unexpectedly")
+            })?;
+            let mut events = vec![event];
+            tokio::time::sleep(FILE_CHANGE_COALESCE_DELAY).await;
+            while let Ok(event) = self.receiver.try_recv() {
+                events.push(event);
+                if events.len() >= MAX_FILE_CHANGES_PER_EVENT {
+                    break;
+                }
+            }
+
+            let response = self.coalesce(events);
+            if response.rescan_required || !response.changes.is_empty() {
+                return Ok(response);
+            }
+        }
+    }
+
+    fn coalesce(&self, events: Vec<notify::Result<Event>>) -> FileChangesResponse {
+        let mut changes = HashMap::<Vec<u8>, String>::new();
+        let mut rescan_required = false;
+        for event in events {
+            let event = match event {
+                Ok(event) => event,
+                Err(_) => {
+                    rescan_required = true;
+                    continue;
+                }
+            };
+            let Some(kind) = file_change_kind(&event.kind) else {
+                continue;
+            };
+            if kind == "rescan" {
+                rescan_required = true;
+            }
+            for path in event.paths {
+                if let Some(requested_path) = self.requested_paths.get(&path) {
+                    changes.insert(requested_path.clone(), kind.into());
+                }
+            }
+        }
+        let mut changes = changes
+            .into_iter()
+            .map(|(path, kind)| FileChange { path, kind })
+            .collect::<Vec<_>>();
+        changes.sort_by(|left, right| left.path.cmp(&right.path));
+        FileChangesResponse {
+            changes,
+            rescan_required,
+        }
+    }
+}
+
+fn file_change_kind(kind: &EventKind) -> Option<&'static str> {
+    match kind {
+        EventKind::Access(_) => None,
+        EventKind::Create(_) => Some("created"),
+        EventKind::Modify(_) => Some("modified"),
+        EventKind::Remove(_) => Some("removed"),
+        EventKind::Any | EventKind::Other => Some("rescan"),
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum UploadState {
@@ -142,7 +221,55 @@ impl FileService {
             resumable_uploads: true,
             atomic_upload_commit: true,
             chunk_sha256: true,
+            file_watch_events: true,
         }
+    }
+
+    pub fn watch_files(&self, request: WatchFilesRequest) -> FileResult<FileChangeSubscription> {
+        if request.paths.is_empty() {
+            return Err(FileServiceError::new(
+                "invalid",
+                "at least one file path is required",
+            ));
+        }
+        if request.paths.len() > MAX_WATCHED_FILES {
+            return Err(FileServiceError::new(
+                "quota",
+                format!("at most {MAX_WATCHED_FILES} files may be watched"),
+            ));
+        }
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut watcher = notify::recommended_watcher(move |event| {
+            let _ = sender.send(event);
+        })
+        .map_err(|error| FileServiceError::new("watch", error.to_string()))?;
+        let mut watched_directories = HashSet::new();
+        let mut requested_paths = HashMap::new();
+        for raw_path in request.paths {
+            let path = self.resolve_existing(&raw_path, false)?;
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                FileServiceError::io(format!("cannot inspect {}", path.display()), error)
+            })?;
+            if metadata.is_dir() {
+                return Err(FileServiceError::new(
+                    "invalid",
+                    format!("{} is a directory", path.display()),
+                ));
+            }
+            let parent = path.parent().unwrap_or(self.root.as_path()).to_path_buf();
+            if watched_directories.insert(parent.clone()) {
+                watcher
+                    .watch(&parent, RecursiveMode::NonRecursive)
+                    .map_err(|error| FileServiceError::new("watch", error.to_string()))?;
+            }
+            requested_paths.insert(path, raw_path);
+        }
+        Ok(FileChangeSubscription {
+            _watcher: watcher,
+            receiver,
+            requested_paths,
+        })
     }
 
     pub fn stat(&self, request: FileStatRequest) -> FileResult<FileStatResponse> {
@@ -1221,6 +1348,34 @@ mod tests {
                 .code,
             "invalid"
         );
+    }
+
+    #[tokio::test]
+    async fn watches_open_files_without_recursively_watching_the_project() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("Sources")).unwrap();
+        fs::write(root.path().join("Sources/App.swift"), b"first").unwrap();
+        fs::write(root.path().join("Sources/Other.swift"), b"ignored").unwrap();
+        let service = FileService::new(root.path().to_path_buf()).unwrap();
+        let mut subscription = service
+            .watch_files(WatchFilesRequest {
+                paths: vec![b"Sources/App.swift".to_vec()],
+            })
+            .unwrap();
+
+        fs::write(root.path().join("Sources/Other.swift"), b"still ignored").unwrap();
+        fs::write(root.path().join("Sources/App.swift"), b"second").unwrap();
+        let changes = tokio::time::timeout(Duration::from_secs(3), subscription.next())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(changes.changes.len(), 1);
+        assert_eq!(changes.changes[0].path, b"Sources/App.swift");
+        assert!(matches!(
+            changes.changes[0].kind.as_str(),
+            "modified" | "created"
+        ));
     }
 
     #[test]
