@@ -56,6 +56,7 @@ pub enum ServerMode {
     Managed {
         authorized_keys_directory: Option<PathBuf>,
         session_root_override: Option<PathBuf>,
+        worker_idle_timeout: std::time::Duration,
     },
 }
 
@@ -202,8 +203,13 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
         ServerMode::Managed {
             authorized_keys_directory,
             session_root_override,
+            worker_idle_timeout,
         } => ModeState::Managed {
-            router: WorkerRouter::new(&options.paths.state_dir, session_root_override)?,
+            router: WorkerRouter::new(
+                &options.paths.state_dir,
+                session_root_override,
+                worker_idle_timeout,
+            )?,
             authorized_keys_directory,
         },
     };

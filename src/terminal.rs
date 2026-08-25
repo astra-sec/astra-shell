@@ -285,6 +285,14 @@ impl TerminalManager {
         &self.session_root
     }
 
+    pub fn has_active_terminals(&self) -> bool {
+        self.terminals
+            .read()
+            .expect("terminal registry poisoned")
+            .values()
+            .any(|terminal| terminal.info().status == "running")
+    }
+
     pub fn get(&self, selector: &str) -> Option<Arc<Terminal>> {
         let terminals = self.terminals.read().expect("terminal registry poisoned");
         if let Some(terminal) = terminals.get(selector) {
@@ -972,6 +980,7 @@ mod tests {
                 environment: Vec::new(),
             })
             .unwrap();
+        assert!(manager.has_active_terminals());
 
         let first = terminal.acquire_lease(false, false, "").unwrap();
         let resumed = terminal

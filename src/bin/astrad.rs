@@ -1,9 +1,9 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use astra_shell::{
     server::{ServerMode, ServerOptions, ServerPaths, initialize_state, serve},
-    worker::serve_worker,
+    worker::{DEFAULT_WORKER_IDLE_TIMEOUT_SECONDS, serve_worker},
 };
 use clap::{Parser, Subcommand};
 
@@ -36,6 +36,9 @@ enum Command {
         /// Rootless session root, or an explicit managed-mode test override.
         #[arg(long)]
         session_root: Option<PathBuf>,
+        /// Stop an empty managed worker after this many idle seconds; 0 disables recycling.
+        #[arg(long, default_value_t = DEFAULT_WORKER_IDLE_TIMEOUT_SECONDS)]
+        worker_idle_timeout_seconds: u64,
     },
     /// Internal per-user process started by the managed gateway.
     #[command(hide = true)]
@@ -48,6 +51,8 @@ enum Command {
         session_root: PathBuf,
         #[arg(long)]
         expected_uid: u32,
+        #[arg(long)]
+        idle_timeout_seconds: u64,
     },
 }
 
@@ -82,11 +87,13 @@ async fn run() -> Result<()> {
             managed,
             authorized_keys_dir,
             session_root,
+            worker_idle_timeout_seconds,
         } => {
             let mode = if managed {
                 ServerMode::Managed {
                     authorized_keys_directory: authorized_keys_dir,
                     session_root_override: session_root,
+                    worker_idle_timeout: Duration::from_secs(worker_idle_timeout_seconds),
                 }
             } else {
                 ServerMode::Rootless {
@@ -105,6 +112,16 @@ async fn run() -> Result<()> {
             state_dir,
             session_root,
             expected_uid,
-        } => serve_worker(socket, state_dir, session_root, expected_uid).await,
+            idle_timeout_seconds,
+        } => {
+            serve_worker(
+                socket,
+                state_dir,
+                session_root,
+                expected_uid,
+                Duration::from_secs(idle_timeout_seconds),
+            )
+            .await
+        }
     }
 }

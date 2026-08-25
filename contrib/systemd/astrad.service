@@ -9,7 +9,7 @@ User=root
 Group=root
 WorkingDirectory=/home/mimi/astra-shell
 Environment=RUST_LOG=astra_shell=info
-ExecStart=/usr/local/sbin/astrad serve --managed --listen 0.0.0.0:4433 --state-dir /home/mimi/astra-shell/state
+ExecStart=/usr/local/sbin/astrad serve --managed --listen 0.0.0.0:4433 --state-dir /home/mimi/astra-shell/state --worker-idle-timeout-seconds 600
 Restart=on-failure
 RestartSec=2s
 

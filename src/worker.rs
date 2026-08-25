@@ -14,6 +14,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
     process::Command,
     sync::Mutex,
+    task::JoinSet,
 };
 use tracing::{info, warn};
 
@@ -30,11 +31,19 @@ use crate::{
 pub struct WorkerRouter {
     users_root: PathBuf,
     session_root_override: Option<PathBuf>,
+    idle_timeout: Duration,
     start_lock: Mutex<()>,
 }
 
+pub const DEFAULT_WORKER_IDLE_TIMEOUT_SECONDS: u64 = 10 * 60;
+const MAX_WORKER_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 impl WorkerRouter {
-    pub fn new(state_dir: &Path, session_root_override: Option<PathBuf>) -> Result<Arc<Self>> {
+    pub fn new(
+        state_dir: &Path,
+        session_root_override: Option<PathBuf>,
+        idle_timeout: Duration,
+    ) -> Result<Arc<Self>> {
         let users_root = state_dir.join("users");
         fs::create_dir_all(&users_root)?;
         fs::set_permissions(state_dir, fs::Permissions::from_mode(0o711))?;
@@ -42,6 +51,7 @@ impl WorkerRouter {
         Ok(Arc::new(Self {
             users_root,
             session_root_override,
+            idle_timeout,
             start_lock: Mutex::new(()),
         }))
     }
@@ -165,6 +175,8 @@ impl WorkerRouter {
             .arg(&session_root)
             .arg("--expected-uid")
             .arg(account.uid.to_string())
+            .arg("--idle-timeout-seconds")
+            .arg(self.idle_timeout.as_secs().to_string())
             .env_clear()
             .env("HOME", &account.home)
             .env("USER", &account.username)
@@ -251,6 +263,7 @@ pub async fn serve_worker(
     state_dir: PathBuf,
     session_root: PathBuf,
     expected_uid: u32,
+    idle_timeout: Duration,
 ) -> Result<()> {
     let actual_uid = effective_uid();
     if actual_uid != expected_uid {
@@ -272,15 +285,161 @@ pub async fn serve_worker(
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("failed to bind worker socket {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    let mut requests = JoinSet::new();
+    let mut idle_state = WorkerIdleState::default();
+    let check_interval = idle_timeout.min(MAX_WORKER_IDLE_CHECK_INTERVAL);
     loop {
-        let (stream, _) = listener.accept().await?;
-        let manager = manager.clone();
-        let files = files.clone();
-        tokio::spawn(async move {
-            let (recv, send) = stream.into_split();
-            if let Err(error) = handle_worker_request(manager, files, send, recv).await {
-                warn!(%error, "worker request failed");
+        tokio::select! {
+            biased;
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                idle_state.mark_active();
+                let manager = manager.clone();
+                let files = files.clone();
+                requests.spawn(async move {
+                    let (recv, send) = stream.into_split();
+                    handle_worker_request(manager, files, send, recv).await
+                });
             }
-        });
+            completed = requests.join_next(), if !requests.is_empty() => {
+                match completed {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(error))) => warn!(%error, "worker request failed"),
+                    Some(Err(error)) => warn!(%error, "worker request task failed"),
+                    None => {}
+                }
+                idle_state.observe(
+                    requests.is_empty() && !manager.has_active_terminals(),
+                    std::time::Instant::now(),
+                );
+            }
+            _ = tokio::time::sleep(check_interval), if !idle_timeout.is_zero() => {
+                let now = std::time::Instant::now();
+                let empty = requests.is_empty() && !manager.has_active_terminals();
+                if idle_state.should_exit(empty, now, idle_timeout) {
+                    info!(
+                        idle_seconds = idle_timeout.as_secs(),
+                        "empty user worker reached its idle timeout; exiting"
+                    );
+                    remove_runtime_file(&socket, "worker socket");
+                    remove_runtime_file(&pid_file, "worker PID file");
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct WorkerIdleState {
+    idle_since: Option<std::time::Instant>,
+}
+
+impl WorkerIdleState {
+    fn mark_active(&mut self) {
+        self.idle_since = None;
+    }
+
+    fn observe(&mut self, empty: bool, now: std::time::Instant) {
+        if empty {
+            self.idle_since.get_or_insert(now);
+        } else {
+            self.mark_active();
+        }
+    }
+
+    fn should_exit(&mut self, empty: bool, now: std::time::Instant, timeout: Duration) -> bool {
+        if timeout.is_zero() {
+            self.mark_active();
+            return false;
+        }
+        self.observe(empty, now);
+        self.idle_since
+            .is_some_and(|idle_since| now.duration_since(idle_since) >= timeout)
+    }
+}
+
+fn remove_runtime_file(path: &Path, description: &str) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(%error, path = %path.display(), %description, "failed to clean up worker runtime file")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_exits_only_after_continuous_empty_timeout() {
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(10);
+        let mut state = WorkerIdleState::default();
+
+        assert!(!state.should_exit(true, start, timeout));
+        assert!(!state.should_exit(true, start + Duration::from_secs(9), timeout));
+        assert!(state.should_exit(true, start + timeout, timeout));
+    }
+
+    #[test]
+    fn activity_restarts_worker_idle_timer() {
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(10);
+        let mut state = WorkerIdleState::default();
+
+        assert!(!state.should_exit(true, start, timeout));
+        assert!(!state.should_exit(false, start + Duration::from_secs(9), timeout));
+        assert!(!state.should_exit(true, start + Duration::from_secs(10), timeout));
+        assert!(!state.should_exit(true, start + Duration::from_secs(19), timeout));
+        assert!(state.should_exit(true, start + Duration::from_secs(20), timeout));
+    }
+
+    #[test]
+    fn zero_worker_idle_timeout_disables_recycling() {
+        let start = std::time::Instant::now();
+        let mut state = WorkerIdleState::default();
+
+        assert!(!state.should_exit(true, start, Duration::ZERO));
+        assert!(!state.should_exit(true, start + Duration::from_secs(86_400), Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn in_flight_request_prevents_worker_recycling() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_dir = temporary.path().join("state");
+        let session_root = temporary.path().join("home");
+        let socket = state_dir.join("session.sock");
+        fs::create_dir(&state_dir).unwrap();
+        fs::create_dir(&session_root).unwrap();
+
+        let worker = tokio::spawn(serve_worker(
+            socket.clone(),
+            state_dir.clone(),
+            session_root,
+            effective_uid(),
+            Duration::from_millis(50),
+        ));
+        for _ in 0..20 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let request = UnixStream::connect(&socket).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(175)).await;
+        assert!(!worker.is_finished());
+
+        drop(request);
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("empty worker did not exit after its idle timeout")
+            .unwrap()
+            .unwrap();
+        assert!(!socket.exists());
+        assert!(!state_dir.join("worker.pid").exists());
     }
 }

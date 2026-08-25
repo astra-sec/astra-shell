@@ -22,6 +22,7 @@ Astra Shell 是一个以 QUIC 连接多个持久 PTY 的远程终端原型。`as
 - Astra Files/1 文件协议：目录分页、元数据、创建/删除/重命名，以及带 SHA-256、断点续传和原子提交的上传下载；
 - 活动 Terminal 只以内存中实际持有的 PTY 为准，不保存可能失真的 `running` 记录；
 - QUIC keepalive、15 秒认证超时，以及 gateway/worker 单实例进程锁；
+- managed worker 在没有活动 Terminal、没有请求并连续空闲 10 分钟后自动退出；
 - 工作目录边界，子进程 cwd 不能逃出服务端配置的 `session-root`。
 
 ## 构建
@@ -196,7 +197,7 @@ state/users/1002/session.sock
 state/users/1002/worker.pid
 ```
 
-用户 worker 不随 gateway 退出，因此 gateway 可以滚动重启而不关闭用户 PTY。非 root 也可以启动 `--managed` 做测试，但只能登录当前 UID，不能切换到其他账户。
+用户 worker 不随 gateway 退出，因此 gateway 可以滚动重启而不关闭用户 PTY。没有活动 Terminal 和请求时，worker 默认连续空闲 600 秒后自动退出；使用 `--worker-idle-timeout-seconds SECONDS` 调整，设为 `0` 可关闭回收。非 root 也可以启动 `--managed` 做测试，但只能登录当前 UID，不能切换到其他账户。
 
 ### systemd 服务
 
@@ -247,6 +248,6 @@ cargo clippy --all-targets -- -D warnings
 - 保存的是有界原始输出，不是语义 screen/grid 快照；
 - 暂无 QUIC DATAGRAM 累计状态同步、预测和端口转发；Astra Files/1 已支持单文件传输和基本目录操作，但尚未提供递归目录同步、稀疏文件、ACL/xattr 和 GUI；
 - 暂无 SSH stdio fallback；
-- rootless 模式的 PTY 仍由 gateway 进程持有；managed 模式已经使用可跨 gateway 重启存活的独立用户 worker，但尚未提供正式的 worker 停止/升级管理命令。
+- rootless 模式的 PTY 仍由 gateway 进程持有；managed 模式已经使用可跨 gateway 重启存活、空闲时自动回收的独立用户 worker，但尚未提供正式的 worker 升级管理命令。
 
 线协议定义见 [`proto/astra.proto`](proto/astra.proto)，总体产品方向见 [`quic-mosh-tmux-implementation-plan.md`](quic-mosh-tmux-implementation-plan.md)。

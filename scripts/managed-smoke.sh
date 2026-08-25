@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_dir="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 mkdir -p "$repo_dir/.local-test"
-run_dir="$(mktemp -d "$repo_dir/.local-test/managed.XXXXXX")"
+run_dir="$(mktemp -d "${TMPDIR:-/tmp}/astra-managed.XXXXXX")"
 mkdir -p "$run_dir/home" "$run_dir/tmp" "$run_dir/authorized"
 chmod 700 "$run_dir/authorized"
 
@@ -49,6 +49,7 @@ start_gateway() {
     --listen "$requested_listen" \
     --state-dir "$run_dir/server" \
     --authorized-keys-dir "$run_dir/authorized" \
+    --worker-idle-timeout-seconds 2 \
     --session-root "$repo_dir" >"$log_file" 2>&1 &
   gateway_pid=$!
 
@@ -84,7 +85,7 @@ start_gateway() {
 start_gateway "$run_dir/gateway-1.log"
 "${client[@]}" list >/dev/null
 
-managed_remote_dir=".local-test/$(basename "$run_dir")/managed-files"
+managed_remote_dir=".local-test/managed-files-$(basename "$run_dir")"
 dd if=/dev/urandom of="$run_dir/managed-source.bin" bs=1048576 count=2 status=none
 "${client[@]}" files mkdir "$managed_remote_dir"
 "${client[@]}" files put "$run_dir/managed-source.bin" "$managed_remote_dir/source.bin"
@@ -136,7 +137,7 @@ terminal_id="$(
   "${client[@]}" new --name gateway-restart -- \
     /bin/sh -c 'echo BEFORE_GATEWAY_RESTART; sleep 3; echo AFTER_GATEWAY_RESTART; sleep 120'
 )"
-{ sleep 40; } | timeout 35s "${client[@]}" attach "$terminal_id" \
+{ sleep 40; } | "${client[@]}" attach "$terminal_id" \
   >"$run_dir/live-attach.out" 2>"$run_dir/live-attach.err" &
 live_attach_pid=$!
 for _ in $(seq 1 50); do
@@ -182,4 +183,23 @@ if HOME="$run_dir/home" XDG_CONFIG_HOME="$run_dir/home/.config" target/debug/ast
 fi
 
 "${client[@]}" close "$terminal_id" >/dev/null
+
+retired_worker_pid="$(tr -d '\n' <"$run_dir/server/users/$uid/worker.pid")"
+for _ in $(seq 1 60); do
+  if ! kill -0 "$retired_worker_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+if kill -0 "$retired_worker_pid" 2>/dev/null; then
+  echo "empty managed worker did not exit after its idle timeout" >&2
+  exit 1
+fi
+
+"${client[@]}" list >/dev/null
+replacement_worker_pid="$(tr -d '\n' <"$run_dir/server/users/$uid/worker.pid")"
+if [[ "$replacement_worker_pid" == "$retired_worker_pid" ]]; then
+  echo "a request after idle recycling did not start a replacement worker" >&2
+  exit 1
+fi
 echo "managed smoke test passed; artifacts: $run_dir"
