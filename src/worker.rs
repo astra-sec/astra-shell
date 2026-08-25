@@ -164,6 +164,24 @@ impl WorkerRouter {
             .clone()
             .unwrap_or_else(|| account.home.clone());
         let executable = worker_executable()?;
+        #[cfg(target_os = "linux")]
+        let mut command = {
+            let supplementary_groups = account
+                .supplementary_groups
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut command = Command::new("/usr/bin/setpriv");
+            command
+                .arg(format!("--reuid={}", account.uid))
+                .arg(format!("--regid={}", account.gid))
+                .arg(format!("--groups={supplementary_groups}"))
+                .arg("--")
+                .arg(executable);
+            command
+        };
+        #[cfg(not(target_os = "linux"))]
         let mut command = Command::new(executable);
         command
             .arg("worker")
@@ -185,9 +203,10 @@ impl WorkerRouter {
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .kill_on_drop(false);
 
+        #[cfg(not(target_os = "linux"))]
         if current_uid == 0 && account.uid != 0 {
             install_child_credentials(&mut command, account);
         }
@@ -207,20 +226,13 @@ impl WorkerRouter {
 }
 
 fn worker_executable() -> Result<PathBuf> {
-    // A root gateway may itself live below a private administrator home.  On
-    // Linux, exec through procfs keeps the already-running binary reachable
-    // after the child drops to the target UID, without copying a privileged
-    // helper or depending on that home's directory traversal permissions.
-    #[cfg(target_os = "linux")]
-    {
-        Ok(PathBuf::from("/proc/self/exe"))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Ok(std::env::current_exe()?)
-    }
+    // Resolve the real path before the child drops privileges. Some hardened
+    // procfs configurations deny exec through /proc/self/exe after setuid,
+    // even when the underlying installed binary is executable by the user.
+    Ok(std::env::current_exe()?)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn install_child_credentials(command: &mut Command, account: &SystemAccount) {
     let uid = account.uid as nix::libc::uid_t;
     let gid = account.gid as nix::libc::gid_t;

@@ -368,7 +368,7 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
             }
             .await;
             if let Err(error) = result {
-                warn!(%error, "request stream failed");
+                warn!(error = %format!("{error:#}"), "request stream failed");
             }
         });
     }

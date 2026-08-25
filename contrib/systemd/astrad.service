@@ -19,6 +19,9 @@ TimeoutStopSec=10s
 
 UMask=0077
 NoNewPrivileges=yes
+# The managed gateway must retain these capabilities so its Linux worker
+# launcher can drop each child to the authenticated Unix account.
+AmbientCapabilities=CAP_SETUID CAP_SETGID
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
