@@ -133,9 +133,11 @@ if ! printf '%s' "$observed_uid" | rg -q "(^|[^0-9])$uid([^0-9]|$)"; then
   exit 1
 fi
 
+restart_gate="$run_dir/gateway-restarted"
 terminal_id="$(
   "${client[@]}" new --name gateway-restart -- \
-    /bin/sh -c 'echo BEFORE_GATEWAY_RESTART; sleep 3; echo AFTER_GATEWAY_RESTART; sleep 120'
+    /bin/sh -c 'sleep 1; echo BEFORE_GATEWAY_RESTART; while [ ! -e "$1" ]; do sleep 0.1; done; while :; do echo AFTER_GATEWAY_RESTART; sleep 1; done' \
+    astra-managed-smoke "$restart_gate"
 )"
 { sleep 40; } | "${client[@]}" attach "$terminal_id" \
   >"$run_dir/live-attach.out" 2>"$run_dir/live-attach.err" &
@@ -158,6 +160,7 @@ gateway_pid=""
 sleep 1
 
 start_gateway "$run_dir/gateway-2.log" "$original_listen"
+touch "$restart_gate"
 for _ in $(seq 1 250); do
   if rg -q 'AFTER_GATEWAY_RESTART' "$run_dir/live-attach.out"; then
     break
