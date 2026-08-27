@@ -32,6 +32,7 @@ use crate::{
         WorkspaceListResponse, WorkspaceResponse, read_message, request, response,
         terminal_command, terminal_event, wire_message, write_message,
     },
+    resources::{QuotaExceeded, ResourceClaim, ResourceGovernor, ResourcePolicy},
     session::SessionManager,
     terminal::{ClipboardSelection, PtyEvent, Terminal},
     terminal_state_v2::{
@@ -79,12 +80,14 @@ pub struct ServerOptions {
     pub listen: SocketAddr,
     pub paths: ServerPaths,
     pub mode: ServerMode,
+    pub resource_policy: ResourcePolicy,
 }
 
 #[derive(Clone)]
 struct ServerState {
     mode: ModeState,
     instance_id: String,
+    resources: ResourceGovernor,
 }
 
 #[derive(Clone)]
@@ -201,19 +204,26 @@ fn write_new_file(path: &Path, contents: &[u8], _mode: u32) -> Result<()> {
 }
 
 pub async fn serve(options: ServerOptions) -> Result<()> {
+    options.resource_policy.validate()?;
     ensure_initialized(&options.paths)?;
     if matches!(&options.mode, ServerMode::Managed { .. }) {
         validate_managed_gateway_state(&options.paths)?;
     }
     let _daemon_lock = ProcessLock::acquire(&options.paths.state_dir.join("gateway.lock"))?;
+    let resources = ResourceGovernor::new(&options.resource_policy)?;
     let mode = match options.mode {
         ServerMode::Rootless { session_root } => {
-            let files = FileService::new(session_root.clone())?;
+            let account = SystemAccount::current()?;
+            let resource_account = resources.account(&account.username)?;
+            let files =
+                FileService::with_resources(session_root.clone(), resource_account.clone())?;
             ModeState::Rootless {
-                account: SystemAccount::current()?,
-                manager: SessionManager::new(
+                account,
+                manager: SessionManager::with_resources(
                     session_root,
                     options.paths.state_dir.join("session-catalog.pb"),
+                    resource_account,
+                    options.resource_policy.clone(),
                 )?,
                 files,
                 authorized_keys: options.paths.authorized_keys.clone(),
@@ -228,6 +238,8 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
                 &options.paths.state_dir,
                 session_root_override,
                 worker_idle_timeout,
+                resources.clone(),
+                options.resource_policy.clone(),
             )?,
             authorized_keys_directory,
         },
@@ -235,7 +247,11 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     let instance_id = fs::read_to_string(&options.paths.instance_id)?
         .trim()
         .to_owned();
-    let state = ServerState { mode, instance_id };
+    let state = ServerState {
+        mode,
+        instance_id,
+        resources,
+    };
 
     let certificate = CertificateDer::from(fs::read(&options.paths.cert)?);
     let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(fs::read(&options.paths.key)?));
@@ -365,10 +381,18 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
         capabilities = negotiated.capabilities.len(),
         "client authenticated"
     );
+    let connection_resources = state.resources.account(&username)?;
+    let _connection_reservation = match connection_resources.reserve(ResourceClaim::connection()) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            connection.close(0x102_u32.into(), b"connection quota exceeded");
+            return Err(error.into());
+        }
+    };
     let connection_id = uuid::Uuid::new_v4().to_string();
 
     loop {
-        let (send, mut recv) = match connection.accept_bi().await {
+        let (mut send, mut recv) = match connection.accept_bi().await {
             Ok(stream) => stream,
             Err(quinn::ConnectionError::ApplicationClosed { .. }) => return Ok(()),
             Err(error) => return Err(error.into()),
@@ -376,11 +400,24 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
         let backend = backend.clone();
         let negotiated = negotiated.clone();
         let connection_id = connection_id.clone();
+        let connection_resources = connection_resources.clone();
         tokio::spawn(async move {
             let result: Result<()> = async {
                 let first_message = read_message(&mut recv)
                     .await?
                     .context("request stream ended before its first message")?;
+                let _gateway_stream_reservation =
+                    if matches!(&backend, ConnectionBackend::Worker { .. }) {
+                        match connection_resources.reserve(ResourceClaim::stream()) {
+                            Ok(reservation) => Some(reservation),
+                            Err(error) => {
+                                reject_request_for_quota(&mut send, &first_message, error).await?;
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        None
+                    };
                 if is_file_request(&first_message) {
                     send.set_priority(-10)?;
                 }
@@ -653,6 +690,7 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    let file_request = is_file_request(&first_message);
     let request = match first_message {
         WireMessage {
             body: Some(wire_message::Body::Request(request)),
@@ -660,6 +698,27 @@ where
         _ => bail!("expected Request as first stream message"),
     };
     let request_id = request.request_id.clone();
+    let resource_account = manager.resource_account();
+    let _stream_resources = match resource_account.reserve(ResourceClaim::stream()) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            send_error(&mut send, request_id, "quota", error.into()).await?;
+            send.shutdown().await?;
+            return Ok(());
+        }
+    };
+    let _file_resources = if file_request {
+        match resource_account.reserve(ResourceClaim::file_handle()) {
+            Ok(reservation) => Some(reservation),
+            Err(error) => {
+                send_error(&mut send, request_id, "quota", error.into()).await?;
+                send.shutdown().await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
     let session_objects = negotiated.has(CAPABILITY_SESSION_OBJECTS, 1);
     match request.command {
         Some(request::Command::List(_)) => {
@@ -682,7 +741,7 @@ where
                 )
                 .await?;
             }
-            Err(error) => send_error(&mut send, request_id, "spawn", error).await?,
+            Err(error) => send_domain_error(&mut send, request_id, "spawn", error).await?,
         },
         Some(request::Command::Close(close)) => {
             match manager.get_terminal(&close.workspace_id, &close.terminal_id, session_objects) {
@@ -1063,6 +1122,21 @@ fn is_file_request(message: &WireMessage) -> bool {
     )
 }
 
+async fn reject_request_for_quota(
+    send: &mut quinn::SendStream,
+    message: &WireMessage,
+    error: QuotaExceeded,
+) -> Result<()> {
+    if let WireMessage {
+        body: Some(wire_message::Body::Request(request)),
+    } = message
+    {
+        send_error(send, request.request_id.clone(), "quota", error.into()).await?;
+    }
+    send.shutdown().await?;
+    Ok(())
+}
+
 async fn send_file_result<W, T>(
     send: &mut W,
     request_id: String,
@@ -1136,7 +1210,7 @@ where
         Ok(attachment) => attachment,
         Err(error) => {
             terminal.release_lease(&lease.lease_id);
-            send_error(&mut send, request_id, "attachment", error).await?;
+            send_domain_error(&mut send, request_id, "attachment", error).await?;
             send.shutdown().await?;
             return Ok(());
         }
@@ -1417,6 +1491,23 @@ where
     .await
 }
 
+async fn send_domain_error<W>(
+    send: &mut W,
+    request_id: String,
+    default_code: &str,
+    error: anyhow::Error,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let code = if error.downcast_ref::<QuotaExceeded>().is_some() {
+        "quota"
+    } else {
+        default_code
+    };
+    send_error(send, request_id, code, error).await
+}
+
 async fn write_terminal_event<W>(
     send: &mut W,
     terminal_id: &str,
@@ -1533,9 +1624,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::*;
+    use crate::protocol::{FileCapabilitiesRequest, ListRequest, Request};
+    use crate::resources::ResourceAccount;
     use crate::terminal_engine::TerminalEngine;
 
     #[test]
@@ -1585,6 +1679,88 @@ mod tests {
         let state = temporary.path().join("state");
         symlink(&actual, &state).unwrap();
         assert!(initialize_state(&ServerPaths::new(state)).is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_quota_returns_protocol_error_without_running_the_request() {
+        let mut policy = ResourcePolicy::default();
+        policy.user.streams = 1;
+        let error = quota_response(
+            policy,
+            ResourceClaim::stream(),
+            request::Command::List(ListRequest {}),
+        )
+        .await;
+        assert_eq!(error.code, "quota");
+        assert!(error.message.contains("streams"));
+    }
+
+    #[tokio::test]
+    async fn file_handle_quota_returns_protocol_error_before_file_service_work() {
+        let mut policy = ResourcePolicy::default();
+        policy.user.file_handles = 1;
+        let error = quota_response(
+            policy,
+            ResourceClaim::file_handle(),
+            request::Command::FileCapabilities(FileCapabilitiesRequest {}),
+        )
+        .await;
+        assert_eq!(error.code, "quota");
+        assert!(error.message.contains("file_handles"));
+    }
+
+    async fn quota_response(
+        policy: ResourcePolicy,
+        existing: ResourceClaim,
+        command: request::Command,
+    ) -> ErrorResponse {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("home");
+        fs::create_dir(&root).unwrap();
+        let resources = ResourceAccount::standalone("test user", policy.user).unwrap();
+        let _existing = resources.reserve(existing).unwrap();
+        let manager = SessionManager::with_resources(
+            root.clone(),
+            temporary.path().join("session-catalog.pb"),
+            resources.clone(),
+            policy,
+        )
+        .unwrap();
+        let files = FileService::with_resources(root, resources).unwrap();
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let (server_read, server_write) = tokio::io::split(server);
+        let request_id = "quota-request".to_owned();
+        let first_message = WireMessage::new(wire_message::Body::Request(Request {
+            request_id: request_id.clone(),
+            command: Some(command),
+        }));
+        handle_worker_message(
+            manager,
+            files,
+            server_write,
+            server_read,
+            first_message,
+            NegotiatedProtocol {
+                version: crate::PROTOCOL_VERSION,
+                capabilities: BTreeMap::new(),
+            },
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .await
+        .unwrap();
+        let response = read_message(&mut client_read)
+            .await
+            .unwrap()
+            .expect("quota response missing");
+        let wire_message::Body::Response(response) = response.body.unwrap() else {
+            panic!("expected Response")
+        };
+        assert_eq!(response.request_id, request_id);
+        let response::Result::Error(error) = response.result.unwrap() else {
+            panic!("expected ErrorResponse")
+        };
+        error
     }
 
     #[test]

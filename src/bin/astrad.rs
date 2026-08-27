@@ -2,10 +2,13 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use astra_shell::{
+    resources::{ResourceLimits, ResourcePolicy},
     server::{ServerMode, ServerOptions, ServerPaths, initialize_state, serve},
     worker::{DEFAULT_WORKER_IDLE_TIMEOUT_SECONDS, serve_worker},
 };
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+
+const MIB: u64 = 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "astrad", version, about = "Astra persistent terminal daemon")]
@@ -39,6 +42,8 @@ enum Command {
         /// Stop an empty managed worker after this many idle seconds; 0 disables recycling.
         #[arg(long, default_value_t = DEFAULT_WORKER_IDLE_TIMEOUT_SECONDS)]
         worker_idle_timeout_seconds: u64,
+        #[command(flatten)]
+        resources: ResourceArgs,
     },
     /// Internal per-user process started by the managed gateway.
     #[command(hide = true)]
@@ -53,7 +58,159 @@ enum Command {
         expected_uid: u32,
         #[arg(long)]
         idle_timeout_seconds: u64,
+        #[command(flatten)]
+        resources: UserResourceArgs,
+        #[command(flatten)]
+        terminal_resources: TerminalResourceArgs,
     },
+}
+
+#[derive(Clone, Debug, Args)]
+struct ResourceArgs {
+    #[command(flatten)]
+    global: GlobalResourceArgs,
+    #[command(flatten)]
+    user: UserResourceArgs,
+    #[command(flatten)]
+    terminal: TerminalResourceArgs,
+}
+
+impl ResourceArgs {
+    fn policy(self) -> Result<ResourcePolicy> {
+        let policy = ResourcePolicy {
+            global: self.global.limits()?,
+            user: self.user.limits()?,
+            terminal_base_memory_bytes: to_bytes(
+                self.terminal.terminal_base_memory_mib,
+                "terminal base memory",
+            )?,
+            terminal_cell_memory_bytes: self.terminal.terminal_cell_memory_bytes,
+            terminal_history_bytes: to_bytes(
+                self.terminal.terminal_history_mib,
+                "terminal history",
+            )?,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+struct GlobalResourceArgs {
+    #[arg(long, default_value_t = 1_024)]
+    max_global_connections: u64,
+    #[arg(long, default_value_t = 8_192)]
+    max_global_streams: u64,
+    #[arg(long, default_value_t = 64)]
+    max_global_workers: u64,
+    #[arg(long, default_value_t = 4_096)]
+    max_global_terminals: u64,
+    #[arg(long, default_value_t = 16_384)]
+    max_global_attachments: u64,
+    #[arg(long, default_value_t = 16_384)]
+    max_global_terminal_memory_mib: u64,
+    #[arg(long, default_value_t = 32_768)]
+    max_global_history_mib: u64,
+    #[arg(long, default_value_t = 16_384)]
+    max_global_file_handles: u64,
+    #[arg(long, default_value_t = 1_024)]
+    max_global_uploads: u64,
+    #[arg(long, default_value_t = 524_288)]
+    max_global_upload_mib: u64,
+}
+
+impl GlobalResourceArgs {
+    fn limits(self) -> Result<ResourceLimits> {
+        Ok(ResourceLimits {
+            connections: self.max_global_connections,
+            streams: self.max_global_streams,
+            workers: self.max_global_workers,
+            terminals: self.max_global_terminals,
+            attachments: self.max_global_attachments,
+            terminal_memory_bytes: to_bytes(
+                self.max_global_terminal_memory_mib,
+                "global terminal memory",
+            )?,
+            history_bytes: to_bytes(self.max_global_history_mib, "global history")?,
+            file_handles: self.max_global_file_handles,
+            uploads: self.max_global_uploads,
+            upload_bytes: to_bytes(self.max_global_upload_mib, "global upload")?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+struct UserResourceArgs {
+    #[arg(long, default_value_t = 8)]
+    max_user_connections: u64,
+    #[arg(long, default_value_t = 256)]
+    max_user_streams: u64,
+    #[arg(long, default_value_t = 64)]
+    max_user_terminals: u64,
+    #[arg(long, default_value_t = 256)]
+    max_user_attachments: u64,
+    #[arg(long, default_value_t = 256)]
+    max_user_terminal_memory_mib: u64,
+    #[arg(long, default_value_t = 512)]
+    max_user_history_mib: u64,
+    #[arg(long, default_value_t = 256)]
+    max_user_file_handles: u64,
+    #[arg(long, default_value_t = 16)]
+    max_user_uploads: u64,
+    #[arg(long, default_value_t = 8_192)]
+    max_user_upload_mib: u64,
+}
+
+impl UserResourceArgs {
+    fn limits(self) -> Result<ResourceLimits> {
+        Ok(ResourceLimits {
+            connections: self.max_user_connections,
+            streams: self.max_user_streams,
+            workers: 1,
+            terminals: self.max_user_terminals,
+            attachments: self.max_user_attachments,
+            terminal_memory_bytes: to_bytes(
+                self.max_user_terminal_memory_mib,
+                "user terminal memory",
+            )?,
+            history_bytes: to_bytes(self.max_user_history_mib, "user history")?,
+            file_handles: self.max_user_file_handles,
+            uploads: self.max_user_uploads,
+            upload_bytes: to_bytes(self.max_user_upload_mib, "user upload")?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+struct TerminalResourceArgs {
+    #[arg(long, default_value_t = 4)]
+    terminal_base_memory_mib: u64,
+    #[arg(long, default_value_t = 64)]
+    terminal_cell_memory_bytes: u64,
+    #[arg(long, default_value_t = 8)]
+    terminal_history_mib: u64,
+}
+
+fn worker_policy(user: UserResourceArgs, terminal: TerminalResourceArgs) -> Result<ResourcePolicy> {
+    let user = user.limits()?;
+    let policy = ResourcePolicy {
+        global: user,
+        user,
+        terminal_base_memory_bytes: to_bytes(
+            terminal.terminal_base_memory_mib,
+            "terminal base memory",
+        )?,
+        terminal_cell_memory_bytes: terminal.terminal_cell_memory_bytes,
+        terminal_history_bytes: to_bytes(terminal.terminal_history_mib, "terminal history")?,
+    };
+    policy.validate()?;
+    Ok(policy)
+}
+
+fn to_bytes(mebibytes: u64, label: &str) -> Result<u64> {
+    mebibytes
+        .checked_mul(MIB)
+        .ok_or_else(|| anyhow::anyhow!("{label} limit overflows bytes"))
 }
 
 #[tokio::main]
@@ -88,7 +245,9 @@ async fn run() -> Result<()> {
             authorized_keys_dir,
             session_root,
             worker_idle_timeout_seconds,
+            resources,
         } => {
+            let resource_policy = resources.policy()?;
             let mode = if managed {
                 ServerMode::Managed {
                     authorized_keys_directory: authorized_keys_dir,
@@ -104,6 +263,7 @@ async fn run() -> Result<()> {
                 listen,
                 paths: ServerPaths::new(state_dir),
                 mode,
+                resource_policy,
             })
             .await
         }
@@ -113,15 +273,82 @@ async fn run() -> Result<()> {
             session_root,
             expected_uid,
             idle_timeout_seconds,
+            resources,
+            terminal_resources,
         } => {
+            let resource_policy = worker_policy(resources, terminal_resources)?;
             serve_worker(
                 socket,
                 state_dir,
                 session_root,
                 expected_uid,
                 Duration::from_secs(idle_timeout_seconds),
+                resource_policy,
             )
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_rejects_zero_or_inverted_resource_policy() {
+        let parsed = Cli::try_parse_from(["astrad", "serve", "--max-user-terminals", "0"]).unwrap();
+        let Command::Serve { resources, .. } = parsed.command else {
+            panic!("expected serve command")
+        };
+        assert!(resources.policy().is_err());
+
+        let parsed = Cli::try_parse_from([
+            "astrad",
+            "serve",
+            "--max-global-terminals",
+            "1",
+            "--max-user-terminals",
+            "2",
+        ])
+        .unwrap();
+        let Command::Serve { resources, .. } = parsed.command else {
+            panic!("expected serve command")
+        };
+        assert!(resources.policy().is_err());
+    }
+
+    #[test]
+    fn hidden_worker_receives_assigned_user_capacity() {
+        let parsed = Cli::try_parse_from([
+            "astrad",
+            "worker",
+            "--socket",
+            "/tmp/astra-test.sock",
+            "--state-dir",
+            "/tmp/astra-test-state",
+            "--session-root",
+            "/tmp",
+            "--expected-uid",
+            "501",
+            "--idle-timeout-seconds",
+            "60",
+            "--max-user-terminals",
+            "32",
+            "--terminal-history-mib",
+            "4",
+        ])
+        .unwrap();
+        let Command::Worker {
+            resources,
+            terminal_resources,
+            ..
+        } = parsed.command
+        else {
+            panic!("expected worker command")
+        };
+        let policy = worker_policy(resources, terminal_resources).unwrap();
+        assert_eq!(policy.user.terminals, 32);
+        assert_eq!(policy.terminal_history_bytes, 4 * MIB);
+        assert_eq!(policy.global, policy.user);
     }
 }
