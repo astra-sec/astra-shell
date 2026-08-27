@@ -71,7 +71,7 @@ Rootless 模式使用 `state/authorized_keys`，daemon 只能代表启动它的 
 
 ### 资源配额
 
-Rootless 与 managed 模式使用同一套分层 `ResourceGovernor`。默认每用户允许 8 个认证连接、256 条活动 Stream、64 个 Terminal、256 个 Attachment、256 MiB Terminal 基础内存容量、512 MiB history 容量、256 个活动文件操作、16 个活动 upload 和 8 GiB 声明 upload bytes。每个 Terminal admission 至少预留 4 MiB 基础内存和 8 MiB history；大初始网格会增加基础内存 claim。
+Rootless 与 managed 模式使用同一套分层 `ResourceGovernor`。默认每用户允许 8 个认证连接、256 条活动 Stream、64 个 Terminal、256 个 Attachment、256 MiB Terminal 基础内存容量、512 MiB history 容量、256 个活动文件操作、16 个活动 upload 和 8 GiB 声明 upload bytes。每个 Terminal admission 至少预留 4 MiB 基础内存和 8 MiB history；权威主屏历史默认保留 10,000 行或 8 MiB accounted bytes，取先达到者，大初始网格会增加基础内存 claim。
 
 所有限制都能从 `astrad serve --help` 中的 `--max-global-*`、`--max-user-*` 和 `--terminal-*` 参数覆盖。例如：
 
@@ -82,10 +82,11 @@ Rootless 与 managed 模式使用同一套分层 `ResourceGovernor`。默认每�
   --session-root /home/mimi/astra-shell \
   --max-user-terminals 32 \
   --max-user-history-mib 1024 \
+  --terminal-history-rows 20000 \
   --terminal-history-mib 16
 ```
 
-多个维度同时生效，实际可创建数量由最先耗尽的维度决定。0 不表示无限，零值或 global 无法容纳一个完整 user capacity 的配置会在 daemon 启动前失败。超限返回稳定的 `quota` 错误，只拒绝新资源，不结束已经运行的 Terminal。managed gateway 按 UID 预留完整 user worker capacity，root gateway 不解析 Terminal 内容；内部 worker 不能接受客户端自报或提高的配额。完整所有权与默认值见 [`docs/adr/0003-resource-quota-model.md`](docs/adr/0003-resource-quota-model.md)。
+多个维度同时生效，实际可创建数量由最先耗尽的维度决定。0 不表示无限，零值或 global 无法容纳一个完整 user capacity 的配置会在 daemon 启动前失败。单 Terminal 的服务端硬上限是 1,000,000 行和 1 GiB；提高行数但不提高字节数不会绕过 byte trim。超限返回稳定的 `quota` 错误，只拒绝新资源，不结束已经运行的 Terminal。managed gateway 按 UID 预留完整 user worker capacity，root gateway 不解析 Terminal 内容；内部 worker 不能接受客户端自报或提高的配额。资源所有权见 [`docs/adr/0003-resource-quota-model.md`](docs/adr/0003-resource-quota-model.md)，历史计量与 trim 规则见 [`docs/adr/0004-history-capacity-accounting.md`](docs/adr/0004-history-capacity-accounting.md)。
 
 ### 启动客户端
 

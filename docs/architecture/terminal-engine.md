@@ -1,6 +1,6 @@
 # Astra server TerminalEngine
 
-状态：`TERM-03` 至 `TERM-06`、`HIST-01/02` 服务端实现说明。服务端权威终端模型、可靠 semantic attach、输入模式、宿主能力边界、主屏历史 cell model 和 Anchor 分页已经实现；增量同步和历史容量策略仍属于后续任务。
+状态：`TERM-03` 至 `TERM-06`、`HIST-01` 至 `HIST-03` 服务端实现说明。服务端权威终端模型、可靠 semantic attach、输入模式、宿主能力边界、主屏历史 cell model、Anchor 分页和双上限容量已经实现；增量同步仍属于后续任务。
 
 ## 权威数据路径
 
@@ -22,7 +22,7 @@ PTY reader
 - 上游：WezTerm commit `78cd82dbba7315814bfbff40e246b8bed4b702e7`
 - 默认 feature：`astra-headless`
 - Astra v1 未承诺的 graphics/image 路径默认不编译，也不在 DA 中声明 Sixel。
-- 未独立发布的 `wezterm-cell`、`wezterm-char-props`、`wezterm-escape-parser`、`wezterm-surface` 是同一上游 commit 的源码镜像，放在 `vendor/`；Astra 修改只允许进入 `astra-wezterm-term`。
+- 未独立发布的 `wezterm-cell`、`wezterm-char-props`、`wezterm-escape-parser`、`wezterm-surface` 是同一上游 commit 的源码镜像，放在 `vendor/`。除 ADR 0004 允许的 `astra_*` retained-storage 计量 API 外，Astra 行为修改只允许进入 `astra-wezterm-term`；计量 API 不包含协议、trim 策略或客户端逻辑。
 - fork 不包含 protobuf、网络 generation 或客户端特判；升级必须固定新 commit、审计 upstream diff、同步替换四个 core mirror 并重跑 conformance suite。
 
 `AstraTerminalView` 同时暴露 primary/alternate 和必要运行态，只提供 caller-bounded row iterator，不提供无界 clone-all API。网络层将该 view 转换为 Astra 自有、带资源上限的 Terminal State v2，不序列化上游私有结构。
@@ -32,10 +32,17 @@ PTY reader
 历史不是另一份字符串缓存。主屏 viewport 上滚时，原 `Line` 连同 grapheme、cell width、完整 attributes、hyperlink、soft-wrap marker 和 `AstraLineIdentity` 一起进入同一个 `VecDeque`；压缩 scrollback 只改变内部存储，不降低导出语义。`AstraScreenView` 明确暴露 screen kind、是否允许 scrollback 和 history row count，`TerminalEngine` 每次导出都验证：
 
 - primary 的 retained history 与 viewport 连续，`viewport_start + rows == row_count`；
+- primary history 同时满足配置的 row limit 和 accounted-byte limit；
 - alternate 不允许 scrollback，history row count 和 viewport start 必须为 0，row count 必须正好等于 viewport 高度；
 - primary/alternate 仍共享 Terminal State v2 的有界消息预算，但只有 primary 能产生历史。
 
-`HIST-01` 只定义权威 cell model 和稳定 identity。它不提高 2,000 行临时容量基线，也不让客户端自行拼接页面；容量/字节配额与滚动条仍分别属于 `HIST-03/04`。
+## 历史容量与计量
+
+`HIST-03` 把 OPS-01 的 per-Terminal history reservation 接到同一个 `Screen`。默认双上限是 10,000 retained rows 或 8 MiB accounted bytes，取先达到者；`--terminal-history-rows` 与 `--terminal-history-mib` 可以在服务端策略范围内同时调整，绝对硬上限分别为 1,000,000 rows 与 1 GiB。
+
+accounted bytes 跟随当前压缩/向量存储表示，计入 `Line`/identity、cell 或 cluster allocation、grapheme、fat attributes、wide-cell bitset 与 hyperlink payload；共享 hyperlink 按每个引用重复计费。普通 scroll 只增减新进入和被淘汰行的费用，resize/reflow 后从权威队列重算。它约束 retained model data，不冒充 OS RSS；容器余量属于 Terminal base-memory reservation。
+
+任一上限超出时，引擎只从 primary history 最旧前缀 trim。viewport 与 alternate 不受影响，logical ID 不复用，正常 trim 不轮换 epoch；保留 Anchor 稳定，`oldest_available` 随同一队列自然前移。完整决策见 ADR 0004。滚动条仍属于 `HIST-04`。
 
 ## Anchor 历史分页
 
@@ -72,7 +79,7 @@ DA/DSR 和尺寸查询由服务端直接回答。字符尺寸始终可用；像�
 
 OSC 52 是单向、显式协商的 host effect：服务端最多接受 256 KiB UTF-8 写入，通过 `terminal.clipboard_write` v1 结构化事件交给 semantic client；query 永不读取或回传客户端剪贴板，未协商的 attachment 不收到事件。Primary DA 不宣称通用 clipboard access。OSC 8 hyperlink 只作为语义 State 数据传输，是否打开以及允许的 URL scheme 必须由客户端在用户点击时决定。
 
-每次语义导出都运行 Terminal State v2 validator；超出 schema 大小、引用或 enum 约束时返回错误并拒绝整个 State，不部分发送，也不 panic。历史总容量、按字节配额和分页不是本任务职责，仍由 `HIST-01` 至 `HIST-03` 与 `OPS-01` 完成。
+每次语义导出都运行 Terminal State v2 validator；超出 schema 大小、引用或 enum 约束时返回错误并拒绝整个 State，不部分发送，也不 panic。历史分页、行数与 accounted-byte 上限由同一个权威 Screen 实施，不由协议层二次裁剪。
 
 ## 迁移兼容边界
 
@@ -90,6 +97,8 @@ OSC 52 是单向、显式协商的 host effect：服务端最多接受 256 KiB U
 - primary history 与 alternate viewport 共享 schema 的 4096-row 总预算；截取后仍完整包含当前 primary viewport。
 - 带 style、hyperlink 和 wide grapheme 的 soft-wrapped logical line 滚入历史后保持完整 cell 语义。
 - normal scroll/trim 不轮换 epoch、不复用 logical ID；反复 narrow/wide reflow 保持 logical ID 和 retained content。
+- 默认简单输出保留 10,000 行；第 10,001 行确定性推进 oldest Anchor，复杂 hyperlink 内容可先触发 byte trim。
+- resize/reflow 后重新计量且不超过双上限；已经被 trim 的分页 Anchor 返回当前真实边界与空正常页。
 - alternate 大量滚动仍只导出一个 viewport，且不改变 primary 历史的 cell 和 identity。
 - Anchor 分页严格位于请求边界之前，遵守 512-row/4-MiB 上限；oldest 边界产生空页，旧 epoch 产生结构化 reset。
 - 历史页分片共享 transfer identity 和 SHA-256；N-1 decoder 忽略未协商的 command/event oneof。

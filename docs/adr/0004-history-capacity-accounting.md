@@ -26,6 +26,8 @@ HIST-01/02 已使主屏 viewport、已保留历史、稳定 Anchor 和分页共�
 - line zone、cell vector、压缩 text、attribute cluster 和 wide-cell bitset 的已分配存储；
 - heap grapheme、fat cell attributes 与 hyperlink URI/parameters；共享 hyperlink 在每个引用它的 cluster/cell 上重复计费，避免共享关系成为绕过上限的手段。
 
+这项决策把 ADR 0001 的受控 fork 边界收窄扩展到 `wezterm-cell` 与 `wezterm-surface` 中命名为 `astra_*` 的只读 retained-storage 计量方法。core mirror 不拥有上限、trim 或协议决策；这些行为仍只位于 `astra-wezterm-term::Screen`。
+
 正常上滚前，row 先执行与现有引擎相同的 `compress_for_scrollback`，再按压缩后的真实表示计费。计数覆盖权威模型保留的数据，但不是操作系统 RSS/cgroup 指标；allocator/container spare capacity 由 Terminal base-memory reservation 承担，后续 OPS-02 可独立暴露 RSS 指标。
 
 ### 增量维护与重算
