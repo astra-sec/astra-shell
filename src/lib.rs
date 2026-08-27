@@ -7,6 +7,7 @@ pub mod negotiation;
 pub(crate) mod process_lock;
 pub mod protocol;
 pub mod server;
+pub mod session;
 pub mod terminal;
 pub mod terminal_engine;
 pub mod terminal_state_v2;

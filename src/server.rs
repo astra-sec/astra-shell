@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use prost::Message;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -20,18 +20,20 @@ use crate::{
     files::{FileResult, FileService},
     negotiation::{
         CAPABILITY_CLIPBOARD_WRITE, CAPABILITY_HISTORY_PAGING, CAPABILITY_SEMANTIC_STATE,
-        NegotiatedProtocol, ProtocolSupport, negotiate_client_hello, selections,
-        validate_worker_selection,
+        CAPABILITY_SESSION_OBJECTS, NegotiatedProtocol, ProtocolSupport, negotiate_client_hello,
+        selections, validate_worker_selection,
     },
     process_lock::ProcessLock,
     protocol::{
-        AckResponse, AttachResponse, AuthResult, ClipboardSelection as WireClipboardSelection,
-        ClipboardWrite, ErrorResponse, HistoryPageChunk, LeaseChanged, ListResponse, Response,
-        ServerHello, SpawnResponse, TerminalEvent, TerminalStateChunk, WireMessage,
-        WorkerStreamHello, read_message, request, response, terminal_command, terminal_event,
-        wire_message, write_message,
+        AckResponse, AttachResponse, AttachmentListResponse, AuthResult,
+        ClipboardSelection as WireClipboardSelection, ClipboardWrite, ErrorResponse,
+        HistoryPageChunk, LeaseChanged, ListResponse, Response, ServerHello, SpawnResponse,
+        TerminalEvent, TerminalListResponse, TerminalStateChunk, WireMessage, WorkerStreamHello,
+        WorkspaceListResponse, WorkspaceResponse, read_message, request, response,
+        terminal_command, terminal_event, wire_message, write_message,
     },
-    terminal::{ClipboardSelection, PtyEvent, Terminal, TerminalManager},
+    session::SessionManager,
+    terminal::{ClipboardSelection, PtyEvent, Terminal},
     terminal_state_v2::{
         HistoryPage, MAX_ENCODED_HISTORY_PAGE_BYTES, MAX_ENCODED_STATE_BYTES, State,
     },
@@ -89,7 +91,7 @@ struct ServerState {
 enum ModeState {
     Rootless {
         account: SystemAccount,
-        manager: TerminalManager,
+        manager: SessionManager,
         files: FileService,
         authorized_keys: PathBuf,
     },
@@ -102,7 +104,7 @@ enum ModeState {
 #[derive(Clone)]
 enum ConnectionBackend {
     Local {
-        manager: TerminalManager,
+        manager: SessionManager,
         files: FileService,
     },
     Worker {
@@ -209,7 +211,10 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
             let files = FileService::new(session_root.clone())?;
             ModeState::Rootless {
                 account: SystemAccount::current()?,
-                manager: TerminalManager::new(session_root)?,
+                manager: SessionManager::new(
+                    session_root,
+                    options.paths.state_dir.join("session-catalog.pb"),
+                )?,
                 files,
                 authorized_keys: options.paths.authorized_keys.clone(),
             }
@@ -360,6 +365,7 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
         capabilities = negotiated.capabilities.len(),
         "client authenticated"
     );
+    let connection_id = uuid::Uuid::new_v4().to_string();
 
     loop {
         let (send, mut recv) = match connection.accept_bi().await {
@@ -369,6 +375,7 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
         };
         let backend = backend.clone();
         let negotiated = negotiated.clone();
+        let connection_id = connection_id.clone();
         tokio::spawn(async move {
             let result: Result<()> = async {
                 let first_message = read_message(&mut recv)
@@ -379,12 +386,27 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
                 }
                 match backend {
                     ConnectionBackend::Local { manager, files } => {
-                        handle_worker_message(manager, files, send, recv, first_message, negotiated)
-                            .await
+                        handle_worker_message(
+                            manager,
+                            files,
+                            send,
+                            recv,
+                            first_message,
+                            negotiated,
+                            connection_id,
+                        )
+                        .await
                     }
                     ConnectionBackend::Worker { router, account } => {
                         router
-                            .proxy_stream(&account, send, recv, first_message, negotiated)
+                            .proxy_stream(
+                                &account,
+                                send,
+                                recv,
+                                first_message,
+                                negotiated,
+                                connection_id,
+                            )
                             .await
                     }
                 }
@@ -567,7 +589,7 @@ fn authenticate_user(
 }
 
 pub(crate) async fn handle_worker_request<W, R>(
-    manager: TerminalManager,
+    manager: SessionManager,
     files: FileService,
     send: W,
     mut recv: R,
@@ -579,32 +601,53 @@ where
     let hello = read_message(&mut recv)
         .await?
         .context("request stream ended before its first message")?;
-    let negotiated = match hello {
+    let (negotiated, connection_id) = match hello {
         WireMessage {
             body:
                 Some(wire_message::Body::WorkerStreamHello(WorkerStreamHello {
                     protocol_version,
                     capabilities,
-                    ..
+                    connection_id,
                 })),
-        } => {
-            validate_worker_selection(protocol_version, &capabilities, &ProtocolSupport::runtime())?
-        }
+        } => (
+            validate_worker_selection(
+                protocol_version,
+                &capabilities,
+                &ProtocolSupport::runtime(),
+            )?,
+            connection_id,
+        ),
         _ => bail!("expected WorkerStreamHello as first worker stream message"),
     };
+    let parsed_connection_id =
+        uuid::Uuid::parse_str(&connection_id).context("worker connection ID is not a UUID")?;
+    ensure!(
+        parsed_connection_id.to_string() == connection_id,
+        "worker connection ID is not canonical"
+    );
     let request = read_message(&mut recv)
         .await?
         .context("worker stream ended before its request")?;
-    handle_worker_message(manager, files, send, recv, request, negotiated).await
+    handle_worker_message(
+        manager,
+        files,
+        send,
+        recv,
+        request,
+        negotiated,
+        connection_id,
+    )
+    .await
 }
 
 async fn handle_worker_message<W, R>(
-    manager: TerminalManager,
+    manager: SessionManager,
     files: FileService,
     mut send: W,
     recv: R,
     first_message: WireMessage,
     negotiated: NegotiatedProtocol,
+    connection_id: String,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -617,9 +660,10 @@ where
         _ => bail!("expected Request as first stream message"),
     };
     let request_id = request.request_id.clone();
+    let session_objects = negotiated.has(CAPABILITY_SESSION_OBJECTS, 1);
     match request.command {
         Some(request::Command::List(_)) => {
-            let terminals = manager.list();
+            let terminals = manager.list_legacy_terminals();
             send_response(
                 &mut send,
                 request_id,
@@ -627,7 +671,7 @@ where
             )
             .await?;
         }
-        Some(request::Command::Spawn(spawn)) => match manager.spawn(spawn) {
+        Some(request::Command::Spawn(spawn)) => match manager.spawn(spawn, session_objects) {
             Ok(terminal) => {
                 send_response(
                     &mut send,
@@ -640,65 +684,84 @@ where
             }
             Err(error) => send_error(&mut send, request_id, "spawn", error).await?,
         },
-        Some(request::Command::Close(close)) => match manager.get(&close.terminal_id) {
-            Some(terminal) => match terminal.kill() {
-                Ok(()) => {
+        Some(request::Command::Close(close)) => {
+            match manager.get_terminal(&close.workspace_id, &close.terminal_id, session_objects) {
+                Ok(Some(terminal)) => match terminal.kill() {
+                    Ok(()) => {
+                        send_response(
+                            &mut send,
+                            request_id,
+                            response::Result::Ack(AckResponse {
+                                message: "terminal process signalled".into(),
+                            }),
+                        )
+                        .await?;
+                    }
+                    Err(error) => send_error(&mut send, request_id, "terminal", error).await?,
+                },
+                Ok(None) => {
+                    send_error(
+                        &mut send,
+                        request_id,
+                        "not_found",
+                        anyhow!("terminal is not active"),
+                    )
+                    .await?
+                }
+                Err(error) => send_error(&mut send, request_id, "workspace", error).await?,
+            }
+        }
+        Some(request::Command::RenameTerminal(rename)) => {
+            match manager.get_terminal(&rename.workspace_id, &rename.terminal_id, session_objects) {
+                Ok(Some(terminal)) => {
+                    terminal.rename(rename.name);
                     send_response(
                         &mut send,
                         request_id,
                         response::Result::Ack(AckResponse {
-                            message: "terminal process signalled".into(),
+                            message: "terminal renamed".into(),
                         }),
                     )
                     .await?;
                 }
-                Err(error) => send_error(&mut send, request_id, "terminal", error).await?,
-            },
-            None => {
-                send_error(
-                    &mut send,
-                    request_id,
-                    "not_found",
-                    anyhow!("terminal is not active"),
-                )
-                .await?
+                Ok(None) => {
+                    send_error(
+                        &mut send,
+                        request_id,
+                        "not_found",
+                        anyhow!("terminal is not active"),
+                    )
+                    .await?
+                }
+                Err(error) => send_error(&mut send, request_id, "workspace", error).await?,
             }
-        },
-        Some(request::Command::RenameTerminal(rename)) => match manager.get(&rename.terminal_id) {
-            Some(terminal) => {
-                terminal.rename(rename.name);
-                send_response(
-                    &mut send,
-                    request_id,
-                    response::Result::Ack(AckResponse {
-                        message: "terminal renamed".into(),
-                    }),
-                )
-                .await?;
-            }
-            None => {
-                send_error(
-                    &mut send,
-                    request_id,
-                    "not_found",
-                    anyhow!("terminal is not active"),
-                )
-                .await?
-            }
-        },
+        }
         Some(request::Command::Attach(attach)) => {
-            let Some(terminal) = manager.get(&attach.terminal_id) else {
-                send_error(
-                    &mut send,
-                    request_id,
-                    "not_found",
-                    anyhow!("terminal is not active in this daemon"),
-                )
-                .await?;
-                send.shutdown().await?;
-                return Ok(());
+            let terminal = match manager.get_terminal(
+                &attach.workspace_id,
+                &attach.terminal_id,
+                session_objects,
+            ) {
+                Ok(Some(terminal)) => terminal,
+                Ok(None) => {
+                    send_error(
+                        &mut send,
+                        request_id,
+                        "not_found",
+                        anyhow!("terminal is not active in this daemon"),
+                    )
+                    .await?;
+                    send.shutdown().await?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    send_error(&mut send, request_id, "workspace", error).await?;
+                    send.shutdown().await?;
+                    return Ok(());
+                }
             };
             handle_attach(
+                manager,
                 terminal,
                 request_id,
                 attach.read_only,
@@ -707,6 +770,7 @@ where
                 send,
                 recv,
                 negotiated,
+                connection_id,
             )
             .await?;
             return Ok(());
@@ -860,6 +924,87 @@ where
             .await?;
             send_file_ack(&mut send, request_id, result, "file renamed").await?;
         }
+        Some(request::Command::ListWorkspaces(_)) if session_objects => {
+            send_response(
+                &mut send,
+                request_id,
+                response::Result::WorkspaceList(WorkspaceListResponse {
+                    workspaces: manager.list_workspaces(),
+                }),
+            )
+            .await?;
+        }
+        Some(request::Command::CreateWorkspace(create)) if session_objects => {
+            match manager.create_workspace(&create.name) {
+                Ok(workspace) => {
+                    send_response(
+                        &mut send,
+                        request_id,
+                        response::Result::Workspace(WorkspaceResponse {
+                            workspace: Some(workspace),
+                        }),
+                    )
+                    .await?;
+                }
+                Err(error) => send_error(&mut send, request_id, "workspace", error).await?,
+            }
+        }
+        Some(request::Command::RenameWorkspace(rename)) if session_objects => {
+            match manager.rename_workspace(&rename.workspace_id, &rename.name) {
+                Ok(workspace) => {
+                    send_response(
+                        &mut send,
+                        request_id,
+                        response::Result::Workspace(WorkspaceResponse {
+                            workspace: Some(workspace),
+                        }),
+                    )
+                    .await?;
+                }
+                Err(error) => send_error(&mut send, request_id, "workspace", error).await?,
+            }
+        }
+        Some(request::Command::DeleteWorkspace(delete)) if session_objects => {
+            match manager.delete_workspace(&delete.workspace_id) {
+                Ok(()) => {
+                    send_response(
+                        &mut send,
+                        request_id,
+                        response::Result::Ack(AckResponse {
+                            message: "workspace deleted".into(),
+                        }),
+                    )
+                    .await?;
+                }
+                Err(error) => send_error(&mut send, request_id, "conflict", error).await?,
+            }
+        }
+        Some(request::Command::ListTerminals(list)) if session_objects => {
+            match manager.list_terminals(&list.workspace_id, list.include_exited) {
+                Ok(terminals) => {
+                    send_response(
+                        &mut send,
+                        request_id,
+                        response::Result::TerminalList(TerminalListResponse { terminals }),
+                    )
+                    .await?;
+                }
+                Err(error) => send_error(&mut send, request_id, "workspace", error).await?,
+            }
+        }
+        Some(request::Command::ListAttachments(list)) if session_objects => {
+            match manager.list_attachments(&list.workspace_id, &list.terminal_id) {
+                Ok(attachments) => {
+                    send_response(
+                        &mut send,
+                        request_id,
+                        response::Result::AttachmentList(AttachmentListResponse { attachments }),
+                    )
+                    .await?;
+                }
+                Err(error) => send_error(&mut send, request_id, "workspace", error).await?,
+            }
+        }
         Some(
             request::Command::ListWorkspaces(_)
             | request::Command::CreateWorkspace(_)
@@ -872,7 +1017,7 @@ where
                 &mut send,
                 request_id,
                 "unsupported",
-                anyhow!("session.objects runtime is not enabled"),
+                anyhow!("session.objects capability was not negotiated"),
             )
             .await?;
         }
@@ -962,6 +1107,7 @@ where
 }
 
 async fn handle_attach<W, R>(
+    manager: SessionManager,
     terminal: Arc<Terminal>,
     request_id: String,
     read_only: bool,
@@ -970,6 +1116,7 @@ async fn handle_attach<W, R>(
     mut send: W,
     mut recv: R,
     negotiated: NegotiatedProtocol,
+    connection_id: String,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -984,7 +1131,20 @@ where
             return Ok(());
         }
     };
+    let info = terminal.info();
+    let mut attachment = match manager.register_attachment(&connection_id, &info, read_only) {
+        Ok(attachment) => attachment,
+        Err(error) => {
+            terminal.release_lease(&lease.lease_id);
+            send_error(&mut send, request_id, "attachment", error).await?;
+            send.shutdown().await?;
+            return Ok(());
+        }
+    };
+    attachment.set_state(crate::protocol::AttachmentState::Snapshotting)?;
+    let attachment_info = attachment.info();
     let semantic = negotiated.has(CAPABILITY_SEMANTIC_STATE, 2);
+    let session_objects = negotiated.has(CAPABILITY_SESSION_OBJECTS, 1);
     let history_paging = semantic && negotiated.has(CAPABILITY_HISTORY_PAGING, 1);
     let clipboard_write = semantic && negotiated.has(CAPABILITY_CLIPBOARD_WRITE, 1);
     let (snapshot, initial_state, mut events) = if semantic {
@@ -994,7 +1154,6 @@ where
         let (snapshot, events) = terminal.snapshot_and_subscribe()?;
         (Some(snapshot), None, events)
     };
-    let info = terminal.info();
     send_response(
         &mut send,
         request_id,
@@ -1005,18 +1164,20 @@ where
             history: Vec::new(),
             resume_token: lease.resume_token.clone(),
             snapshot,
-            attachment: None,
+            attachment: Some(attachment_info.clone()),
         }),
     )
     .await?;
     if let Some(state) = initial_state {
-        write_terminal_state(&mut send, &info.id, &state).await?;
+        write_terminal_state(&mut send, &info.id, &attachment_info.id, &state).await?;
     }
+    attachment.set_state(crate::protocol::AttachmentState::Live)?;
 
     if info.status != "running" {
         write_terminal_event(
             &mut send,
             &info.id,
+            &attachment_info.id,
             terminal_event::Event::Exited(info.exit_code.unwrap_or(1)),
         )
         .await?;
@@ -1031,9 +1192,12 @@ where
                 incoming = read_message(&mut recv) => {
                     match incoming? {
                         Some(WireMessage { body: Some(wire_message::Body::TerminalCommand(command)) }) => {
-                            if command.terminal_id != info.id {
-                                bail!("terminal command targets the wrong terminal")
-                            }
+                            validate_terminal_command_target(
+                                &command,
+                                &info.id,
+                                &attachment_info.id,
+                                session_objects,
+                            )?;
                             match command.command {
                                 Some(terminal_command::Command::Input(bytes)) => {
                                     if !terminal.owns_lease(&lease.lease_id) { continue; }
@@ -1055,7 +1219,12 @@ where
                                         bail!("history page requested without negotiated capability")
                                     }
                                     let page = terminal.history_page(command.sequence, &request)?;
-                                    write_history_page(&mut send, &info.id, &page).await?;
+                                    write_history_page(
+                                        &mut send,
+                                        &info.id,
+                                        &attachment_info.id,
+                                        &page,
+                                    ).await?;
                                 }
                                 Some(terminal_command::Command::Detach(_)) | None => break,
                             }
@@ -1070,6 +1239,7 @@ where
                             write_terminal_event(
                                 &mut send,
                                 &info.id,
+                                &attachment_info.id,
                                 terminal_event::Event::LeaseChanged(LeaseChanged {
                                     read_only: true,
                                     reason: "taken_over".into(),
@@ -1085,11 +1255,17 @@ where
                         Ok(PtyEvent::Output(bytes)) => {
                             if semantic {
                                 let state = terminal.semantic_state()?;
-                                write_terminal_state(&mut send, &info.id, &state).await?;
+                                write_terminal_state(
+                                    &mut send,
+                                    &info.id,
+                                    &attachment_info.id,
+                                    &state,
+                                ).await?;
                             } else {
                                 write_terminal_event(
                                     &mut send,
                                     &info.id,
+                                    &attachment_info.id,
                                     terminal_event::Event::Output(bytes),
                                 ).await?;
                             }
@@ -1098,6 +1274,7 @@ where
                             write_terminal_event(
                                 &mut send,
                                 &info.id,
+                                &attachment_info.id,
                                 terminal_event::Event::Exited(code),
                             ).await?;
                             break;
@@ -1106,6 +1283,7 @@ where
                             write_terminal_event(
                                 &mut send,
                                 &info.id,
+                                &attachment_info.id,
                                 terminal_event::Event::Error(message),
                             ).await?;
                         }
@@ -1113,6 +1291,7 @@ where
                             write_terminal_event(
                                 &mut send,
                                 &info.id,
+                                &attachment_info.id,
                                 terminal_event::Event::Interactive(interactive),
                             ).await?;
                         }
@@ -1127,6 +1306,7 @@ where
                                 write_terminal_event(
                                     &mut send,
                                     &info.id,
+                                    &attachment_info.id,
                                     terminal_event::Event::ClipboardWrite(ClipboardWrite {
                                         selection: selection as i32,
                                         clear: contents.is_none(),
@@ -1139,19 +1319,27 @@ where
                             // A tmux-style authoritative grid lets a slow client
                             // recover exactly instead of continuing after a gap
                             // in the byte stream.
+                            attachment.set_state(crate::protocol::AttachmentState::Snapshotting)?;
                             if semantic {
                                 let (state, replacement) = terminal.semantic_state_and_subscribe()?;
                                 events = replacement;
-                                write_terminal_state(&mut send, &info.id, &state).await?;
+                                write_terminal_state(
+                                    &mut send,
+                                    &info.id,
+                                    &attachment_info.id,
+                                    &state,
+                                ).await?;
                             } else {
                                 let (snapshot, replacement) = terminal.snapshot_and_subscribe()?;
                                 events = replacement;
                                 write_terminal_event(
                                     &mut send,
                                     &info.id,
+                                    &attachment_info.id,
                                     terminal_event::Event::Snapshot(snapshot),
                                 ).await?;
                             }
+                            attachment.set_state(crate::protocol::AttachmentState::Live)?;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
@@ -1165,6 +1353,7 @@ where
         let _ = write_terminal_event(
             &mut send,
             &info.id,
+            &attachment_info.id,
             terminal_event::Event::Error(error.to_string()),
         )
         .await;
@@ -1172,6 +1361,25 @@ where
     terminal.release_lease(&lease.lease_id);
     let _ = send.shutdown().await;
     result
+}
+
+fn validate_terminal_command_target(
+    command: &crate::protocol::TerminalCommand,
+    terminal_id: &str,
+    attachment_id: &str,
+    session_objects: bool,
+) -> Result<()> {
+    ensure!(
+        command.terminal_id == terminal_id,
+        "terminal command targets the wrong terminal"
+    );
+    if session_objects {
+        ensure!(
+            command.attachment_id == attachment_id,
+            "terminal command targets the wrong attachment"
+        );
+    }
+    Ok(())
 }
 
 async fn send_response<W>(send: &mut W, request_id: String, result: response::Result) -> Result<()>
@@ -1212,6 +1420,7 @@ where
 async fn write_terminal_event<W>(
     send: &mut W,
     terminal_id: &str,
+    attachment_id: &str,
     event: terminal_event::Event,
 ) -> Result<()>
 where
@@ -1221,7 +1430,7 @@ where
         send,
         &WireMessage::new(wire_message::Body::TerminalEvent(TerminalEvent {
             terminal_id: terminal_id.into(),
-            attachment_id: String::new(),
+            attachment_id: attachment_id.into(),
             event: Some(event),
         })),
     )
@@ -1280,7 +1489,12 @@ fn history_page_chunks(page: &HistoryPage) -> Result<Vec<HistoryPageChunk>> {
     Ok(chunks)
 }
 
-async fn write_terminal_state<W>(send: &mut W, terminal_id: &str, state: &State) -> Result<()>
+async fn write_terminal_state<W>(
+    send: &mut W,
+    terminal_id: &str,
+    attachment_id: &str,
+    state: &State,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -1288,6 +1502,7 @@ where
         write_terminal_event(
             send,
             terminal_id,
+            attachment_id,
             terminal_event::Event::SemanticStateChunk(chunk),
         )
         .await?;
@@ -1295,7 +1510,12 @@ where
     Ok(())
 }
 
-async fn write_history_page<W>(send: &mut W, terminal_id: &str, page: &HistoryPage) -> Result<()>
+async fn write_history_page<W>(
+    send: &mut W,
+    terminal_id: &str,
+    attachment_id: &str,
+    page: &HistoryPage,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -1303,6 +1523,7 @@ where
         write_terminal_event(
             send,
             terminal_id,
+            attachment_id,
             terminal_event::Event::HistoryPageChunk(chunk),
         )
         .await?;
@@ -1316,6 +1537,27 @@ mod tests {
 
     use super::*;
     use crate::terminal_engine::TerminalEngine;
+
+    #[test]
+    fn formal_terminal_commands_are_fenced_by_attachment_identity() {
+        let mut command = crate::protocol::TerminalCommand {
+            terminal_id: "terminal".into(),
+            attachment_id: "attachment".into(),
+            ..Default::default()
+        };
+        assert!(validate_terminal_command_target(&command, "terminal", "attachment", true).is_ok());
+        command.attachment_id = "stale".into();
+        assert!(
+            validate_terminal_command_target(&command, "terminal", "attachment", true).is_err()
+        );
+        assert!(
+            validate_terminal_command_target(&command, "terminal", "attachment", false).is_ok()
+        );
+        command.terminal_id = "wrong".into();
+        assert!(
+            validate_terminal_command_target(&command, "terminal", "attachment", false).is_err()
+        );
+    }
 
     #[test]
     fn initialization_creates_private_state_without_overwriting_partial_identity() {

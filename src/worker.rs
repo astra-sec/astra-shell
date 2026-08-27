@@ -25,7 +25,6 @@ use crate::{
     process_lock::ProcessLock,
     protocol::{WireMessage, WorkerStreamHello, wire_message, write_message},
     server::handle_worker_request,
-    terminal::TerminalManager,
 };
 
 #[derive(Debug)]
@@ -64,6 +63,7 @@ impl WorkerRouter {
         mut quic_recv: quinn::RecvStream,
         first_message: WireMessage,
         negotiated: NegotiatedProtocol,
+        connection_id: String,
     ) -> Result<()> {
         let worker = self.connect(account).await?;
         let (mut worker_recv, mut worker_send) = worker.into_split();
@@ -72,7 +72,7 @@ impl WorkerRouter {
             &WireMessage::new(wire_message::Body::WorkerStreamHello(WorkerStreamHello {
                 protocol_version: negotiated.version,
                 capabilities: selections(&negotiated),
-                connection_id: String::new(),
+                connection_id,
             })),
         )
         .await?;
@@ -298,7 +298,8 @@ pub async fn serve_worker(
     let pid_file = state_dir.join("worker.pid");
     fs::write(&pid_file, format!("{}\n", std::process::id()))?;
     fs::set_permissions(&pid_file, fs::Permissions::from_mode(0o600))?;
-    let manager = TerminalManager::new(session_root)?;
+    let manager =
+        crate::session::SessionManager::new(session_root, state_dir.join("session-catalog.pb"))?;
     let files = FileService::new(manager.session_root().to_path_buf())?;
     match fs::remove_file(&socket) {
         Ok(()) => {}

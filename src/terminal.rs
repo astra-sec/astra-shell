@@ -351,6 +351,22 @@ impl TerminalManager {
         terminals
     }
 
+    pub fn list_in_workspace(&self, workspace_id: &str, include_exited: bool) -> Vec<TerminalInfo> {
+        let mut terminals: Vec<_> = self
+            .terminals
+            .read()
+            .expect("terminal registry poisoned")
+            .values()
+            .map(|terminal| terminal.info())
+            .filter(|terminal| {
+                terminal.workspace_id == workspace_id
+                    && (include_exited || terminal.lifecycle == TerminalLifecycle::Running as i32)
+            })
+            .collect();
+        terminals.sort_by_key(|terminal| terminal.display_id);
+        terminals
+    }
+
     pub fn session_root(&self) -> &Path {
         &self.session_root
     }
@@ -896,17 +912,17 @@ fn start_child_monitor(
                         let mut info = terminal.info.write().expect("terminal info poisoned");
                         info.status = "exited".into();
                         info.exit_code = Some(code);
+                        info.lifecycle = TerminalLifecycle::Exited as i32;
                     }
                     let _ = terminal.events.send(PtyEvent::Exited(code));
                     break;
                 }
                 Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
                 Err(error) => {
-                    terminal
-                        .info
-                        .write()
-                        .expect("terminal info poisoned")
-                        .status = "lost".into();
+                    let mut info = terminal.info.write().expect("terminal info poisoned");
+                    info.status = "lost".into();
+                    info.lifecycle = TerminalLifecycle::Exited as i32;
+                    drop(info);
                     let message = format!("failed to wait for terminal: {error}");
                     let _ = terminal.events.send(PtyEvent::Error(message));
                     break;
