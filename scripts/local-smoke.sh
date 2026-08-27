@@ -7,6 +7,29 @@ run_dir="$(mktemp -d "$repo_dir/.local-test/smoke.XXXXXX")"
 mkdir -p "$run_dir/home/.ssh" "$run_dir/tmp"
 chmod 700 "$run_dir/home/.ssh"
 
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  local marker="$run_dir/timeout.$BASHPID.$RANDOM"
+  "$@" &
+  local command_pid=$!
+  (
+    sleep "$seconds"
+    : >"$marker"
+    kill -TERM "$command_pid" 2>/dev/null || true
+  ) &
+  local timer_pid=$!
+  local status=0
+  wait "$command_pid" || status=$?
+  kill "$timer_pid" 2>/dev/null || true
+  wait "$timer_pid" 2>/dev/null || true
+  if [[ -e "$marker" ]]; then
+    rm -f "$marker"
+    return 124
+  fi
+  return "$status"
+}
+
 export TMPDIR="$run_dir/tmp"
 export CARGO_HOME="$repo_dir/.cargo-home"
 export CARGO_TARGET_DIR="$repo_dir/target"
@@ -48,7 +71,7 @@ if [[ -z "$listen" ]]; then
 fi
 
 duplicate_status=0
-HOME="$run_dir/home" timeout 2s target/debug/astrad serve \
+HOME="$run_dir/home" run_with_timeout 2 target/debug/astrad serve \
   --listen 127.0.0.1:0 \
   --state-dir "$run_dir/server" \
   --session-root "$repo_dir" >"$run_dir/duplicate-server.log" 2>&1 || duplicate_status=$?
@@ -197,14 +220,14 @@ if ! [[ "$terminal_uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
   exit 1
 fi
 
-before="$(timeout 1s "${client[@]}" attach "$terminal_id" --read-only || true)"
+before="$(run_with_timeout 1 "${client[@]}" attach "$terminal_id" --read-only || true)"
 if ! printf '%s' "$before" | rg -q 'BEFORE_DETACH'; then
   echo "initial terminal output was not received" >&2
   exit 1
 fi
 
 sleep 3
-after="$(timeout 1s "${client[@]}" attach "$terminal_uuid" --read-only || true)"
+after="$(run_with_timeout 1 "${client[@]}" attach "$terminal_uuid" --read-only || true)"
 if ! printf '%s' "$after" | rg -q 'WHILE_DETACHED'; then
   echo "detached terminal output was not recovered" >&2
   exit 1
