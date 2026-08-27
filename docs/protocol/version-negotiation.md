@@ -24,15 +24,18 @@
 | `terminal.semantic_state` | 可靠分片传输的 `astra.terminal.v2.State`；禁止混发 raw PTY | 是（Apple client/server v2） | `TERM-03`、`TERM-04` 已完成；CLI 未实现 replica，因此只 offer legacy capability |
 | `terminal.clipboard_write` | semantic attachment 上的 OSC 52 单向、受限剪贴板写事件；不包含读取 | 是（Apple client/server v1） | 必须同时选择 `terminal.semantic_state` v2；CLI 不 offer |
 | `terminal.history_paging` | 使用 v2 `Anchor` 的可靠历史分页、trim 边界和客户端远端 viewport | 是（Apple client/server v1） | 必须同时选择 `terminal.semantic_state` v2；CLI 不 offer |
+| `session.objects` | Workspace CRUD、Terminal 归属和 Attachment 身份 | 是（Apple client/server v1） | 与 renderer capability 独立；CLI 保留 N-1 默认 Workspace 适配 |
 | `terminal.datagram_state` | generation 累计 patch 可走 QUIC DATAGRAM | 否 | `SYNC-01` 至 `SYNC-03` 完成 |
 
 Capability 名称存在不代表实现完成。runtime support list 只能加入已经通过对应架构任务验收的能力；禁止为了让 UI 走新分支而提前 offer。
 
-managed 模式下，gateway 在认证和协商完成后为每条 Unix worker stream 先发送内部 `WorkerStreamHello`。worker 必须按自己的 runtime support 重新验证 application version、capability 名称、版本、重复项和数量；网络 client 不能直接提供这份受信选择。这样 rootless 和 managed attachment 使用同一份已验证 `NegotiatedProtocol`，不会由 `AttachRequest` 回显能力。
+managed 模式下，gateway 在认证和协商完成后为每条 Unix worker stream 先发送内部 `WorkerStreamHello`。worker 必须按自己的 runtime support 重新验证 application version、capability 名称、版本、重复项和数量；gateway 同时加入认证连接 UUID，worker 校验其 canonical UUID 形式，网络 client 不能直接提供这份受信元数据。这样 rootless 和 managed attachment 使用同一份已验证 `NegotiatedProtocol` 和连接身份，不会由 `AttachRequest` 回显能力。
 
 semantic attachment 的 `AttachResponse` 不携带 legacy snapshot。服务端紧接着发送一个或多个有序 `TerminalStateChunk`：16-byte transfer ID、chunk index/count、总大小和整份 State 的 SHA-256。当前每片上限 512 KiB、整份 State 仍受 8 MiB schema 上限约束，因此最多 16 片。Apple client 只有在顺序、元数据、总大小、SHA-256、protobuf decode 和 State v2 validator 全部通过后才发布一次状态；任何失败都终止 attachment，不发布半份状态。
 
 history paging 只在 semantic v2 同时选择时生效。`HistoryPageRequest` 和 `HistoryPageChunk` 是 appended oneof；未选择能力的 N-1 decoder 会忽略它们。每页最多 512 rows/4 MiB，仍以可靠 512 KiB chunks 和整页 SHA-256 原子发布。
+
+session objects 的 Workspace RPC 也是 appended oneof，所有资源身份字段只追加 tag。N-1 客户端映射到同一 SessionManager 的默认 Workspace；新客户端只在 capability 被选择后发送正式 RPC。详细边界见 `session-objects-v1.md`。
 
 ## N/N-1 行为矩阵
 
