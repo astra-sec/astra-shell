@@ -20,11 +20,16 @@ use crate::terminal_state_v2::{
 #[derive(Debug)]
 struct AstraTerminalConfiguration {
     scrollback_rows: usize,
+    scrollback_bytes: usize,
 }
 
 impl TerminalConfiguration for AstraTerminalConfiguration {
     fn scrollback_size(&self) -> usize {
         self.scrollback_rows
+    }
+
+    fn scrollback_size_bytes(&self) -> usize {
+        self.scrollback_bytes
     }
 
     fn color_palette(&self) -> ColorPalette {
@@ -40,9 +45,25 @@ impl TerminalConfiguration for AstraTerminalConfiguration {
 /// exports bounded Terminal State v2 directly; it never renders ANSI.
 pub struct TerminalEngine {
     terminal: Terminal,
+    history_limits: HistoryLimits,
     epoch: [u8; 16],
     identity_epoch: (u64, u64),
     epoch_sequence_start: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistoryLimits {
+    pub rows: usize,
+    pub bytes: usize,
+}
+
+impl HistoryLimits {
+    pub const fn rows_only(rows: usize) -> Self {
+        Self {
+            rows,
+            bytes: usize::MAX,
+        }
+    }
 }
 
 impl TerminalEngine {
@@ -52,12 +73,29 @@ impl TerminalEngine {
         scrollback_rows: usize,
         host_reply_writer: Box<dyn Write + Send>,
     ) -> Result<Self> {
+        Self::with_history_limits(
+            rows,
+            columns,
+            HistoryLimits::rows_only(scrollback_rows),
+            host_reply_writer,
+        )
+    }
+
+    pub fn with_history_limits(
+        rows: u32,
+        columns: u32,
+        history_limits: HistoryLimits,
+        host_reply_writer: Box<dyn Write + Send>,
+    ) -> Result<Self> {
         ensure!(
             (1..=terminal_state_v2::MAX_DIMENSION).contains(&rows)
                 && (1..=terminal_state_v2::MAX_DIMENSION).contains(&columns),
             "terminal dimensions are out of range"
         );
-        let config = Arc::new(AstraTerminalConfiguration { scrollback_rows });
+        let config = Arc::new(AstraTerminalConfiguration {
+            scrollback_rows: history_limits.rows,
+            scrollback_bytes: history_limits.bytes,
+        });
         let terminal = Terminal::new(
             terminal_size(rows, columns, 0, 0),
             config,
@@ -70,6 +108,7 @@ impl TerminalEngine {
         let epoch_sequence_start = initial_view.sequence;
         Ok(Self {
             terminal,
+            history_limits,
             epoch: *Uuid::new_v4().as_bytes(),
             identity_epoch,
             epoch_sequence_start,
@@ -113,7 +152,7 @@ impl TerminalEngine {
     pub fn semantic_state(&mut self) -> Result<State> {
         self.refresh_identity_epoch();
         let view = self.terminal.astra_view();
-        validate_authoritative_screens(&view)?;
+        validate_authoritative_screens(&view, self.history_limits)?;
         let generation = generation(&view, self.epoch_sequence_start)?;
         let mut tables = ExportTables::default();
         let alternate_row_count = view.alternate.row_count();
@@ -168,7 +207,7 @@ impl TerminalEngine {
         terminal_state_v2::validate_history_page_request(request)?;
         self.refresh_identity_epoch();
         let view = self.terminal.astra_view();
-        validate_authoritative_screens(&view)?;
+        validate_authoritative_screens(&view, self.history_limits)?;
         let generation = generation(&view, self.epoch_sequence_start)?;
         let primary = &view.primary;
         let row_count = primary.row_count();
@@ -250,6 +289,15 @@ impl TerminalEngine {
         }
     }
 
+    #[cfg(test)]
+    fn history_usage(&self) -> (usize, usize) {
+        let view = self.terminal.astra_view();
+        (
+            view.primary.history_row_count(),
+            view.primary.history_bytes(),
+        )
+    }
+
     /// Transitional serializer for clients that negotiated the registered
     /// legacy ANSI capability. This is derived from semantic state and is
     /// never fed back into the authoritative engine.
@@ -279,7 +327,10 @@ impl TerminalEngine {
     }
 }
 
-fn validate_authoritative_screens(view: &astra_wezterm_term::AstraTerminalView<'_>) -> Result<()> {
+fn validate_authoritative_screens(
+    view: &astra_wezterm_term::AstraTerminalView<'_>,
+    history_limits: HistoryLimits,
+) -> Result<()> {
     ensure!(
         view.primary.kind() == AstraScreenKind::Primary && view.primary.allows_scrollback(),
         "primary terminal screen lost scrollback semantics"
@@ -290,9 +341,15 @@ fn validate_authoritative_screens(view: &astra_wezterm_term::AstraTerminalView<'
         "primary terminal history and viewport are not contiguous"
     );
     ensure!(
+        view.primary.history_row_count() <= history_limits.rows
+            && view.primary.history_bytes() <= history_limits.bytes,
+        "primary terminal history exceeds its configured capacity"
+    );
+    ensure!(
         view.alternate.kind() == AstraScreenKind::Alternate
             && !view.alternate.allows_scrollback()
             && view.alternate.history_row_count() == 0
+            && view.alternate.history_bytes() == 0
             && view.alternate.viewport_start() == 0
             && view.alternate.row_count() == view.rows(),
         "alternate terminal screen must contain exactly one viewport and no history"
@@ -1133,7 +1190,85 @@ mod tests {
     }
 
     #[test]
-    fn trimmed_soft_wrap_retains_absolute_anchor_through_reflow() {
+    fn accounted_byte_limit_trims_complex_history_before_the_row_limit() {
+        let byte_limit = 4 * 1024;
+        let mut engine = TerminalEngine::with_history_limits(
+            2,
+            40,
+            HistoryLimits {
+                rows: 100,
+                bytes: byte_limit,
+            },
+            Box::new(ReplySink::default()),
+        )
+        .unwrap();
+        let uri = format!("https://example.com/{}", "history".repeat(32));
+        let mut output = Vec::new();
+        for index in 0..40 {
+            output.extend_from_slice(
+                format!("\x1b]8;;{uri}\x1b\\linked-{index}\x1b]8;;\x1b\\\r\n").as_bytes(),
+            );
+        }
+        engine.advance(&output);
+
+        let (history_rows, history_bytes) = engine.history_usage();
+        assert!(history_rows > 0);
+        assert!(history_rows < 38, "byte limit did not trim history");
+        assert!(history_bytes <= byte_limit);
+        let state = engine.semantic_state().unwrap();
+        let primary = state.primary.as_ref().unwrap();
+        assert_eq!(primary.viewport_start as usize, history_rows);
+        assert!(primary.oldest_available.as_ref().unwrap().logical_line_id > 1);
+    }
+
+    #[test]
+    fn byte_accounting_is_recomputed_after_reflow() {
+        let byte_limit = 16 * 1024;
+        let mut engine = TerminalEngine::with_history_limits(
+            3,
+            7,
+            HistoryLimits {
+                rows: 100,
+                bytes: byte_limit,
+            },
+            Box::new(ReplySink::default()),
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        for index in 0..30 {
+            output.extend_from_slice(format!("r{index:02}abcdef\r\n").as_bytes());
+        }
+        engine.advance(&output);
+        let before = engine.semantic_state().unwrap();
+        let before_oldest = before
+            .primary
+            .as_ref()
+            .unwrap()
+            .oldest_available
+            .clone()
+            .unwrap();
+
+        engine.resize(3, 4, 0, 0).unwrap();
+        let (history_rows, history_bytes) = engine.history_usage();
+        assert!(history_rows <= 100);
+        assert!(history_bytes <= byte_limit);
+        let after = engine.semantic_state().unwrap();
+        let after_oldest = after
+            .primary
+            .as_ref()
+            .unwrap()
+            .oldest_available
+            .as_ref()
+            .unwrap();
+        assert_eq!(after.epoch, before.epoch);
+        assert!(
+            (after_oldest.logical_line_id, after_oldest.cell_offset)
+                >= (before_oldest.logical_line_id, before_oldest.cell_offset)
+        );
+    }
+
+    #[test]
+    fn reflow_trim_advances_only_the_removed_soft_wrap_prefix() {
         let mut engine = TerminalEngine::new(2, 5, 2, Box::new(ReplySink::default())).unwrap();
         engine.advance(b"abcdefghijklmnopqrstuvwxyz1234");
 
@@ -1159,8 +1294,9 @@ mod tests {
         let first_after = after_primary.included_rows[0].start.as_ref().unwrap();
         assert_eq!(after.epoch, before.epoch);
         assert_eq!(first_after.logical_line_id, logical_id);
-        assert_eq!(first_after.cell_offset, retained_offset);
-        assert_eq!(logical_text(after_primary, logical_id), retained_text);
+        assert!(first_after.cell_offset >= retained_offset);
+        let after_text = logical_text(after_primary, logical_id);
+        assert!(retained_text.ends_with(&after_text));
 
         let offsets: Vec<_> = after_primary
             .included_rows

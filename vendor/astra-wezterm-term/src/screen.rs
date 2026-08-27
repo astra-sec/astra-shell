@@ -40,6 +40,7 @@ pub struct Screen {
     line_identities: VecDeque<AstraLineIdentity>,
     next_logical_line_id: u64,
     astra_identity_epoch: u64,
+    astra_history_bytes: usize,
 
     /// Whenever we scroll a line off the top of the scrollback, we
     /// increment this.  We use this offset to translate between
@@ -112,6 +113,7 @@ impl Screen {
             line_identities,
             next_logical_line_id,
             astra_identity_epoch: 1,
+            astra_history_bytes: 0,
             config: Arc::clone(config),
             allow_scrollback,
             physical_rows,
@@ -173,6 +175,48 @@ impl Screen {
 
     fn scrollback_size(&self) -> usize {
         scrollback_size(&self.config, self.allow_scrollback)
+    }
+
+    fn scrollback_size_bytes(&self) -> usize {
+        if self.allow_scrollback {
+            self.config.scrollback_size_bytes()
+        } else {
+            0
+        }
+    }
+
+    fn astra_row_retained_bytes(&self, index: usize) -> usize {
+        core::mem::size_of::<AstraLineIdentity>()
+            .saturating_add(self.lines[index].astra_retained_bytes())
+    }
+
+    fn astra_recompute_history_bytes(&mut self) {
+        self.astra_history_bytes = self.astra_calculated_history_bytes();
+    }
+
+    fn astra_calculated_history_bytes(&self) -> usize {
+        (0..self.astra_history_row_count())
+            .map(|index| self.astra_row_retained_bytes(index))
+            .fold(0usize, usize::saturating_add)
+    }
+
+    fn astra_trim_history_to_limits(&mut self) {
+        while self.astra_history_row_count() > self.scrollback_size()
+            || self.astra_history_bytes > self.scrollback_size_bytes()
+        {
+            debug_assert!(self.astra_history_row_count() > 0);
+            let removed_bytes = self.astra_row_retained_bytes(0);
+            self.lines.pop_front();
+            self.line_identities.pop_front();
+            self.stable_row_index_offset += 1;
+            self.astra_history_bytes = self.astra_history_bytes.saturating_sub(removed_bytes);
+        }
+        self.assert_astra_identity_invariant();
+    }
+
+    fn astra_recompute_and_trim_history(&mut self) {
+        self.astra_recompute_history_bytes();
+        self.astra_trim_history_to_limits();
     }
 
     fn rewrap_lines(
@@ -413,6 +457,7 @@ impl Screen {
 
         self.physical_rows = physical_rows;
         self.physical_cols = physical_cols;
+        self.astra_recompute_and_trim_history();
         self.assert_astra_identity_invariant();
         CursorPosition {
             x: cursor_x,
@@ -453,6 +498,10 @@ impl Screen {
         history_rows
     }
 
+    pub fn astra_history_bytes(&self) -> usize {
+        self.astra_history_bytes
+    }
+
     pub fn astra_allows_scrollback(&self) -> bool {
         self.allow_scrollback
     }
@@ -463,6 +512,11 @@ impl Screen {
 
     pub(crate) fn astra_finish_update(&mut self) {
         self.assert_astra_identity_invariant();
+        #[cfg(test)]
+        debug_assert_eq!(
+            self.astra_history_bytes,
+            self.astra_calculated_history_bytes()
+        );
         let mut requires_rebase = false;
         for index in 1..self.lines.len() {
             if !self.lines[index - 1].last_cell_was_wrapped()
@@ -814,6 +868,7 @@ impl Screen {
         let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
         let scrollback_ok = scroll_region.start == 0 && self.allow_scrollback;
         let insert_at_end = scroll_region.end as usize == self.physical_rows;
+        let previous_history_rows = self.astra_history_row_count();
 
         // A single parser update can soft-wrap and scroll several times before
         // `astra_finish_update` runs. Carry the logical identity forward before
@@ -857,6 +912,22 @@ impl Screen {
                 self.line_mut(y).compress_for_scrollback();
             }
         }
+
+        let (removed_history_bytes, added_history_bytes) = if scrollback_ok {
+            let removed_old_rows = lines_removed.min(previous_history_rows);
+            let removed_old_bytes = (0..removed_old_rows)
+                .map(|index| self.astra_row_retained_bytes(index))
+                .fold(0usize, usize::saturating_add);
+            let removed_new_rows = lines_removed.saturating_sub(removed_old_rows);
+            let retained_new_start = previous_history_rows.saturating_add(removed_new_rows);
+            let retained_new_end = previous_history_rows.saturating_add(num_rows);
+            let added_bytes = (retained_new_start..retained_new_end)
+                .map(|index| self.astra_row_retained_bytes(index))
+                .fold(0usize, usize::saturating_add);
+            (removed_old_bytes, added_bytes)
+        } else {
+            (0, 0)
+        };
 
         let remove_idx = if scroll_region.start == 0 {
             0
@@ -935,6 +1006,13 @@ impl Screen {
         if num_rows > 0 && !insert_at_end {
             self.rebase_line_identities();
         }
+        if scrollback_ok {
+            self.astra_history_bytes = self
+                .astra_history_bytes
+                .saturating_sub(removed_history_bytes)
+                .saturating_add(added_history_bytes);
+            self.astra_trim_history_to_limits();
+        }
         self.assert_astra_identity_invariant();
     }
 
@@ -948,6 +1026,7 @@ impl Screen {
                 self.stable_row_index_offset += 1;
             }
         }
+        self.astra_history_bytes = 0;
     }
 
     /// ```text

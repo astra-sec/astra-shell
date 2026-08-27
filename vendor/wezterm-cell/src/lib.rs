@@ -200,6 +200,28 @@ impl Default for CellAttributes {
 }
 
 impl CellAttributes {
+    /// Conservative heap charge used by Astra's retained-history budget.
+    /// Shared hyperlinks are intentionally charged at every reference so
+    /// sharing cannot be used to bypass the per-terminal limit.
+    pub fn astra_heap_bytes(&self) -> usize {
+        let Some(fat) = &self.fat else {
+            return 0;
+        };
+        let mut bytes = core::mem::size_of::<FatAttributes>();
+        if let Some(link) = &fat.hyperlink {
+            bytes = bytes
+                .saturating_add(core::mem::size_of::<Hyperlink>())
+                .saturating_add(link.uri().len());
+            for (key, value) in link.params() {
+                bytes = bytes
+                    .saturating_add(core::mem::size_of::<(String, String)>())
+                    .saturating_add(key.len())
+                    .saturating_add(value.len());
+            }
+        }
+        bytes
+    }
+
     bitfield!(intensity, set_intensity, Intensity, 0b11, 0);
     bitfield!(underline, set_underline, Underline, 0b111, 2);
     bitfield!(blink, set_blink, Blink, 0b11, 5);
@@ -683,6 +705,17 @@ impl TeenyString {
             unsafe { (*heap).bytes.as_slice() }
         }
     }
+
+    fn astra_heap_bytes(&self) -> usize {
+        if Self::is_marker_bit_set(self.0) {
+            0
+        } else {
+            let heap = self.0 as *const u64 as *const TeenyStringHeap;
+            unsafe {
+                core::mem::size_of::<TeenyStringHeap>().saturating_add((*heap).bytes.capacity())
+            }
+        }
+    }
 }
 
 impl Drop for TeenyString {
@@ -743,6 +776,14 @@ impl Default for Cell {
 }
 
 impl Cell {
+    /// Heap storage owned or referenced by this cell, excluding the inline
+    /// `Cell` value itself. Used only for Astra history accounting.
+    pub fn astra_heap_bytes(&self) -> usize {
+        self.text
+            .astra_heap_bytes()
+            .saturating_add(self.attrs.astra_heap_bytes())
+    }
+
     /// Create a new cell holding the specified character and with the
     /// specified cell attributes.
     /// All control and movement characters are rewritten as a space.

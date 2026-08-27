@@ -132,6 +132,10 @@ impl<'a> AstraScreenView<'a> {
         self.screen.astra_history_row_count()
     }
 
+    pub fn history_bytes(&self) -> usize {
+        self.screen.astra_history_bytes()
+    }
+
     pub fn allows_scrollback(&self) -> bool {
         self.screen.astra_allows_scrollback()
     }

@@ -88,6 +88,34 @@ impl ClusteredLine {
         }
     }
 
+    pub(crate) fn astra_heap_bytes(&self) -> usize {
+        let cluster_bytes = self
+            .clusters
+            .capacity()
+            .saturating_mul(core::mem::size_of::<Cluster>());
+        let attribute_bytes = self
+            .clusters
+            .iter()
+            .map(|cluster| cluster.attrs.astra_heap_bytes())
+            .fold(0usize, usize::saturating_add);
+        let wide_cell_bytes = self
+            .is_double_wide
+            .as_ref()
+            .map(|bits| {
+                core::mem::size_of::<FixedBitSet>().saturating_add(
+                    bits.as_slice()
+                        .len()
+                        .saturating_mul(core::mem::size_of::<u32>()),
+                )
+            })
+            .unwrap_or(0);
+        self.text
+            .capacity()
+            .saturating_add(cluster_bytes)
+            .saturating_add(attribute_bytes)
+            .saturating_add(wide_cell_bytes)
+    }
+
     pub fn to_cell_vec(&self) -> Vec<Cell> {
         let mut cells = vec![];
 

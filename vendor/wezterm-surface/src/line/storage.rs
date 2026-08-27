@@ -11,6 +11,15 @@ pub(crate) enum CellStorage {
     C(ClusteredLine),
 }
 
+impl CellStorage {
+    pub(crate) fn astra_heap_bytes(&self) -> usize {
+        match self {
+            Self::V(storage) => storage.astra_heap_bytes(),
+            Self::C(storage) => storage.astra_heap_bytes(),
+        }
+    }
+}
+
 pub(crate) enum VisibleCellIter<'a> {
     V(VecStorageIter<'a>),
     C(ClusterLineCellIter<'a>),

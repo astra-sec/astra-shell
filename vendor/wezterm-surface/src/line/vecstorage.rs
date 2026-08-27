@@ -19,6 +19,18 @@ impl VecStorage {
         Self { cells }
     }
 
+    pub(crate) fn astra_heap_bytes(&self) -> usize {
+        self.cells
+            .capacity()
+            .saturating_mul(core::mem::size_of::<Cell>())
+            .saturating_add(
+                self.cells
+                    .iter()
+                    .map(Cell::astra_heap_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+
     #[cfg_attr(not(feature = "use_image"), allow(unused_mut, unused_variables))]
     pub(crate) fn set_cell(&mut self, idx: usize, mut cell: Cell, clear_image_placement: bool) {
         #[cfg(feature = "use_image")]

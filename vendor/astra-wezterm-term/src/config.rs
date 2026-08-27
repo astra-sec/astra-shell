@@ -147,6 +147,12 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
         3500
     }
 
+    /// Returns the maximum accounted bytes retained by primary-screen
+    /// scrollback. The visible viewport is not included in this budget.
+    fn scrollback_size_bytes(&self) -> usize {
+        usize::MAX
+    }
+
     /// Return true if the embedding application wants to use CSI-u encoding
     /// for keys that would otherwise be ambiguous.
     /// <http://www.leonerd.org.uk/hacks/fixterms/>

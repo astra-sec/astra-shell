@@ -73,6 +73,19 @@ impl PartialEq for Line {
 }
 
 impl Line {
+    /// Conservative retained-memory charge for one line. This follows the
+    /// current compressed/vector storage representation rather than expanding
+    /// the line into protocol cells.
+    pub fn astra_retained_bytes(&self) -> usize {
+        core::mem::size_of::<Self>()
+            .saturating_add(
+                self.zones
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<ZoneRange>()),
+            )
+            .saturating_add(self.cells.astra_heap_bytes())
+    }
+
     pub fn with_width_and_cell(width: usize, cell: Cell, seqno: SequenceNo) -> Self {
         let mut cells = Vec::with_capacity(width);
         cells.resize(width, cell.clone());
