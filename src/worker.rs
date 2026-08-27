@@ -299,6 +299,8 @@ fn append_worker_resource_policy(command: &mut Command, policy: &ResourcePolicy)
         .arg((policy.terminal_base_memory_bytes / MIB).to_string())
         .arg("--terminal-cell-memory-bytes")
         .arg(policy.terminal_cell_memory_bytes.to_string())
+        .arg("--terminal-history-rows")
+        .arg(policy.terminal_history_rows.to_string())
         .arg("--terminal-history-mib")
         .arg((policy.terminal_history_bytes / MIB).to_string());
 }

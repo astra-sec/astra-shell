@@ -902,6 +902,8 @@ fn export_color(color: &WireColor) -> Color {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use crate::resources::ResourcePolicy;
+
     use super::*;
 
     #[derive(Clone, Default)]
@@ -1219,6 +1221,45 @@ mod tests {
         let primary = state.primary.as_ref().unwrap();
         assert_eq!(primary.viewport_start as usize, history_rows);
         assert!(primary.oldest_available.as_ref().unwrap().logical_line_id > 1);
+    }
+
+    #[test]
+    fn default_capacity_retains_ten_thousand_simple_rows() {
+        let policy = ResourcePolicy::default();
+        let limits = HistoryLimits {
+            rows: usize::try_from(policy.terminal_history_rows).unwrap(),
+            bytes: usize::try_from(policy.terminal_history_bytes).unwrap(),
+        };
+        let mut engine =
+            TerminalEngine::with_history_limits(2, 8, limits, Box::new(ReplySink::default()))
+                .unwrap();
+        engine.advance("x\r\n".repeat(10_005).as_bytes());
+
+        let (history_rows, history_bytes) = engine.history_usage();
+        assert_eq!(history_rows, 10_000);
+        assert!(history_bytes <= limits.bytes);
+        let before = engine.semantic_state().unwrap();
+        let before_oldest = before
+            .primary
+            .as_ref()
+            .unwrap()
+            .oldest_available
+            .as_ref()
+            .unwrap()
+            .logical_line_id;
+
+        engine.advance(b"y\r\n");
+        assert_eq!(engine.history_usage().0, 10_000);
+        let after = engine.semantic_state().unwrap();
+        let after_oldest = after
+            .primary
+            .as_ref()
+            .unwrap()
+            .oldest_available
+            .as_ref()
+            .unwrap()
+            .logical_line_id;
+        assert!(after_oldest > before_oldest);
     }
 
     #[test]

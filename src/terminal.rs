@@ -23,13 +23,10 @@ use crate::protocol::{
 };
 use crate::{
     resources::{ResourceAccount, ResourceClaim, ResourcePolicy, ResourceReservation},
-    terminal_engine::TerminalEngine,
+    terminal_engine::{HistoryLimits, TerminalEngine},
     terminal_state_v2::{HistoryPage, HistoryPageRequest, State},
 };
 
-// Match tmux's default history-limit: enough context for normal use without
-// letting many wide panes retain unbounded cell grids.
-const SCREEN_SCROLLBACK_ROWS: usize = 2_000;
 const EXITED_TERMINAL_RETENTION: Duration = Duration::from_secs(60);
 const MAX_TERM_LENGTH: usize = 64;
 const MAX_LOCALE_VALUE_LENGTH: usize = 256;
@@ -506,6 +503,10 @@ impl TerminalManager {
             engine: Mutex::new(initial_terminal_engine(
                 rows,
                 cols,
+                HistoryLimits {
+                    rows: usize::try_from(self.resource_policy.terminal_history_rows)?,
+                    bytes: usize::try_from(self.resource_policy.terminal_history_bytes)?,
+                },
                 default_shell,
                 writer,
                 events.clone(),
@@ -641,14 +642,15 @@ impl Clipboard for HostClipboard {
 fn initial_terminal_engine(
     rows: u32,
     cols: u32,
+    history_limits: HistoryLimits,
     include_welcome: bool,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     events: broadcast::Sender<PtyEvent>,
 ) -> Result<TerminalEngine> {
-    let mut engine = TerminalEngine::new(
+    let mut engine = TerminalEngine::with_history_limits(
         rows,
         cols,
-        SCREEN_SCROLLBACK_ROWS,
+        history_limits,
         Box::new(HostReplyWriter(writer)),
     )?;
     let clipboard: Arc<dyn Clipboard> = Arc::new(HostClipboard { events });
@@ -1000,8 +1002,7 @@ mod tests {
 
     #[test]
     fn authoritative_engine_exports_full_tui_state_and_legacy_compatibility_view() {
-        let mut engine =
-            TerminalEngine::new(8, 30, SCREEN_SCROLLBACK_ROWS, Box::new(std::io::sink())).unwrap();
+        let mut engine = TerminalEngine::new(8, 30, 2_000, Box::new(std::io::sink())).unwrap();
         engine.advance(b"\x1b[2J\x1b[Hshell history\r\n$ codex");
         engine.advance(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[1;36mCodex\x1b[0m");
         engine.resize(10, 36, 0, 0).unwrap();
@@ -1054,8 +1055,7 @@ mod tests {
 
     #[test]
     fn semantic_reset_discards_stale_contents_before_snapshot_serialization() {
-        let mut engine =
-            TerminalEngine::new(4, 16, SCREEN_SCROLLBACK_ROWS, Box::new(std::io::sink())).unwrap();
+        let mut engine = TerminalEngine::new(4, 16, 2_000, Box::new(std::io::sink())).unwrap();
         engine.advance(b"stale client data\r\nthat must vanish");
         engine.advance(b"\x1bc\x1b[2;3Hauthoritative");
 

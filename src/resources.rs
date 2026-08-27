@@ -8,6 +8,9 @@ use anyhow::{Result, ensure};
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
+pub const DEFAULT_TERMINAL_HISTORY_ROWS: u64 = 10_000;
+pub const MAX_TERMINAL_HISTORY_ROWS: u64 = 1_000_000;
+pub const MAX_TERMINAL_HISTORY_BYTES: u64 = GIB;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ResourceClaim {
@@ -206,6 +209,7 @@ pub struct ResourcePolicy {
     pub user: ResourceLimits,
     pub terminal_base_memory_bytes: u64,
     pub terminal_cell_memory_bytes: u64,
+    pub terminal_history_rows: u64,
     pub terminal_history_bytes: u64,
 }
 
@@ -216,6 +220,7 @@ impl Default for ResourcePolicy {
             user: ResourceLimits::user_defaults(),
             terminal_base_memory_bytes: 4 * MIB,
             terminal_cell_memory_bytes: 64,
+            terminal_history_rows: DEFAULT_TERMINAL_HISTORY_ROWS,
             terminal_history_bytes: 8 * MIB,
         }
     }
@@ -232,8 +237,17 @@ impl ResourcePolicy {
         ensure!(
             self.terminal_base_memory_bytes > 0
                 && self.terminal_cell_memory_bytes > 0
+                && self.terminal_history_rows > 0
                 && self.terminal_history_bytes > 0,
             "per-terminal capacity values must be nonzero"
+        );
+        ensure!(
+            self.terminal_history_rows <= MAX_TERMINAL_HISTORY_ROWS,
+            "per-terminal history rows exceed the server hard limit"
+        );
+        ensure!(
+            self.terminal_history_bytes <= MAX_TERMINAL_HISTORY_BYTES,
+            "per-terminal history bytes exceed the server hard limit"
         );
         ensure!(
             self.user.terminal_memory_bytes >= self.terminal_base_memory_bytes,

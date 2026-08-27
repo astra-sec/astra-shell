@@ -2,7 +2,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use astra_shell::{
-    resources::{ResourceLimits, ResourcePolicy},
+    resources::{DEFAULT_TERMINAL_HISTORY_ROWS, ResourceLimits, ResourcePolicy},
     server::{ServerMode, ServerOptions, ServerPaths, initialize_state, serve},
     worker::{DEFAULT_WORKER_IDLE_TIMEOUT_SECONDS, serve_worker},
 };
@@ -85,6 +85,7 @@ impl ResourceArgs {
                 "terminal base memory",
             )?,
             terminal_cell_memory_bytes: self.terminal.terminal_cell_memory_bytes,
+            terminal_history_rows: self.terminal.terminal_history_rows,
             terminal_history_bytes: to_bytes(
                 self.terminal.terminal_history_mib,
                 "terminal history",
@@ -187,6 +188,8 @@ struct TerminalResourceArgs {
     terminal_base_memory_mib: u64,
     #[arg(long, default_value_t = 64)]
     terminal_cell_memory_bytes: u64,
+    #[arg(long, default_value_t = DEFAULT_TERMINAL_HISTORY_ROWS)]
+    terminal_history_rows: u64,
     #[arg(long, default_value_t = 8)]
     terminal_history_mib: u64,
 }
@@ -201,6 +204,7 @@ fn worker_policy(user: UserResourceArgs, terminal: TerminalResourceArgs) -> Resu
             "terminal base memory",
         )?,
         terminal_cell_memory_bytes: terminal.terminal_cell_memory_bytes,
+        terminal_history_rows: terminal.terminal_history_rows,
         terminal_history_bytes: to_bytes(terminal.terminal_history_mib, "terminal history")?,
     };
     policy.validate()?;
@@ -302,6 +306,19 @@ mod tests {
         };
         assert!(resources.policy().is_err());
 
+        for arguments in [
+            ["--terminal-history-rows", "0"],
+            ["--terminal-history-rows", "1000001"],
+            ["--terminal-history-mib", "1025"],
+        ] {
+            let parsed =
+                Cli::try_parse_from(["astrad", "serve", arguments[0], arguments[1]]).unwrap();
+            let Command::Serve { resources, .. } = parsed.command else {
+                panic!("expected serve command")
+            };
+            assert!(resources.policy().is_err());
+        }
+
         let parsed = Cli::try_parse_from([
             "astrad",
             "serve",
@@ -336,6 +353,8 @@ mod tests {
             "32",
             "--terminal-history-mib",
             "4",
+            "--terminal-history-rows",
+            "20000",
         ])
         .unwrap();
         let Command::Worker {
@@ -348,6 +367,7 @@ mod tests {
         };
         let policy = worker_policy(resources, terminal_resources).unwrap();
         assert_eq!(policy.user.terminals, 32);
+        assert_eq!(policy.terminal_history_rows, 20_000);
         assert_eq!(policy.terminal_history_bytes, 4 * MIB);
         assert_eq!(policy.global, policy.user);
     }
