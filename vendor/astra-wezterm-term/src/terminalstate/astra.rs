@@ -85,6 +85,7 @@ pub struct AstraTerminalView<'a> {
 
 pub struct AstraScreenView<'a> {
     screen: &'a Screen,
+    kind: AstraScreenKind,
     pub cursor: AstraCursorView,
     pub saved_cursor: Option<AstraCursorView>,
     pub scroll_margin_top: usize,
@@ -115,12 +116,24 @@ impl AstraTerminalView<'_> {
 }
 
 impl<'a> AstraScreenView<'a> {
+    pub fn kind(&self) -> AstraScreenKind {
+        self.kind
+    }
+
     pub fn row_count(&self) -> usize {
         self.screen.astra_row_count()
     }
 
     pub fn viewport_start(&self) -> usize {
         self.screen.astra_viewport_start()
+    }
+
+    pub fn history_row_count(&self) -> usize {
+        self.screen.astra_history_row_count()
+    }
+
+    pub fn allows_scrollback(&self) -> bool {
+        self.screen.astra_allows_scrollback()
     }
 
     pub fn rows(
@@ -222,8 +235,18 @@ impl TerminalState {
                 .unwrap_or_else(|| default_cursor(&self.screen.alt_screen))
         };
         AstraTerminalView {
-            primary: screen_view(self, &self.screen.screen, primary_cursor),
-            alternate: screen_view(self, &self.screen.alt_screen, alternate_cursor),
+            primary: screen_view(
+                self,
+                &self.screen.screen,
+                AstraScreenKind::Primary,
+                primary_cursor,
+            ),
+            alternate: screen_view(
+                self,
+                &self.screen.alt_screen,
+                AstraScreenKind::Alternate,
+                alternate_cursor,
+            ),
             active_screen,
             modes: AstraModesView {
                 application_cursor_keys: self.application_cursor_keys,
@@ -281,10 +304,12 @@ impl TerminalState {
 fn screen_view<'a>(
     state: &'a TerminalState,
     screen: &'a Screen,
+    kind: AstraScreenKind,
     cursor: AstraCursorView,
 ) -> AstraScreenView<'a> {
     AstraScreenView {
         screen,
+        kind,
         cursor,
         saved_cursor: screen
             .saved_cursor

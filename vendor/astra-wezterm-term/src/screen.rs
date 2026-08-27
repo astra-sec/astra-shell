@@ -143,6 +143,18 @@ impl Screen {
         debug_assert_eq!(self.lines.len(), self.line_identities.len());
     }
 
+    fn propagate_wrapped_line_identities(&mut self) {
+        for index in 1..self.lines.len() {
+            if self.lines[index - 1].last_cell_was_wrapped() {
+                let previous = self.line_identities[index - 1];
+                self.line_identities[index] = AstraLineIdentity {
+                    logical_line_id: previous.logical_line_id,
+                    cell_offset: previous.cell_offset + self.physical_cols,
+                };
+            }
+        }
+    }
+
     /// Structural edits such as inserting rows above retained rows cannot
     /// preserve a monotonically ordered logical ID space. Rebase all retained
     /// rows and advance the identity epoch so Astra invalidates old anchors.
@@ -433,6 +445,18 @@ impl Screen {
         self.lines.len().saturating_sub(self.physical_rows)
     }
 
+    /// Number of retained physical rows preceding the visible viewport.
+    /// This is always zero for the alternate screen.
+    pub fn astra_history_row_count(&self) -> usize {
+        let history_rows = self.astra_viewport_start();
+        debug_assert!(self.allow_scrollback || history_rows == 0);
+        history_rows
+    }
+
+    pub fn astra_allows_scrollback(&self) -> bool {
+        self.allow_scrollback
+    }
+
     pub fn astra_identity_epoch(&self) -> u64 {
         self.astra_identity_epoch
     }
@@ -452,15 +476,7 @@ impl Screen {
         if requires_rebase {
             self.rebase_line_identities();
         }
-        for index in 1..self.lines.len() {
-            if self.lines[index - 1].last_cell_was_wrapped() {
-                let previous = self.line_identities[index - 1];
-                self.line_identities[index] = AstraLineIdentity {
-                    logical_line_id: previous.logical_line_id,
-                    cell_offset: previous.cell_offset + self.physical_cols,
-                };
-            }
-        }
+        self.propagate_wrapped_line_identities();
         self.assert_astra_identity_invariant();
     }
 
@@ -798,6 +814,12 @@ impl Screen {
         let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
         let scrollback_ok = scroll_region.start == 0 && self.allow_scrollback;
         let insert_at_end = scroll_region.end as usize == self.physical_rows;
+
+        // A single parser update can soft-wrap and scroll several times before
+        // `astra_finish_update` runs. Carry the logical identity forward before
+        // an earlier fragment is evicted so a retained suffix keeps its
+        // absolute cell offset and logical line ID.
+        self.propagate_wrapped_line_identities();
 
         debug!(
             "scroll_up {:?} num_rows={} phys_scroll={:?}",

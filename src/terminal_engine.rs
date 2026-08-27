@@ -117,6 +117,23 @@ impl TerminalEngine {
             self.epoch_sequence_start = self.terminal.astra_view().sequence;
         }
         let view = self.terminal.astra_view();
+        ensure!(
+            view.primary.kind() == AstraScreenKind::Primary && view.primary.allows_scrollback(),
+            "primary terminal screen lost scrollback semantics"
+        );
+        ensure!(
+            view.primary.history_row_count() == view.primary.viewport_start()
+                && view.primary.viewport_start() + view.rows() == view.primary.row_count(),
+            "primary terminal history and viewport are not contiguous"
+        );
+        ensure!(
+            view.alternate.kind() == AstraScreenKind::Alternate
+                && !view.alternate.allows_scrollback()
+                && view.alternate.history_row_count() == 0
+                && view.alternate.viewport_start() == 0
+                && view.alternate.row_count() == view.rows(),
+            "alternate terminal screen must contain exactly one viewport and no history"
+        );
         let generation = view
             .sequence
             .checked_sub(self.epoch_sequence_start)
@@ -746,6 +763,35 @@ mod tests {
         }
     }
 
+    fn row_text(row: &Row) -> String {
+        row.cells
+            .iter()
+            .map(|cell| cell.grapheme.as_str())
+            .collect()
+    }
+
+    fn logical_text(screen: &Screen, logical_line_id: u64) -> String {
+        screen
+            .included_rows
+            .iter()
+            .filter(|row| {
+                row.start
+                    .as_ref()
+                    .is_some_and(|anchor| anchor.logical_line_id == logical_line_id)
+            })
+            .map(row_text)
+            .collect()
+    }
+
+    fn assert_same_row_content_and_identity(left: &[Row], right: &[Row]) {
+        assert_eq!(left.len(), right.len());
+        for (left, right) in left.iter().zip(right) {
+            assert_eq!(left.start, right.start);
+            assert_eq!(left.cells, right.cells);
+            assert_eq!(left.wrapped_to_next, right.wrapped_to_next);
+        }
+    }
+
     #[test]
     fn exports_both_screens_styles_modes_and_hyperlinks_without_ansi() {
         let sink = ReplySink::default();
@@ -827,6 +873,246 @@ mod tests {
                 >= 2
         );
         assert_eq!(before.epoch, after.epoch);
+    }
+
+    #[test]
+    fn primary_history_preserves_cells_styles_hyperlinks_and_soft_wrap_identity() {
+        let mut engine = TerminalEngine::new(3, 6, 32, Box::new(ReplySink::default())).unwrap();
+        engine.advance(b"\x1b[31m\x1b]8;;https://example.com/history\x1b\\abc");
+        engine.advance("界".as_bytes());
+        engine.advance(b"def\x1b]8;;\x1b\\\x1b[0m\r\nhard-1\r\nhard-2\r\ntail");
+
+        let state = engine.semantic_state().unwrap();
+        let primary = state.primary.as_ref().unwrap();
+        assert!(
+            primary.viewport_start > 0,
+            "test output did not enter history"
+        );
+        let history = &primary.included_rows[..primary.viewport_start as usize];
+        let wide = history
+            .iter()
+            .flat_map(|row| &row.cells)
+            .find(|cell| cell.grapheme == "界")
+            .expect("wide linked cell was lost from history");
+        assert_eq!(wide.width, 2);
+        assert_ne!(wide.style_id, 0);
+        assert_ne!(wide.hyperlink_id, 0);
+        assert!(state.styles.iter().any(|style| style.id == wide.style_id));
+        assert!(
+            state
+                .hyperlinks
+                .iter()
+                .any(|link| link.id == wide.hyperlink_id
+                    && link.uri == "https://example.com/history")
+        );
+
+        let linked_rows: Vec<_> = primary
+            .included_rows
+            .iter()
+            .filter(|row| row.cells.iter().any(|cell| cell.hyperlink_id != 0))
+            .collect();
+        assert!(
+            linked_rows.len() >= 2,
+            "linked logical line did not soft-wrap"
+        );
+        let first = linked_rows[0].start.as_ref().unwrap();
+        let second = linked_rows[1].start.as_ref().unwrap();
+        assert!(linked_rows[0].wrapped_to_next);
+        assert_eq!(first.logical_line_id, second.logical_line_id);
+        assert_eq!(second.cell_offset, first.cell_offset + state.cols);
+        let following_hard_line = primary
+            .included_rows
+            .iter()
+            .skip_while(|row| row.start.as_ref().unwrap().logical_line_id == first.logical_line_id)
+            .next()
+            .unwrap();
+        assert!(
+            following_hard_line.start.as_ref().unwrap().logical_line_id > first.logical_line_id
+        );
+    }
+
+    #[test]
+    fn repeated_reflow_preserves_logical_history_identity_and_content() {
+        let mut engine = TerminalEngine::new(4, 8, 64, Box::new(ReplySink::default())).unwrap();
+        engine.advance(b"abcdefghijklmno\r\nsecond\r\nthird\r\nfourth\r\ntail");
+        let initial = engine.semantic_state().unwrap();
+        let initial_primary = initial.primary.as_ref().unwrap();
+        let logical_id = initial_primary
+            .included_rows
+            .iter()
+            .find(|row| row.wrapped_to_next && row_text(row).starts_with("abcdefgh"))
+            .unwrap()
+            .start
+            .as_ref()
+            .unwrap()
+            .logical_line_id;
+        assert_eq!(logical_text(initial_primary, logical_id), "abcdefghijklmno");
+
+        engine.resize(4, 5, 0, 0).unwrap();
+        let narrow = engine.semantic_state().unwrap();
+        assert_eq!(narrow.epoch, initial.epoch);
+        assert_eq!(
+            logical_text(narrow.primary.as_ref().unwrap(), logical_id),
+            "abcdefghijklmno"
+        );
+        let narrow_offsets: Vec<_> = narrow
+            .primary
+            .as_ref()
+            .unwrap()
+            .included_rows
+            .iter()
+            .filter_map(|row| row.start.as_ref())
+            .filter(|anchor| anchor.logical_line_id == logical_id)
+            .map(|anchor| anchor.cell_offset)
+            .collect();
+        assert_eq!(narrow_offsets, vec![0, 5, 10]);
+
+        engine.resize(4, 12, 0, 0).unwrap();
+        let wide = engine.semantic_state().unwrap();
+        assert_eq!(wide.epoch, initial.epoch);
+        assert_eq!(
+            logical_text(wide.primary.as_ref().unwrap(), logical_id),
+            "abcdefghijklmno"
+        );
+        let wide_offsets: Vec<_> = wide
+            .primary
+            .as_ref()
+            .unwrap()
+            .included_rows
+            .iter()
+            .filter_map(|row| row.start.as_ref())
+            .filter(|anchor| anchor.logical_line_id == logical_id)
+            .map(|anchor| anchor.cell_offset)
+            .collect();
+        assert_eq!(wide_offsets, vec![0, 12]);
+    }
+
+    #[test]
+    fn normal_history_trim_advances_oldest_anchor_without_reusing_ids() {
+        let mut engine = TerminalEngine::new(2, 8, 2, Box::new(ReplySink::default())).unwrap();
+        engine.advance(b"line-0\r\nline-1\r\nline-2\r\nline-3\r\nline-4");
+        let before = engine.semantic_state().unwrap();
+        let before_primary = before.primary.as_ref().unwrap();
+        let before_oldest = before_primary
+            .oldest_available
+            .as_ref()
+            .unwrap()
+            .logical_line_id;
+        let before_newest = before_primary
+            .newest_available
+            .as_ref()
+            .unwrap()
+            .logical_line_id;
+
+        engine.advance(b"\r\nline-5\r\nline-6\r\nline-7");
+        let after = engine.semantic_state().unwrap();
+        let after_primary = after.primary.as_ref().unwrap();
+        let after_oldest = after_primary
+            .oldest_available
+            .as_ref()
+            .unwrap()
+            .logical_line_id;
+        let after_newest = after_primary
+            .newest_available
+            .as_ref()
+            .unwrap()
+            .logical_line_id;
+        assert_eq!(after.epoch, before.epoch);
+        assert!(after_oldest > before_oldest);
+        assert!(after_newest > before_newest);
+        assert!(
+            after_primary.included_rows.iter().all(|row| row
+                .start
+                .as_ref()
+                .unwrap()
+                .logical_line_id
+                >= after_oldest)
+        );
+        assert!(
+            after_oldest <= before_newest,
+            "retained rows should keep their IDs"
+        );
+    }
+
+    #[test]
+    fn trimmed_soft_wrap_retains_absolute_anchor_through_reflow() {
+        let mut engine = TerminalEngine::new(2, 5, 2, Box::new(ReplySink::default())).unwrap();
+        engine.advance(b"abcdefghijklmnopqrstuvwxyz1234");
+
+        let before = engine.semantic_state().unwrap();
+        let before_primary = before.primary.as_ref().unwrap();
+        let first_before = before_primary.included_rows[0].start.as_ref().unwrap();
+        let logical_id = first_before.logical_line_id;
+        let retained_offset = first_before.cell_offset;
+        let retained_text = logical_text(before_primary, logical_id);
+        assert!(retained_offset > 0, "test did not trim the logical prefix");
+        assert!(
+            before_primary.included_rows.iter().all(|row| row
+                .start
+                .as_ref()
+                .unwrap()
+                .logical_line_id
+                == logical_id)
+        );
+
+        engine.resize(2, 4, 0, 0).unwrap();
+        let after = engine.semantic_state().unwrap();
+        let after_primary = after.primary.as_ref().unwrap();
+        let first_after = after_primary.included_rows[0].start.as_ref().unwrap();
+        assert_eq!(after.epoch, before.epoch);
+        assert_eq!(first_after.logical_line_id, logical_id);
+        assert_eq!(first_after.cell_offset, retained_offset);
+        assert_eq!(logical_text(after_primary, logical_id), retained_text);
+
+        let offsets: Vec<_> = after_primary
+            .included_rows
+            .iter()
+            .map(|row| row.start.as_ref().unwrap().cell_offset)
+            .collect();
+        assert!(
+            offsets
+                .windows(2)
+                .all(|pair| pair[1] == pair[0] + after.cols)
+        );
+    }
+
+    #[test]
+    fn alternate_screen_never_creates_history_or_mutates_primary_history() {
+        let mut engine = TerminalEngine::new(3, 8, 16, Box::new(ReplySink::default())).unwrap();
+        engine.advance(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let before = engine.semantic_state().unwrap();
+        let primary_before = before.primary.as_ref().unwrap().included_rows.clone();
+        assert!(before.primary.as_ref().unwrap().viewport_start > 0);
+
+        engine.advance(b"\x1b[?1049hA\r\nB\r\nC\r\nD\r\nE\r\nF");
+        let alternate = engine.semantic_state().unwrap();
+        let alternate_screen = alternate.alternate.as_ref().unwrap();
+        assert_eq!(alternate.active_screen, ScreenKind::Alternate as i32);
+        assert_eq!(alternate_screen.viewport_start, 0);
+        assert_eq!(
+            alternate_screen.included_rows.len(),
+            alternate.rows as usize
+        );
+        assert_eq!(
+            alternate_screen.oldest_available,
+            alternate_screen.included_start
+        );
+        assert_eq!(
+            alternate_screen.newest_available,
+            alternate_screen.included_end
+        );
+        assert_same_row_content_and_identity(
+            &alternate.primary.as_ref().unwrap().included_rows,
+            &primary_before,
+        );
+
+        engine.advance(b"\x1b[?1049l");
+        let restored = engine.semantic_state().unwrap();
+        assert_eq!(restored.active_screen, ScreenKind::Primary as i32);
+        assert_same_row_content_and_identity(
+            &restored.primary.as_ref().unwrap().included_rows,
+            &primary_before,
+        );
     }
 
     #[test]

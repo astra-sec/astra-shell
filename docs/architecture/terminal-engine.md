@@ -1,6 +1,6 @@
 # Astra server TerminalEngine
 
-状态：`TERM-03` 至 `TERM-06` 服务端实现说明。服务端权威终端模型、可靠 semantic attach、输入模式与宿主能力边界已经实现；增量同步和历史分页仍属于后续任务。
+状态：`TERM-03` 至 `TERM-06`、`HIST-01` 服务端实现说明。服务端权威终端模型、可靠 semantic attach、输入模式、宿主能力边界和主屏历史 cell model 已经实现；增量同步和历史分页仍属于后续任务。
 
 ## 权威数据路径
 
@@ -26,6 +26,16 @@ PTY reader
 - fork 不包含 protobuf、网络 generation 或客户端特判；升级必须固定新 commit、审计 upstream diff、同步替换四个 core mirror 并重跑 conformance suite。
 
 `AstraTerminalView` 同时暴露 primary/alternate 和必要运行态，只提供 caller-bounded row iterator，不提供无界 clone-all API。网络层将该 view 转换为 Astra 自有、带资源上限的 Terminal State v2，不序列化上游私有结构。
+
+## 主屏历史模型
+
+历史不是另一份字符串缓存。主屏 viewport 上滚时，原 `Line` 连同 grapheme、cell width、完整 attributes、hyperlink、soft-wrap marker 和 `AstraLineIdentity` 一起进入同一个 `VecDeque`；压缩 scrollback 只改变内部存储，不降低导出语义。`AstraScreenView` 明确暴露 screen kind、是否允许 scrollback 和 history row count，`TerminalEngine` 每次导出都验证：
+
+- primary 的 retained history 与 viewport 连续，`viewport_start + rows == row_count`；
+- alternate 不允许 scrollback，history row count 和 viewport start 必须为 0，row count 必须正好等于 viewport 高度；
+- primary/alternate 仍共享 Terminal State v2 的有界消息预算，但只有 primary 能产生历史。
+
+`HIST-01` 只定义权威 cell model 和稳定 identity。它不提高 2,000 行临时容量基线，也不让客户端自行拼接页面；可靠分页、真实远端 viewport、容量/字节配额与滚动条分别属于 `HIST-02/03/04`。
 
 ## 逻辑行身份
 
@@ -72,6 +82,9 @@ OSC 52 是单向、显式协商的 host effect：服务端最多接受 256 KiB U
 - resize/reflow 后 logical line ID 与 wire epoch 保持。
 - retained rows 上方结构插入会轮换 epoch，并从 generation 1 重新开始。
 - primary history 与 alternate viewport 共享 schema 的 4096-row 总预算；截取后仍完整包含当前 primary viewport。
+- 带 style、hyperlink 和 wide grapheme 的 soft-wrapped logical line 滚入历史后保持完整 cell 语义。
+- normal scroll/trim 不轮换 epoch、不复用 logical ID；反复 narrow/wide reflow 保持 logical ID 和 retained content。
+- alternate 大量滚动仍只导出一个 viewport，且不改变 primary 历史的 cell 和 identity。
 - DA/DSR、字符/像素尺寸查询写入宿主 sink；未知像素、title 和 OSC 52 read 安全降级。
 - OSC 52 write 形成有大小上限的结构化 host effect，超限写入被拒绝。
 - RIS 后旧内容不再进入后续语义 State；ANSI 兼容视图从语义 State 生成。
