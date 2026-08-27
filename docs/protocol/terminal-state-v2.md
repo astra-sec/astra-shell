@@ -1,6 +1,6 @@
 # Astra Terminal State v2
 
-状态：`TERM-02` 领域模型；`TERM-03` 从服务端权威引擎直接导出；`TERM-04` 已接入可靠 wire 分片、Apple replica 和 SwiftTerm 受控 fork 的原子 cell 导入。
+状态：`TERM-02` 领域模型；`TERM-03` 从服务端权威引擎直接导出；`TERM-04` 已接入可靠 wire 分片和原子 cell 导入；`HIST-02` 已接入 Anchor 历史分页与客户端 viewport。
 
 权威 schema 是 [`proto/terminal_state_v2.proto`](../../proto/terminal_state_v2.proto)。旧 `TerminalSnapshot` 的 ANSI 字段不是 v2 的组成部分。
 
@@ -41,8 +41,10 @@
 | 项目 | 上限 |
 |---|---:|
 | protobuf encoded State | 8 MiB |
+| protobuf encoded HistoryPage | 4 MiB |
 | rows / cols | 各 1...1,000 |
 | 两屏 `included_rows` 总数 | 4,096 |
+| 单个 HistoryPage rows | 512 |
 | 所有 row 的 cell 总数 | 1,000,000 |
 | 单 grapheme UTF-8 | 256 bytes |
 | styles | 4,096 |
@@ -52,7 +54,15 @@
 | working directory | 16 KiB |
 | tab stops / screen | 1,000 |
 
-8 MiB 是单个语义状态对象的领域上限，不表示它必须塞入一个现有 `astra/1` 4 MiB frame。`PROTO-01`/`HIST-02` 必须定义可靠分帧和历史分页；禁止为了通过 frame 限制而截断 cell、style 或另一屏。
+8 MiB 是单个语义状态对象的领域上限，不表示它必须塞入一个现有 `astra/1` 4 MiB frame。State 与 HistoryPage 均使用 512 KiB reliable chunks、整体 SHA-256 和独立 transfer ID；禁止为了通过 frame 限制而截断 cell、style 或另一屏。
+
+## 历史分页
+
+- `HistoryPageRequest` 必须使用当前 epoch 和完整 `before: Anchor`，请求 `1...512` 行；transport 以 `TerminalCommand.sequence` 作为响应 `request_id`。
+- 正常页面只含严格早于 `before` 的 primary rows，并携带服务端真实 oldest/newest、实际 included 首尾、页面需要的 style/hyperlink 表和 `more_before`。
+- 空页面不得伪造 included 首尾或表。epoch 不匹配使用 `reset_required` 空页面通知客户端原子清除缓存。
+- Apple Replica 只合并同 epoch、同 cols、严格位于当前 loaded range 之前的页面；最新 State 的 oldest/newest 是 trim 权威边界。
+- PTY 当前 viewport 与用户显示 viewport 是两个位置：前者继续由 State cursor/`viewport_start` 定义，后者由客户端保存为 Anchor。新 State、页面 prepend 和 trim 都不得把它退化为数组下标或滚动百分比。
 
 验证失败是协议错误：丢弃整个 state，保留最后一个已验证 generation，并请求可靠 snapshot；不得部分导入。
 
@@ -70,5 +80,5 @@
 - `TERM-03` 已从唯一 WezTerm fork 导出本 schema，并证明权威导出不经过 ANSI/纯文本；实现边界见 [`docs/architecture/terminal-engine.md`](../architecture/terminal-engine.md)。
 - Apple 端先完成分片元数据、SHA-256、protobuf 和本 schema 的完整验证，再由单一 `AstraTerminalReplica` 按 epoch/generation 发布；SwiftTerm parser 不参与 semantic attachment。
 - 当前可靠路径在 PTY 更新和 lag 恢复时发送完整 State。它是 `SYNC-01/02` 之前正确但带宽较高的基线；后续 diff/ACK 只能替换传输增量，不能建立第二个 replica。
-- `HIST-02` 复用 `Anchor` 定义分页请求、页范围和 merge，不重新定义字节/行偏移身份。
+- `HIST-02` 已复用 `Anchor` 定义分页请求、页范围、merge 和用户 viewport，没有重新定义字节/行偏移身份。
 - `SYNC-01` 在本 schema 外层定义 base/target generation、ACK 和 diff；不得复用 `row_version` 充当 transport ACK。

@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package astra.v1;
 
+import "terminal_state_v2.proto";
+
 message WireMessage {
   oneof body {
     ServerHello server_hello = 1;
@@ -299,6 +301,7 @@ message TerminalCommand {
     bytes input = 10;
     Resize resize = 11;
     bool detach = 12;
+    astra.terminal.v2.HistoryPageRequest history_page = 13;
   }
 }
 message Resize {
@@ -320,6 +323,7 @@ message TerminalEvent {
     LeaseChanged lease_changed = 15;
     TerminalStateChunk semantic_state_chunk = 16;
     ClipboardWrite clipboard_write = 17;
+    HistoryPageChunk history_page_chunk = 18;
   }
 }
 enum ClipboardSelection {
@@ -335,6 +339,15 @@ message ClipboardWrite {
 // One reliable fragment of an encoded astra.terminal.v2.State. The receiver
 // validates size, ordering, digest and the complete State before publication.
 message TerminalStateChunk {
+  bytes transfer_id = 1;
+  uint32 chunk_index = 2;
+  uint32 chunk_count = 3;
+  uint32 total_size = 4;
+  bytes sha256 = 5;
+  bytes data = 6;
+}
+// One reliable fragment of an encoded astra.terminal.v2.HistoryPage.
+message HistoryPageChunk {
   bytes transfer_id = 1;
   uint32 chunk_index = 2;
   uint32 chunk_count = 3;

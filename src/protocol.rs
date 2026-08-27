@@ -2,6 +2,8 @@ use anyhow::{Context, Result, bail};
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::terminal_state_v2::HistoryPageRequest;
+
 pub const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 pub const LOCALE_ENVIRONMENT_VARIABLES: &[&str] = &[
     "LANG",
@@ -629,7 +631,7 @@ pub struct TerminalCommand {
     pub lease_id: String,
     #[prost(uint64, tag = "3")]
     pub sequence: u64,
-    #[prost(oneof = "terminal_command::Command", tags = "10, 11, 12")]
+    #[prost(oneof = "terminal_command::Command", tags = "10, 11, 12, 13")]
     pub command: Option<terminal_command::Command>,
 }
 
@@ -644,6 +646,8 @@ pub mod terminal_command {
         Resize(Resize),
         #[prost(bool, tag = "12")]
         Detach(bool),
+        #[prost(message, tag = "13")]
+        HistoryPage(HistoryPageRequest),
     }
 }
 
@@ -665,13 +669,15 @@ pub struct TerminalEvent {
     pub terminal_id: String,
     #[prost(
         oneof = "terminal_event::Event",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18"
     )]
     pub event: Option<terminal_event::Event>,
 }
 
 pub mod terminal_event {
-    use super::{ClipboardWrite, LeaseChanged, TerminalSnapshot, TerminalStateChunk};
+    use super::{
+        ClipboardWrite, HistoryPageChunk, LeaseChanged, TerminalSnapshot, TerminalStateChunk,
+    };
 
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Event {
@@ -691,6 +697,8 @@ pub mod terminal_event {
         SemanticStateChunk(TerminalStateChunk),
         #[prost(message, tag = "17")]
         ClipboardWrite(ClipboardWrite),
+        #[prost(message, tag = "18")]
+        HistoryPageChunk(HistoryPageChunk),
     }
 }
 
@@ -714,6 +722,22 @@ pub enum ClipboardSelection {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct TerminalStateChunk {
+    #[prost(bytes = "vec", tag = "1")]
+    pub transfer_id: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    pub chunk_index: u32,
+    #[prost(uint32, tag = "3")]
+    pub chunk_count: u32,
+    #[prost(uint32, tag = "4")]
+    pub total_size: u32,
+    #[prost(bytes = "vec", tag = "5")]
+    pub sha256: Vec<u8>,
+    #[prost(bytes = "vec", tag = "6")]
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HistoryPageChunk {
     #[prost(bytes = "vec", tag = "1")]
     pub transfer_id: Vec<u8>,
     #[prost(uint32, tag = "2")]
@@ -825,5 +849,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!((decoded.pixel_width, decoded.pixel_height), (0, 0));
+    }
+
+    #[test]
+    fn history_paging_oneofs_are_ignored_by_n_minus_one_decoders() {
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyTerminalCommand {
+            #[prost(string, tag = "1")]
+            terminal_id: String,
+            #[prost(oneof = "legacy_terminal_command::Command", tags = "10, 11, 12")]
+            command: Option<legacy_terminal_command::Command>,
+        }
+        mod legacy_terminal_command {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Command {
+                #[prost(bytes, tag = "10")]
+                Input(Vec<u8>),
+                #[prost(bool, tag = "12")]
+                Detach(bool),
+            }
+        }
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyTerminalEvent {
+            #[prost(string, tag = "1")]
+            terminal_id: String,
+            #[prost(
+                oneof = "legacy_terminal_event::Event",
+                tags = "10, 11, 12, 13, 14, 15, 16, 17"
+            )]
+            event: Option<legacy_terminal_event::Event>,
+        }
+        mod legacy_terminal_event {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Event {
+                #[prost(bytes, tag = "10")]
+                Output(Vec<u8>),
+                #[prost(int32, tag = "11")]
+                Exited(i32),
+                #[prost(string, tag = "12")]
+                Error(String),
+            }
+        }
+
+        let command = TerminalCommand {
+            terminal_id: "terminal".into(),
+            lease_id: String::new(),
+            sequence: 1,
+            command: Some(terminal_command::Command::HistoryPage(HistoryPageRequest {
+                epoch: vec![1; 16],
+                before: Some(crate::terminal_state_v2::Anchor {
+                    logical_line_id: 1,
+                    cell_offset: 0,
+                }),
+                maximum_rows: 128,
+            })),
+        };
+        let legacy = LegacyTerminalCommand::decode(command.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy.terminal_id, "terminal");
+        assert!(legacy.command.is_none());
+
+        let event = TerminalEvent {
+            terminal_id: "terminal".into(),
+            event: Some(terminal_event::Event::HistoryPageChunk(HistoryPageChunk {
+                transfer_id: vec![2; 16],
+                chunk_index: 0,
+                chunk_count: 1,
+                total_size: 0,
+                sha256: vec![3; 32],
+                data: vec![],
+            })),
+        };
+        let legacy = LegacyTerminalEvent::decode(event.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy.terminal_id, "terminal");
+        assert!(legacy.event.is_none());
     }
 }

@@ -19,19 +19,22 @@ use crate::{
     auth::{authentication_payload, verify_authorized_key, verify_authorized_keys},
     files::{FileResult, FileService},
     negotiation::{
-        CAPABILITY_CLIPBOARD_WRITE, CAPABILITY_SEMANTIC_STATE, NegotiatedProtocol, ProtocolSupport,
-        negotiate_client_hello, selections, validate_worker_selection,
+        CAPABILITY_CLIPBOARD_WRITE, CAPABILITY_HISTORY_PAGING, CAPABILITY_SEMANTIC_STATE,
+        NegotiatedProtocol, ProtocolSupport, negotiate_client_hello, selections,
+        validate_worker_selection,
     },
     process_lock::ProcessLock,
     protocol::{
         AckResponse, AttachResponse, AuthResult, ClipboardSelection as WireClipboardSelection,
-        ClipboardWrite, ErrorResponse, LeaseChanged, ListResponse, Response, ServerHello,
-        SpawnResponse, TerminalEvent, TerminalStateChunk, WireMessage, WorkerStreamHello,
-        read_message, request, response, terminal_command, terminal_event, wire_message,
-        write_message,
+        ClipboardWrite, ErrorResponse, HistoryPageChunk, LeaseChanged, ListResponse, Response,
+        ServerHello, SpawnResponse, TerminalEvent, TerminalStateChunk, WireMessage,
+        WorkerStreamHello, read_message, request, response, terminal_command, terminal_event,
+        wire_message, write_message,
     },
     terminal::{ClipboardSelection, PtyEvent, Terminal, TerminalManager},
-    terminal_state_v2::{MAX_ENCODED_STATE_BYTES, State},
+    terminal_state_v2::{
+        HistoryPage, MAX_ENCODED_HISTORY_PAGE_BYTES, MAX_ENCODED_STATE_BYTES, State,
+    },
     worker::WorkerRouter,
 };
 
@@ -965,6 +968,7 @@ where
         }
     };
     let semantic = negotiated.has(CAPABILITY_SEMANTIC_STATE, 2);
+    let history_paging = semantic && negotiated.has(CAPABILITY_HISTORY_PAGING, 1);
     let clipboard_write = semantic && negotiated.has(CAPABILITY_CLIPBOARD_WRITE, 1);
     let (snapshot, initial_state, mut events) = if semantic {
         let (state, events) = terminal.semantic_state_and_subscribe()?;
@@ -1027,6 +1031,13 @@ where
                                         size.pixel_width,
                                         size.pixel_height,
                                     )?;
+                                }
+                                Some(terminal_command::Command::HistoryPage(request)) => {
+                                    if !history_paging {
+                                        bail!("history page requested without negotiated capability")
+                                    }
+                                    let page = terminal.history_page(command.sequence, &request)?;
+                                    write_history_page(&mut send, &info.id, &page).await?;
                                 }
                                 Some(terminal_command::Command::Detach(_)) | None => break,
                             }
@@ -1224,6 +1235,32 @@ fn terminal_state_chunks(state: &State) -> Result<Vec<TerminalStateChunk>> {
     Ok(chunks)
 }
 
+fn history_page_chunks(page: &HistoryPage) -> Result<Vec<HistoryPageChunk>> {
+    let encoded = page.encode_to_vec();
+    if encoded.len() > MAX_ENCODED_HISTORY_PAGE_BYTES {
+        bail!("terminal history page exceeds the transport limit")
+    }
+    let transfer_id = uuid::Uuid::new_v4().as_bytes().to_vec();
+    let digest = Sha256::digest(&encoded).to_vec();
+    let chunk_count = encoded.len().max(1).div_ceil(TERMINAL_STATE_CHUNK_BYTES);
+    let total_size = u32::try_from(encoded.len())?;
+    let chunk_count = u32::try_from(chunk_count)?;
+    let mut chunks = Vec::with_capacity(chunk_count as usize);
+    for chunk_index in 0..chunk_count {
+        let start = chunk_index as usize * TERMINAL_STATE_CHUNK_BYTES;
+        let end = (start + TERMINAL_STATE_CHUNK_BYTES).min(encoded.len());
+        chunks.push(HistoryPageChunk {
+            transfer_id: transfer_id.clone(),
+            chunk_index,
+            chunk_count,
+            total_size,
+            sha256: digest.clone(),
+            data: encoded[start..end].to_vec(),
+        });
+    }
+    Ok(chunks)
+}
+
 async fn write_terminal_state<W>(send: &mut W, terminal_id: &str, state: &State) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -1233,6 +1270,21 @@ where
             send,
             terminal_id,
             terminal_event::Event::SemanticStateChunk(chunk),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn write_history_page<W>(send: &mut W, terminal_id: &str, page: &HistoryPage) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    for chunk in history_page_chunks(page)? {
+        write_terminal_event(
+            send,
+            terminal_id,
+            terminal_event::Event::HistoryPageChunk(chunk),
         )
         .await?;
     }
@@ -1291,11 +1343,45 @@ mod tests {
         assert_eq!(chunks.concat_data(), encoded);
     }
 
+    #[test]
+    fn history_page_transport_preserves_validated_payload() {
+        let mut engine = TerminalEngine::new(2, 8, 8, Box::new(std::io::sink())).unwrap();
+        engine.advance(b"zero\r\none\r\ntwo\r\nthree");
+        let state = engine.semantic_state().unwrap();
+        let request = crate::terminal_state_v2::HistoryPageRequest {
+            epoch: state.epoch,
+            before: state
+                .primary
+                .unwrap()
+                .included_rows
+                .last()
+                .unwrap()
+                .start
+                .clone(),
+            maximum_rows: 2,
+        };
+        let page = engine.history_page(1, &request).unwrap();
+        let encoded = page.encode_to_vec();
+        let chunks = history_page_chunks(&page).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].transfer_id.len(), 16);
+        assert_eq!(chunks[0].sha256, Sha256::digest(&encoded).to_vec());
+        assert_eq!(chunks.concat_data(), encoded);
+    }
+
     trait ChunkTestData {
         fn concat_data(&self) -> Vec<u8>;
     }
 
     impl ChunkTestData for [TerminalStateChunk] {
+        fn concat_data(&self) -> Vec<u8> {
+            self.iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect()
+        }
+    }
+
+    impl ChunkTestData for [HistoryPageChunk] {
         fn concat_data(&self) -> Vec<u8> {
             self.iter()
                 .flat_map(|chunk| chunk.data.iter().copied())

@@ -55,6 +55,34 @@ message Anchor {
   uint32 cell_offset = 2;
 }
 
+// Requests the contiguous rows immediately preceding `before`. The epoch
+// prevents an anchor from being interpreted after structural edits invalidate
+// its identity namespace. Transport correlation uses TerminalCommand.sequence.
+message HistoryPageRequest {
+  bytes epoch = 1;
+  Anchor before = 2;
+  uint32 maximum_rows = 3;
+}
+
+// A bounded page from the same authoritative primary-screen model as State.
+// An epoch mismatch is returned as reset_required with no included rows so the
+// client can discard cached pages without treating normal reflow as corruption.
+message HistoryPage {
+  uint64 request_id = 1;
+  bytes epoch = 2;
+  uint64 generation = 3;
+  uint32 cols = 4;
+  repeated Row included_rows = 5;
+  Anchor oldest_available = 6;
+  Anchor newest_available = 7;
+  Anchor included_start = 8;
+  Anchor included_end = 9;
+  repeated Style styles = 10;
+  repeated Hyperlink hyperlinks = 11;
+  bool more_before = 12;
+  bool reset_required = 13;
+}
+
 // One physical row for State.cols. Multiple rows can share a logical line ID;
 // their start.cell_offset and wrapped_to_next describe the current reflow.
 message Row {

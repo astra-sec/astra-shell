@@ -46,6 +46,11 @@ impl ProtocolSupport {
                     maximum_version: 2,
                 },
                 CapabilityRange {
+                    name: CAPABILITY_HISTORY_PAGING,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
                     name: CAPABILITY_CLIPBOARD_WRITE,
                     minimum_version: 1,
                     maximum_version: 1,
@@ -161,6 +166,13 @@ pub fn negotiate_client_hello(
             .is_some_and(|version| *version >= 2)
     {
         capabilities.remove(CAPABILITY_CLIPBOARD_WRITE);
+    }
+    if capabilities.contains_key(CAPABILITY_HISTORY_PAGING)
+        && !capabilities
+            .get(CAPABILITY_SEMANTIC_STATE)
+            .is_some_and(|version| *version >= 2)
+    {
+        capabilities.remove(CAPABILITY_HISTORY_PAGING);
     }
 
     Ok(NegotiatedProtocol {
@@ -366,6 +378,13 @@ fn validate_capability_dependencies(capabilities: &BTreeMap<String, u32>) -> Res
                 .is_some_and(|version| *version >= 2),
         "terminal.clipboard_write requires terminal.semantic_state v2"
     );
+    ensure!(
+        !capabilities.contains_key(CAPABILITY_HISTORY_PAGING)
+            || capabilities
+                .get(CAPABILITY_SEMANTIC_STATE)
+                .is_some_and(|version| *version >= 2),
+        "terminal.history_paging requires terminal.semantic_state v2"
+    );
     Ok(())
 }
 
@@ -460,6 +479,32 @@ mod tests {
             server_instance: String::new(),
             capabilities: vec![CapabilitySelection {
                 name: CAPABILITY_CLIPBOARD_WRITE.into(),
+                version: 1,
+            }],
+        };
+        assert!(validate_server_hello(&valid_hello, &invalid_server).is_err());
+    }
+
+    #[test]
+    fn history_paging_is_never_selected_without_semantic_state_v2() {
+        let support = ProtocolSupport::runtime();
+        let mut hello = client_hello("client", &support);
+        hello
+            .capabilities
+            .retain(|offer| offer.name == CAPABILITY_HISTORY_PAGING);
+        let negotiated = negotiate_client_hello(&hello, &support).unwrap();
+        assert!(!negotiated.has(CAPABILITY_HISTORY_PAGING, 1));
+
+        let mut valid_hello = client_hello("client", &support);
+        valid_hello.capabilities.retain(|offer| {
+            offer.name == CAPABILITY_HISTORY_PAGING || offer.name == CAPABILITY_SEMANTIC_STATE
+        });
+        let invalid_server = ServerHello {
+            protocol_version: PROTOCOL_VERSION,
+            challenge: vec![],
+            server_instance: String::new(),
+            capabilities: vec![CapabilitySelection {
+                name: CAPABILITY_HISTORY_PAGING.into(),
                 version: 1,
             }],
         };

@@ -20,7 +20,10 @@ use uuid::Uuid;
 use crate::protocol::{
     EnvironmentVariable, LOCALE_ENVIRONMENT_VARIABLES, SpawnRequest, TerminalInfo, TerminalSnapshot,
 };
-use crate::{terminal_engine::TerminalEngine, terminal_state_v2::State};
+use crate::{
+    terminal_engine::TerminalEngine,
+    terminal_state_v2::{HistoryPage, HistoryPageRequest, State},
+};
 
 // Match tmux's default history-limit: enough context for normal use without
 // letting many wide panes retain unbounded cell grids.
@@ -137,6 +140,17 @@ impl Terminal {
             .lock()
             .expect("terminal engine poisoned")
             .semantic_state()
+    }
+
+    pub fn history_page(
+        &self,
+        request_id: u64,
+        request: &HistoryPageRequest,
+    ) -> Result<HistoryPage> {
+        self.engine
+            .lock()
+            .expect("terminal engine poisoned")
+            .history_page(request_id, request)
     }
 
     pub fn subscribe_to_leases(&self) -> broadcast::Receiver<LeaseEvent> {

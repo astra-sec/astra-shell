@@ -11,9 +11,10 @@ use uuid::Uuid;
 
 use crate::protocol::TerminalSnapshot;
 use crate::terminal_state_v2::{
-    self, Anchor, Blink, Cell, Color, Cursor, CursorShape, Hyperlink, Intensity, KeyboardEncoding,
-    Modes, MouseEncoding, MouseTracking, Palette, Row, SCHEMA_VERSION, Screen, ScreenKind,
-    SemanticType, State, Style, Underline, VerticalAlign, color,
+    self, Anchor, Blink, Cell, Color, Cursor, CursorShape, HistoryPage, HistoryPageRequest,
+    Hyperlink, Intensity, KeyboardEncoding, Modes, MouseEncoding, MouseTracking, Palette, Row,
+    SCHEMA_VERSION, Screen, ScreenKind, SemanticType, State, Style, Underline, VerticalAlign,
+    color,
 };
 
 #[derive(Debug)]
@@ -110,36 +111,10 @@ impl TerminalEngine {
     }
 
     pub fn semantic_state(&mut self) -> Result<State> {
-        let current_identity_epoch = self.terminal.astra_view().identity_epoch;
-        if current_identity_epoch != self.identity_epoch {
-            self.epoch = *Uuid::new_v4().as_bytes();
-            self.identity_epoch = current_identity_epoch;
-            self.epoch_sequence_start = self.terminal.astra_view().sequence;
-        }
+        self.refresh_identity_epoch();
         let view = self.terminal.astra_view();
-        ensure!(
-            view.primary.kind() == AstraScreenKind::Primary && view.primary.allows_scrollback(),
-            "primary terminal screen lost scrollback semantics"
-        );
-        ensure!(
-            view.primary.history_row_count() == view.primary.viewport_start()
-                && view.primary.viewport_start() + view.rows() == view.primary.row_count(),
-            "primary terminal history and viewport are not contiguous"
-        );
-        ensure!(
-            view.alternate.kind() == AstraScreenKind::Alternate
-                && !view.alternate.allows_scrollback()
-                && view.alternate.history_row_count() == 0
-                && view.alternate.viewport_start() == 0
-                && view.alternate.row_count() == view.rows(),
-            "alternate terminal screen must contain exactly one viewport and no history"
-        );
-        let generation = view
-            .sequence
-            .checked_sub(self.epoch_sequence_start)
-            .context("terminal sequence moved backwards within an epoch")?
-            .checked_add(1)
-            .context("terminal generation overflowed")?;
+        validate_authoritative_screens(&view)?;
+        let generation = generation(&view, self.epoch_sequence_start)?;
         let mut tables = ExportTables::default();
         let alternate_row_count = view.alternate.row_count();
         ensure!(
@@ -184,6 +159,97 @@ impl TerminalEngine {
         Ok(state)
     }
 
+    pub fn history_page(
+        &mut self,
+        request_id: u64,
+        request: &HistoryPageRequest,
+    ) -> Result<HistoryPage> {
+        ensure!(request_id > 0, "history request ID is zero");
+        terminal_state_v2::validate_history_page_request(request)?;
+        self.refresh_identity_epoch();
+        let view = self.terminal.astra_view();
+        validate_authoritative_screens(&view)?;
+        let generation = generation(&view, self.epoch_sequence_start)?;
+        let primary = &view.primary;
+        let row_count = primary.row_count();
+        let oldest_available = primary
+            .rows(0, 1)
+            .next()
+            .map(|row| anchor(row.identity.logical_line_id, row.identity.cell_offset))
+            .context("terminal screen has no oldest row")?;
+        let newest_available = primary
+            .rows(row_count - 1, 1)
+            .next()
+            .map(|row| anchor(row.identity.logical_line_id, row.identity.cell_offset))
+            .context("terminal screen has no newest row")?;
+
+        if request.epoch != self.epoch {
+            let page = HistoryPage {
+                request_id,
+                epoch: self.epoch.to_vec(),
+                generation,
+                cols: u32::try_from(view.columns())?,
+                included_rows: Vec::new(),
+                oldest_available: Some(oldest_available),
+                newest_available: Some(newest_available),
+                included_start: None,
+                included_end: None,
+                styles: Vec::new(),
+                hyperlinks: Vec::new(),
+                more_before: false,
+                reset_required: true,
+            };
+            terminal_state_v2::validate_history_page(&page)?;
+            return Ok(page);
+        }
+
+        let before = request
+            .before
+            .as_ref()
+            .context("history request anchor is missing")?;
+        let before_key = (before.logical_line_id, before.cell_offset as usize);
+        let end_index = primary
+            .rows(0, row_count)
+            .position(|row| (row.identity.logical_line_id, row.identity.cell_offset) >= before_key)
+            .unwrap_or(row_count)
+            .min(primary.viewport_start());
+        let start_index = end_index.saturating_sub(request.maximum_rows as usize);
+        let mut tables = ExportTables::default();
+        let included_rows = primary
+            .rows(start_index, end_index - start_index)
+            .map(|row| export_row(row, self.epoch_sequence_start, generation, &mut tables))
+            .collect::<Result<Vec<_>>>()?;
+        let included_start = included_rows.first().and_then(|row| row.start.clone());
+        let included_end = included_rows.last().and_then(|row| row.start.clone());
+        let page = HistoryPage {
+            request_id,
+            epoch: self.epoch.to_vec(),
+            generation,
+            cols: u32::try_from(view.columns())?,
+            included_rows,
+            oldest_available: Some(oldest_available),
+            newest_available: Some(newest_available),
+            included_start,
+            included_end,
+            styles: tables.styles,
+            hyperlinks: tables.hyperlinks,
+            more_before: start_index > 0,
+            reset_required: false,
+        };
+        terminal_state_v2::validate_history_page(&page)
+            .context("authoritative terminal history page is invalid")?;
+        Ok(page)
+    }
+
+    fn refresh_identity_epoch(&mut self) {
+        let view = self.terminal.astra_view();
+        if view.identity_epoch != self.identity_epoch {
+            self.epoch = *Uuid::new_v4().as_bytes();
+            self.identity_epoch = view.identity_epoch;
+            self.epoch_sequence_start = view.sequence;
+        }
+    }
+
     /// Transitional serializer for clients that negotiated the registered
     /// legacy ANSI capability. This is derived from semantic state and is
     /// never fed back into the authoritative engine.
@@ -211,6 +277,38 @@ impl TerminalEngine {
                 .unwrap_or_default(),
         })
     }
+}
+
+fn validate_authoritative_screens(view: &astra_wezterm_term::AstraTerminalView<'_>) -> Result<()> {
+    ensure!(
+        view.primary.kind() == AstraScreenKind::Primary && view.primary.allows_scrollback(),
+        "primary terminal screen lost scrollback semantics"
+    );
+    ensure!(
+        view.primary.history_row_count() == view.primary.viewport_start()
+            && view.primary.viewport_start() + view.rows() == view.primary.row_count(),
+        "primary terminal history and viewport are not contiguous"
+    );
+    ensure!(
+        view.alternate.kind() == AstraScreenKind::Alternate
+            && !view.alternate.allows_scrollback()
+            && view.alternate.history_row_count() == 0
+            && view.alternate.viewport_start() == 0
+            && view.alternate.row_count() == view.rows(),
+        "alternate terminal screen must contain exactly one viewport and no history"
+    );
+    Ok(())
+}
+
+fn generation(
+    view: &astra_wezterm_term::AstraTerminalView<'_>,
+    epoch_sequence_start: u64,
+) -> Result<u64> {
+    view.sequence
+        .checked_sub(epoch_sequence_start)
+        .context("terminal sequence moved backwards within an epoch")?
+        .checked_add(1)
+        .context("terminal generation overflowed")
 }
 
 fn render_legacy_screen(state: &State, screen: &Screen) -> Vec<u8> {
@@ -1113,6 +1211,49 @@ mod tests {
             &restored.primary.as_ref().unwrap().included_rows,
             &primary_before,
         );
+    }
+
+    #[test]
+    fn history_pages_are_contiguous_bounded_and_epoch_scoped() {
+        let mut engine = TerminalEngine::new(2, 8, 32, Box::new(ReplySink::default())).unwrap();
+        engine.advance(b"line-0\r\nline-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5");
+        let state = engine.semantic_state().unwrap();
+        let primary = state.primary.as_ref().unwrap();
+        let before = primary.included_rows[primary.viewport_start as usize]
+            .start
+            .clone();
+        let request = HistoryPageRequest {
+            epoch: state.epoch.clone(),
+            before,
+            maximum_rows: 2,
+        };
+        let page = engine.history_page(7, &request).unwrap();
+        assert_eq!(page.request_id, 7);
+        assert_eq!(page.epoch, state.epoch);
+        assert_eq!(page.cols, state.cols);
+        assert_eq!(page.included_rows.len(), 2);
+        assert!(page.more_before);
+        assert!(!page.reset_required);
+        let page_end = page.included_end.as_ref().unwrap();
+        let request_before = request.before.as_ref().unwrap();
+        assert!(
+            (page_end.logical_line_id, page_end.cell_offset)
+                < (request_before.logical_line_id, request_before.cell_offset)
+        );
+
+        let oldest_request = HistoryPageRequest {
+            before: page.oldest_available.clone(),
+            ..request.clone()
+        };
+        let empty = engine.history_page(8, &oldest_request).unwrap();
+        assert!(empty.included_rows.is_empty());
+        assert!(!empty.more_before);
+
+        engine.advance(b"\x1b[2;1H\x1b[L");
+        let reset = engine.history_page(9, &request).unwrap();
+        assert!(reset.reset_required);
+        assert!(reset.included_rows.is_empty());
+        assert_ne!(reset.epoch, request.epoch);
     }
 
     #[test]

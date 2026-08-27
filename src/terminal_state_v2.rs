@@ -7,8 +7,10 @@ use unicode_segmentation::UnicodeSegmentation;
 pub const SCHEMA_VERSION: u32 = 2;
 pub const EPOCH_BYTES: usize = 16;
 pub const MAX_ENCODED_STATE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ENCODED_HISTORY_PAGE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_DIMENSION: u32 = 1_000;
 pub const MAX_INCLUDED_ROWS: usize = 4_096;
+pub const MAX_HISTORY_PAGE_ROWS: usize = 512;
 pub const MAX_CELLS: usize = 1_000_000;
 pub const MAX_GRAPHEME_BYTES: usize = 256;
 pub const MAX_STYLES: usize = 4_096;
@@ -94,6 +96,46 @@ pub struct Anchor {
     pub logical_line_id: u64,
     #[prost(uint32, tag = "2")]
     pub cell_offset: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HistoryPageRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub epoch: Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    pub before: Option<Anchor>,
+    #[prost(uint32, tag = "3")]
+    pub maximum_rows: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HistoryPage {
+    #[prost(uint64, tag = "1")]
+    pub request_id: u64,
+    #[prost(bytes = "vec", tag = "2")]
+    pub epoch: Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub generation: u64,
+    #[prost(uint32, tag = "4")]
+    pub cols: u32,
+    #[prost(message, repeated, tag = "5")]
+    pub included_rows: Vec<Row>,
+    #[prost(message, optional, tag = "6")]
+    pub oldest_available: Option<Anchor>,
+    #[prost(message, optional, tag = "7")]
+    pub newest_available: Option<Anchor>,
+    #[prost(message, optional, tag = "8")]
+    pub included_start: Option<Anchor>,
+    #[prost(message, optional, tag = "9")]
+    pub included_end: Option<Anchor>,
+    #[prost(message, repeated, tag = "10")]
+    pub styles: Vec<Style>,
+    #[prost(message, repeated, tag = "11")]
+    pub hyperlinks: Vec<Hyperlink>,
+    #[prost(bool, tag = "12")]
+    pub more_before: bool,
+    #[prost(bool, tag = "13")]
+    pub reset_required: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -349,36 +391,7 @@ pub fn validate(state: &State) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("terminal palette is missing"))?,
     )?;
 
-    ensure!(state.styles.len() <= MAX_STYLES, "too many terminal styles");
-    let mut style_ids = HashSet::with_capacity(state.styles.len());
-    for style in &state.styles {
-        validate_style(style)?;
-        ensure!(
-            style.id != 0 && style_ids.insert(style.id),
-            "terminal style IDs must be unique and nonzero"
-        );
-    }
-
-    ensure!(
-        state.hyperlinks.len() <= MAX_HYPERLINKS,
-        "too many terminal hyperlinks"
-    );
-    let mut hyperlink_ids = HashSet::with_capacity(state.hyperlinks.len());
-    for hyperlink in &state.hyperlinks {
-        ensure!(
-            hyperlink.id != 0 && hyperlink_ids.insert(hyperlink.id),
-            "terminal hyperlink IDs must be unique and nonzero"
-        );
-        ensure!(!hyperlink.uri.is_empty(), "terminal hyperlink URI is empty");
-        ensure!(
-            hyperlink.uri.len() <= MAX_HYPERLINK_URI_BYTES,
-            "terminal hyperlink URI is too large"
-        );
-        ensure!(
-            hyperlink.explicit_id.len() <= MAX_HYPERLINK_EXPLICIT_ID_BYTES,
-            "terminal hyperlink explicit ID is too large"
-        );
-    }
+    let (style_ids, hyperlink_ids) = validate_tables(&state.styles, &state.hyperlinks)?;
 
     let primary = state
         .primary
@@ -412,6 +425,140 @@ pub fn validate(state: &State) -> Result<()> {
     )?;
     ensure!(cell_count <= MAX_CELLS, "too many terminal cells");
     Ok(())
+}
+
+pub fn validate_history_page_request(request: &HistoryPageRequest) -> Result<()> {
+    ensure!(
+        request.epoch.len() == EPOCH_BYTES,
+        "history request epoch must be {EPOCH_BYTES} bytes"
+    );
+    required_anchor(&request.before, "history request anchor")?;
+    ensure!(
+        (1..=MAX_HISTORY_PAGE_ROWS as u32).contains(&request.maximum_rows),
+        "history request row count is out of range"
+    );
+    Ok(())
+}
+
+pub fn validate_history_page(page: &HistoryPage) -> Result<()> {
+    ensure!(page.request_id > 0, "history page request ID is zero");
+    ensure!(
+        page.epoch.len() == EPOCH_BYTES,
+        "history page epoch must be {EPOCH_BYTES} bytes"
+    );
+    ensure!(page.generation > 0, "history page generation is zero");
+    ensure!(
+        (1..=MAX_DIMENSION).contains(&page.cols),
+        "history page columns are out of range"
+    );
+    ensure!(
+        page.encoded_len() <= MAX_ENCODED_HISTORY_PAGE_BYTES,
+        "history page exceeds {MAX_ENCODED_HISTORY_PAGE_BYTES} encoded bytes"
+    );
+    let oldest = required_anchor(&page.oldest_available, "history oldest available anchor")?;
+    let newest = required_anchor(&page.newest_available, "history newest available anchor")?;
+    ensure!(
+        anchor_key(oldest) <= anchor_key(newest),
+        "history available range is reversed"
+    );
+
+    if page.reset_required {
+        ensure!(
+            page.included_rows.is_empty()
+                && page.included_start.is_none()
+                && page.included_end.is_none()
+                && page.styles.is_empty()
+                && page.hyperlinks.is_empty()
+                && !page.more_before,
+            "history reset page contains page data"
+        );
+        return Ok(());
+    }
+
+    ensure!(
+        page.included_rows.len() <= MAX_HISTORY_PAGE_ROWS,
+        "history page contains too many rows"
+    );
+    if page.included_rows.is_empty() {
+        ensure!(
+            page.included_start.is_none()
+                && page.included_end.is_none()
+                && page.styles.is_empty()
+                && page.hyperlinks.is_empty()
+                && !page.more_before,
+            "empty history page contains range data"
+        );
+        return Ok(());
+    }
+
+    let included_start = required_anchor(&page.included_start, "history included start anchor")?;
+    let included_end = required_anchor(&page.included_end, "history included end anchor")?;
+    ensure!(
+        anchor_key(oldest) <= anchor_key(included_start)
+            && anchor_key(included_start) <= anchor_key(included_end)
+            && anchor_key(included_end) <= anchor_key(newest),
+        "history included range is outside available rows"
+    );
+    ensure!(
+        page.included_rows
+            .first()
+            .and_then(|row| row.start.as_ref())
+            == Some(included_start)
+            && page.included_rows.last().and_then(|row| row.start.as_ref()) == Some(included_end),
+        "history page boundary anchors do not match rows"
+    );
+    ensure!(
+        page.more_before == (anchor_key(oldest) < anchor_key(included_start)),
+        "history page continuation flag is inconsistent"
+    );
+    let (style_ids, hyperlink_ids) = validate_tables(&page.styles, &page.hyperlinks)?;
+    let mut cell_count = 0;
+    validate_rows(
+        &page.included_rows,
+        page.cols,
+        page.generation,
+        &style_ids,
+        &hyperlink_ids,
+        &mut cell_count,
+    )?;
+    Ok(())
+}
+
+fn validate_tables(
+    styles: &[Style],
+    hyperlinks: &[Hyperlink],
+) -> Result<(HashSet<u32>, HashSet<u64>)> {
+    ensure!(styles.len() <= MAX_STYLES, "too many terminal styles");
+    let mut style_ids = HashSet::with_capacity(styles.len());
+    for style in styles {
+        validate_style(style)?;
+        ensure!(
+            style.id != 0 && style_ids.insert(style.id),
+            "terminal style IDs must be unique and nonzero"
+        );
+    }
+
+    ensure!(
+        hyperlinks.len() <= MAX_HYPERLINKS,
+        "too many terminal hyperlinks"
+    );
+    let mut hyperlink_ids = HashSet::with_capacity(hyperlinks.len());
+    for hyperlink in hyperlinks {
+        ensure!(
+            hyperlink.id != 0 && hyperlink_ids.insert(hyperlink.id),
+            "terminal hyperlink IDs must be unique and nonzero"
+        );
+        ensure!(!hyperlink.uri.is_empty(), "terminal hyperlink URI is empty");
+        ensure!(
+            hyperlink.uri.len() <= MAX_HYPERLINK_URI_BYTES,
+            "terminal hyperlink URI is too large"
+        );
+        ensure!(
+            hyperlink.explicit_id.len() <= MAX_HYPERLINK_EXPLICIT_ID_BYTES,
+            "terminal hyperlink explicit ID is too large"
+        );
+    }
+    Ok((style_ids, hyperlink_ids))
 }
 
 fn validate_modes(modes: &Modes) -> Result<()> {
@@ -557,11 +704,35 @@ fn validate_screen(
         "included row boundary anchors do not match rows"
     );
 
+    validate_rows(
+        &screen.included_rows,
+        state.cols,
+        state.generation,
+        style_ids,
+        hyperlink_ids,
+        cell_count,
+    )?;
+
+    validate_cursor(required_cursor(&screen.cursor, "cursor")?, screen, state)?;
+    if let Some(saved) = &screen.saved_cursor {
+        validate_cursor(saved, screen, state)?;
+    }
+    Ok(())
+}
+
+fn validate_rows(
+    rows: &[Row],
+    cols: u32,
+    generation: u64,
+    style_ids: &HashSet<u32>,
+    hyperlink_ids: &HashSet<u64>,
+    cell_count: &mut usize,
+) -> Result<()> {
     let mut previous: Option<&Anchor> = None;
-    for (index, row) in screen.included_rows.iter().enumerate() {
+    for (index, row) in rows.iter().enumerate() {
         let start = required_anchor(&row.start, "row anchor")?;
         ensure!(
-            row.row_version > 0 && row.row_version <= state.generation,
+            row.row_version > 0 && row.row_version <= generation,
             "row version is outside the state generation"
         );
         if let Some(previous) = previous {
@@ -570,7 +741,7 @@ fn validate_screen(
                 "terminal row anchors are not strictly ordered"
             );
         }
-        if let Some(next) = screen.included_rows.get(index + 1) {
+        if let Some(next) = rows.get(index + 1) {
             let next_start = required_anchor(&next.start, "next row anchor")?;
             if row.wrapped_to_next {
                 ensure!(
@@ -579,7 +750,7 @@ fn validate_screen(
                 );
                 let expected_offset = start
                     .cell_offset
-                    .checked_add(state.cols)
+                    .checked_add(cols)
                     .ok_or_else(|| anyhow::anyhow!("wrapped row offset overflows"))?;
                 ensure!(
                     next_start.cell_offset == expected_offset,
@@ -592,13 +763,8 @@ fn validate_screen(
                 );
             }
         }
-        validate_cells(row, state.cols, style_ids, hyperlink_ids, cell_count)?;
+        validate_cells(row, cols, style_ids, hyperlink_ids, cell_count)?;
         previous = Some(start);
-    }
-
-    validate_cursor(required_cursor(&screen.cursor, "cursor")?, screen, state)?;
-    if let Some(saved) = &screen.saved_cursor {
-        validate_cursor(saved, screen, state)?;
     }
     Ok(())
 }
@@ -986,5 +1152,54 @@ mod tests {
                 .to_string()
                 .contains("kitty keyboard flags")
         );
+    }
+
+    #[test]
+    fn validates_bounded_history_requests_pages_and_resets() {
+        let state = valid_state();
+        let primary = state.primary.unwrap();
+        let request = HistoryPageRequest {
+            epoch: state.epoch.clone(),
+            before: primary.included_end.clone(),
+            maximum_rows: 2,
+        };
+        validate_history_page_request(&request).unwrap();
+
+        let mut page = HistoryPage {
+            request_id: 3,
+            epoch: state.epoch,
+            generation: state.generation,
+            cols: state.cols,
+            included_rows: primary.included_rows,
+            oldest_available: primary.oldest_available,
+            newest_available: primary.newest_available,
+            included_start: primary.included_start,
+            included_end: primary.included_end,
+            styles: state.styles,
+            hyperlinks: state.hyperlinks,
+            more_before: false,
+            reset_required: false,
+        };
+        validate_history_page(&page).unwrap();
+
+        page.included_rows[1].start = Some(anchor(1, state.cols));
+        assert!(validate_history_page(&page).is_err());
+
+        let reset = HistoryPage {
+            request_id: 4,
+            epoch: vec![8; EPOCH_BYTES],
+            generation: 1,
+            cols: state.cols,
+            included_rows: vec![],
+            oldest_available: Some(anchor(10, 0)),
+            newest_available: Some(anchor(11, 0)),
+            included_start: None,
+            included_end: None,
+            styles: vec![],
+            hyperlinks: vec![],
+            more_before: false,
+            reset_required: true,
+        };
+        validate_history_page(&reset).unwrap();
     }
 }

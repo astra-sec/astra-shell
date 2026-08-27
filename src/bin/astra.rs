@@ -805,6 +805,9 @@ async fn attach_terminal(
                                     Some(terminal_event::Event::ClipboardWrite(_)) => {
                                         return Err(anyhow!("server sent an unnegotiated clipboard host effect"));
                                     }
+                                    Some(terminal_event::Event::HistoryPageChunk(_)) => {
+                                        return Err(anyhow!("server sent unnegotiated terminal history"));
+                                    }
                                     None => {}
                                 }
                                 continue;

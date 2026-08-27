@@ -1,6 +1,6 @@
 # Astra server TerminalEngine
 
-状态：`TERM-03` 至 `TERM-06`、`HIST-01` 服务端实现说明。服务端权威终端模型、可靠 semantic attach、输入模式、宿主能力边界和主屏历史 cell model 已经实现；增量同步和历史分页仍属于后续任务。
+状态：`TERM-03` 至 `TERM-06`、`HIST-01/02` 服务端实现说明。服务端权威终端模型、可靠 semantic attach、输入模式、宿主能力边界、主屏历史 cell model 和 Anchor 分页已经实现；增量同步和历史容量策略仍属于后续任务。
 
 ## 权威数据路径
 
@@ -35,7 +35,13 @@ PTY reader
 - alternate 不允许 scrollback，history row count 和 viewport start 必须为 0，row count 必须正好等于 viewport 高度；
 - primary/alternate 仍共享 Terminal State v2 的有界消息预算，但只有 primary 能产生历史。
 
-`HIST-01` 只定义权威 cell model 和稳定 identity。它不提高 2,000 行临时容量基线，也不让客户端自行拼接页面；可靠分页、真实远端 viewport、容量/字节配额与滚动条分别属于 `HIST-02/03/04`。
+`HIST-01` 只定义权威 cell model 和稳定 identity。它不提高 2,000 行临时容量基线，也不让客户端自行拼接页面；容量/字节配额与滚动条仍分别属于 `HIST-03/04`。
+
+## Anchor 历史分页
+
+选择 `terminal.history_paging` v1 的 semantic attachment 可在同一可靠双向 stream 上发送 `HistoryPageRequest`。请求必须携带当前 16-byte epoch、完整 `before: Anchor` 和 `1...512` 行上限；服务端只从 primary retained history 中返回严格位于 `before` 之前、最多 512 行的连续页面，不读取 alternate，也不建立第二份历史缓存。
+
+`HistoryPage` 携带请求 sequence、epoch/generation、cols、真实 oldest/newest、页面首尾 Anchor、页面实际引用的 style/hyperlink 表和 `more_before`。页面编码上限 4 MiB，以 512 KiB chunk、整体 SHA-256 和独立 transfer ID 可靠传输。epoch 已变化时返回无 rows 的 `reset_required` 页面，客户端必须丢弃旧页；请求边界已被 trim 时返回无 rows 的正常页。分页不会改变 engine、generation 或 scrollback 容量。
 
 ## 逻辑行身份
 
@@ -85,6 +91,8 @@ OSC 52 是单向、显式协商的 host effect：服务端最多接受 256 KiB U
 - 带 style、hyperlink 和 wide grapheme 的 soft-wrapped logical line 滚入历史后保持完整 cell 语义。
 - normal scroll/trim 不轮换 epoch、不复用 logical ID；反复 narrow/wide reflow 保持 logical ID 和 retained content。
 - alternate 大量滚动仍只导出一个 viewport，且不改变 primary 历史的 cell 和 identity。
+- Anchor 分页严格位于请求边界之前，遵守 512-row/4-MiB 上限；oldest 边界产生空页，旧 epoch 产生结构化 reset。
+- 历史页分片共享 transfer identity 和 SHA-256；N-1 decoder 忽略未协商的 command/event oneof。
 - DA/DSR、字符/像素尺寸查询写入宿主 sink；未知像素、title 和 OSC 52 read 安全降级。
 - OSC 52 write 形成有大小上限的结构化 host effect，超限写入被拒绝。
 - RIS 后旧内容不再进入后续语义 State；ANSI 兼容视图从语义 State 生成。
