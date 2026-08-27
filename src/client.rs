@@ -512,7 +512,7 @@ async fn authenticate(
     username: &str,
 ) -> Result<NegotiatedProtocol> {
     let (mut send, mut recv) = connection.open_bi().await?;
-    let client_hello = client_hello(username, &ProtocolSupport::runtime());
+    let client_hello = client_hello(username, &ProtocolSupport::command_line_client());
     write_message(
         &mut send,
         &WireMessage::new(wire_message::Body::ClientHello(client_hello.clone())),

@@ -1,6 +1,6 @@
 # Astra Terminal State v2
 
-状态：`TERM-02` 领域模型；`TERM-03` 已能从服务端权威引擎直接导出。它尚未接入 `astra/1` 的 attach/event，wire 接入与客户端 replica 属于 `TERM-04`。
+状态：`TERM-02` 领域模型；`TERM-03` 从服务端权威引擎直接导出；`TERM-04` 已接入可靠 wire 分片、Apple replica 和 SwiftTerm 受控 fork 的原子 cell 导入。
 
 权威 schema 是 [`proto/terminal_state_v2.proto`](../../proto/terminal_state_v2.proto)。旧 `TerminalSnapshot` 的 ANSI 字段不是 v2 的组成部分。
 
@@ -68,6 +68,7 @@
 ## 与后续任务的边界
 
 - `TERM-03` 已从唯一 WezTerm fork 导出本 schema，并证明权威导出不经过 ANSI/纯文本；实现边界见 [`docs/architecture/terminal-engine.md`](../architecture/terminal-engine.md)。
-- `TERM-04` 负责在 Apple replica 原子校验和导入本 schema，不向 SwiftTerm parser replay。
+- Apple 端先完成分片元数据、SHA-256、protobuf 和本 schema 的完整验证，再由单一 `AstraTerminalReplica` 按 epoch/generation 发布；SwiftTerm parser 不参与 semantic attachment。
+- 当前可靠路径在 PTY 更新和 lag 恢复时发送完整 State。它是 `SYNC-01/02` 之前正确但带宽较高的基线；后续 diff/ACK 只能替换传输增量，不能建立第二个 replica。
 - `HIST-02` 复用 `Anchor` 定义分页请求、页范围和 merge，不重新定义字节/行偏移身份。
 - `SYNC-01` 在本 schema 外层定义 base/target generation、ACK 和 diff；不得复用 `row_version` 充当 transport ACK。

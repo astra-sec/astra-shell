@@ -23,7 +23,7 @@ pub const LOCALE_ENVIRONMENT_VARIABLES: &[&str] = &[
 
 #[derive(Clone, PartialEq, Message)]
 pub struct WireMessage {
-    #[prost(oneof = "wire_message::Body", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
+    #[prost(oneof = "wire_message::Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
     pub body: Option<wire_message::Body>,
 }
 
@@ -48,6 +48,8 @@ pub mod wire_message {
         TerminalEvent(TerminalEvent),
         #[prost(message, tag = "8")]
         ClientHello(ClientHello),
+        #[prost(message, tag = "9")]
+        WorkerStreamHello(WorkerStreamHello),
     }
 }
 
@@ -93,6 +95,14 @@ pub struct CapabilitySelection {
     pub name: String,
     #[prost(uint32, tag = "2")]
     pub version: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct WorkerStreamHello {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(message, repeated, tag = "2")]
+    pub capabilities: Vec<CapabilitySelection>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -649,12 +659,12 @@ pub struct Resize {
 pub struct TerminalEvent {
     #[prost(string, tag = "1")]
     pub terminal_id: String,
-    #[prost(oneof = "terminal_event::Event", tags = "10, 11, 12, 13, 14, 15")]
+    #[prost(oneof = "terminal_event::Event", tags = "10, 11, 12, 13, 14, 15, 16")]
     pub event: Option<terminal_event::Event>,
 }
 
 pub mod terminal_event {
-    use super::{LeaseChanged, TerminalSnapshot};
+    use super::{LeaseChanged, TerminalSnapshot, TerminalStateChunk};
 
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Event {
@@ -670,7 +680,25 @@ pub mod terminal_event {
         Snapshot(TerminalSnapshot),
         #[prost(message, tag = "15")]
         LeaseChanged(LeaseChanged),
+        #[prost(message, tag = "16")]
+        SemanticStateChunk(TerminalStateChunk),
     }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TerminalStateChunk {
+    #[prost(bytes = "vec", tag = "1")]
+    pub transfer_id: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    pub chunk_index: u32,
+    #[prost(uint32, tag = "3")]
+    pub chunk_count: u32,
+    #[prost(uint32, tag = "4")]
+    pub total_size: u32,
+    #[prost(bytes = "vec", tag = "5")]
+    pub sha256: Vec<u8>,
+    #[prost(bytes = "vec", tag = "6")]
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]

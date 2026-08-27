@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use anyhow::{Result, ensure};
 use prost::Message;
+use unicode_segmentation::UnicodeSegmentation;
 
 pub const SCHEMA_VERSION: u32 = 2;
 pub const EPOCH_BYTES: usize = 16;
@@ -627,6 +628,10 @@ fn validate_cells(
     for (index, cell) in row.cells.iter().enumerate() {
         ensure!(!cell.grapheme.is_empty(), "terminal grapheme is empty");
         ensure!(
+            cell.grapheme.graphemes(true).count() == 1,
+            "terminal cell must contain exactly one grapheme"
+        );
+        ensure!(
             cell.grapheme.len() <= MAX_GRAPHEME_BYTES,
             "terminal grapheme is too large"
         );
@@ -901,6 +906,13 @@ mod tests {
                 .to_string()
                 .contains("alternate screen")
         );
+    }
+
+    #[test]
+    fn rejects_multiple_graphemes_in_one_cell() {
+        let mut state = valid_state();
+        state.primary.as_mut().unwrap().included_rows[0].cells[0].grapheme = "ab".into();
+        assert!(validate(&state).is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Astra server TerminalEngine
 
-状态：`TERM-03` 实现说明。本文描述服务端已经进入生产 PTY 数据路径的权威终端模型；wire attach 和 Apple replica 仍分别属于 `TERM-04` 与后续同步任务。
+状态：`TERM-03/04` 实现说明。服务端权威终端模型、可靠 semantic attach 和 Apple replica 已进入实现；增量同步、历史分页和输入模式仍属于后续任务。
 
 ## 权威数据路径
 
@@ -58,9 +58,9 @@ graphics、clipboard、notification、download 等未完成安全策略的 host 
 
 ## 迁移兼容边界
 
-旧 Apple/Rust 客户端目前只协商 `terminal.snapshot.ansi.v1`。为保持 N-1 客户端可连接，`TerminalEngine::legacy_snapshot` 将已经验证的语义 State 单向渲染为旧 `TerminalSnapshot`；它不是权威状态，也不回灌引擎。这是登记的 `PATCH-01`，只能在 `TERM-04` 删除，不能继续扩展字段或行为。
+旧 Apple/Rust CLI 只协商 `terminal.legacy_ansi_snapshot`。为保持 N-1 客户端可连接，`TerminalEngine::legacy_snapshot` 将已经验证的语义 State 单向渲染为旧 `TerminalSnapshot`；它不是权威状态，也不回灌引擎。这是隔离的 N-1 兼容路径，不能继续扩展字段或行为，并将在 application v4 最早删除。
 
-实时 attachment 仍发送 raw PTY output，客户端仍由 SwiftTerm 解析；这不构成第二套服务端权威状态，但意味着重连/历史正确性尚未完成。`terminal.state.semantic.v2` capability 必须等 `TERM-04` 的客户端 replica 和 wire 接入完成后才能启用。
+选择 `terminal.semantic_state` v2 的 attachment 不发送 raw PTY 或 ANSI snapshot，而是发送带整体 SHA-256 的可靠 `TerminalStateChunk`。Apple 客户端验证并原子发布完整 State，通过受控 SwiftTerm fork 的 cell import API 同时替换 primary/alternate buffer；未选择 capability 的客户端才进入上述 N-1 路径。当前每次输出发送完整 State，后续 `SYNC-01/02` 将加入 ACK 和累计 diff，不能改变这条单权威链路。
 
 ## Conformance evidence
 

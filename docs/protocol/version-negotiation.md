@@ -21,11 +21,15 @@
 | 名称 | v1 语义 | 当前 runtime 是否 offer | 开启条件 |
 |---|---|---|---|
 | `terminal.legacy_ansi_snapshot` | 旧 `TerminalSnapshot` + ANSI replay | 是 | 迁移期保留 |
-| `terminal.semantic_state` | `astra.terminal.v2.State` 语义状态 | 否 | `TERM-03`、`TERM-04` 完成并有双端测试 |
+| `terminal.semantic_state` | 可靠分片传输的 `astra.terminal.v2.State`；禁止混发 raw PTY | 是（Apple client/server v2） | `TERM-03`、`TERM-04` 已完成；CLI 未实现 replica，因此只 offer legacy capability |
 | `terminal.history_paging` | 使用 v2 `Anchor` 的历史分页 | 否 | `HIST-02` 完成 |
 | `terminal.datagram_state` | generation 累计 patch 可走 QUIC DATAGRAM | 否 | `SYNC-01` 至 `SYNC-03` 完成 |
 
 Capability 名称存在不代表实现完成。runtime support list 只能加入已经通过对应架构任务验收的能力；禁止为了让 UI 走新分支而提前 offer。
+
+managed 模式下，gateway 在认证和协商完成后为每条 Unix worker stream 先发送内部 `WorkerStreamHello`。worker 必须按自己的 runtime support 重新验证 application version、capability 名称、版本、重复项和数量；网络 client 不能直接提供这份受信选择。这样 rootless 和 managed attachment 使用同一份已验证 `NegotiatedProtocol`，不会由 `AttachRequest` 回显能力。
+
+semantic attachment 的 `AttachResponse` 不携带 legacy snapshot。服务端紧接着发送一个或多个有序 `TerminalStateChunk`：16-byte transfer ID、chunk index/count、总大小和整份 State 的 SHA-256。当前每片上限 512 KiB、整份 State 仍受 8 MiB schema 上限约束，因此最多 16 片。Apple client 只有在顺序、元数据、总大小、SHA-256、protobuf decode 和 State v2 validator 全部通过后才发布一次状态；任何失败都终止 attachment，不发布半份状态。
 
 ## N/N-1 行为矩阵
 
@@ -44,7 +48,7 @@ Capability 名称存在不代表实现完成。runtime support list 只能加入
 |---|---|---|---|
 | `AttachResponse.history` | deprecated fallback | `terminal.semantic_state` + `terminal.history_paging` 上线，所有受支持 client 已跨过 N-1 窗口 | application v4；删除时 reserve tag 4/name |
 | `TerminalSnapshot.contents/normal_contents` | deprecated fallback | `TERM-03`、`TERM-04` 完成，v2 semantic capability 稳定一个 release | application v4；删除 message 前 reserve 所有 tag/name |
-| `TerminalEvent.output` raw PTY | 迁移期主路径 | `SYNC-02` reliable semantic diff 覆盖，真实 TUI matrix 通过 | application v4；删除时 reserve tag 10/name |
+| `TerminalEvent.output` raw PTY | 仅未选择 semantic capability 的兼容路径 | N/N-1 迁移窗口结束，真实 TUI matrix 通过 | application v4；删除时 reserve tag 10/name |
 | `TerminalEvent.snapshot` legacy ANSI | deprecated fallback | 同 `TerminalSnapshot` | application v4；删除时 reserve tag 14/name |
 
 规则：一个字段在 N 标记 deprecated 后，至少完整支持 N/N-1 两个版本并经过一个发布窗口，才可在 N+2 停止发送；wire tag/name 最早在 N+2 schema 中 `reserved`，永不复用。实际删除还必须满足 `PROJECT_STATUS.md` 对应 PATCH/COMPAT 的移除条件，两者取更晚者。

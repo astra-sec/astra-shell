@@ -797,6 +797,9 @@ async fn attach_terminal(
                                             eprintln!("\r\n[astra: input lease was taken over; continuing read-only]");
                                         }
                                     }
+                                    Some(terminal_event::Event::SemanticStateChunk(_)) => {
+                                        return Err(anyhow!("server sent semantic terminal state to the ANSI command-line client"));
+                                    }
                                     None => {}
                                 }
                                 continue;

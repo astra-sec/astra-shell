@@ -21,8 +21,9 @@ use tracing::{info, warn};
 use crate::{
     accounts::{SystemAccount, effective_uid},
     files::FileService,
+    negotiation::{NegotiatedProtocol, selections},
     process_lock::ProcessLock,
-    protocol::{WireMessage, write_message},
+    protocol::{WireMessage, WorkerStreamHello, wire_message, write_message},
     server::handle_worker_request,
     terminal::TerminalManager,
 };
@@ -62,9 +63,18 @@ impl WorkerRouter {
         mut quic_send: quinn::SendStream,
         mut quic_recv: quinn::RecvStream,
         first_message: WireMessage,
+        negotiated: NegotiatedProtocol,
     ) -> Result<()> {
         let worker = self.connect(account).await?;
         let (mut worker_recv, mut worker_send) = worker.into_split();
+        write_message(
+            &mut worker_send,
+            &WireMessage::new(wire_message::Body::WorkerStreamHello(WorkerStreamHello {
+                protocol_version: negotiated.version,
+                capabilities: selections(&negotiated),
+            })),
+        )
+        .await?;
         write_message(&mut worker_send, &first_message).await?;
         let client_to_worker = async {
             copy(&mut quic_recv, &mut worker_send).await?;

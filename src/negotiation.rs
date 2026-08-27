@@ -28,7 +28,29 @@ pub struct ProtocolSupport {
 }
 
 impl ProtocolSupport {
+    /// Capabilities implemented by the daemon/worker data plane.
     pub fn runtime() -> Self {
+        Self {
+            minimum_version: MINIMUM_PROTOCOL_VERSION,
+            maximum_version: PROTOCOL_VERSION,
+            capabilities: vec![
+                CapabilityRange {
+                    name: CAPABILITY_LEGACY_ANSI_SNAPSHOT,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_SEMANTIC_STATE,
+                    minimum_version: 2,
+                    maximum_version: 2,
+                },
+            ],
+        }
+    }
+
+    /// Capabilities implemented by the command-line terminal renderer. The
+    /// native Apple client advertises its own semantic-state support.
+    pub fn command_line_client() -> Self {
         Self {
             minimum_version: MINIMUM_PROTOCOL_VERSION,
             maximum_version: PROTOCOL_VERSION,
@@ -143,6 +165,50 @@ pub fn selections(negotiated: &NegotiatedProtocol) -> Vec<CapabilitySelection> {
             version: *version,
         })
         .collect()
+}
+
+/// Revalidates gateway-selected connection metadata at the worker boundary.
+/// Workers never trust a network client's capability claims directly.
+pub fn validate_worker_selection(
+    version: u32,
+    selected: &[CapabilitySelection],
+    support: &ProtocolSupport,
+) -> Result<NegotiatedProtocol> {
+    validate_support(support)?;
+    ensure!(
+        (support.minimum_version..=support.maximum_version).contains(&version),
+        "worker stream selected an unsupported protocol version"
+    );
+    ensure!(
+        selected.len() <= MAX_CAPABILITIES,
+        "worker stream selected too many capabilities"
+    );
+    let supported: BTreeMap<_, _> = support
+        .capabilities
+        .iter()
+        .map(|capability| (capability.name, capability))
+        .collect();
+    let mut capabilities = BTreeMap::new();
+    for selection in selected {
+        validate_capability_name(&selection.name)?;
+        let capability = supported
+            .get(selection.name.as_str())
+            .ok_or_else(|| anyhow::anyhow!("worker stream selected an unknown capability"))?;
+        ensure!(
+            (capability.minimum_version..=capability.maximum_version).contains(&selection.version),
+            "worker stream selected an unsupported capability version"
+        );
+        ensure!(
+            capabilities
+                .insert(selection.name.clone(), selection.version)
+                .is_none(),
+            "worker stream selected a capability more than once"
+        );
+    }
+    Ok(NegotiatedProtocol {
+        version,
+        capabilities,
+    })
 }
 
 pub fn validate_server_hello(
@@ -367,5 +433,23 @@ mod tests {
             }],
         };
         assert!(validate_server_hello(&hello, &server).is_err());
+    }
+
+    #[test]
+    fn worker_revalidates_gateway_selection() {
+        let selection = vec![CapabilitySelection {
+            name: CAPABILITY_SEMANTIC_STATE.into(),
+            version: 2,
+        }];
+        let negotiated =
+            validate_worker_selection(PROTOCOL_VERSION, &selection, &ProtocolSupport::runtime())
+                .unwrap();
+        assert!(negotiated.has(CAPABILITY_SEMANTIC_STATE, 2));
+
+        let duplicate = [selection[0].clone(), selection[0].clone()];
+        assert!(
+            validate_worker_selection(PROTOCOL_VERSION, &duplicate, &ProtocolSupport::runtime(),)
+                .is_err()
+        );
     }
 }

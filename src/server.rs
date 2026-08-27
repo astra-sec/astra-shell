@@ -6,8 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use prost::Message;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{error, info, trace, warn};
 
@@ -16,14 +18,19 @@ use crate::{
     accounts::{SystemAccount, authorized_key_files, effective_uid},
     auth::{authentication_payload, verify_authorized_key, verify_authorized_keys},
     files::{FileResult, FileService},
-    negotiation::{NegotiatedProtocol, ProtocolSupport, negotiate_client_hello, selections},
+    negotiation::{
+        CAPABILITY_SEMANTIC_STATE, NegotiatedProtocol, ProtocolSupport, negotiate_client_hello,
+        selections, validate_worker_selection,
+    },
     process_lock::ProcessLock,
     protocol::{
         AckResponse, AttachResponse, AuthResult, ErrorResponse, LeaseChanged, ListResponse,
-        Response, ServerHello, SpawnResponse, TerminalEvent, WireMessage, read_message, request,
-        response, terminal_command, terminal_event, wire_message, write_message,
+        Response, ServerHello, SpawnResponse, TerminalEvent, TerminalStateChunk, WireMessage,
+        WorkerStreamHello, read_message, request, response, terminal_command, terminal_event,
+        wire_message, write_message,
     },
     terminal::{PtyEvent, Terminal, TerminalManager},
+    terminal_state_v2::{MAX_ENCODED_STATE_BYTES, State},
     worker::WorkerRouter,
 };
 
@@ -99,6 +106,8 @@ enum ConnectionBackend {
         account: SystemAccount,
     },
 }
+
+const TERMINAL_STATE_CHUNK_BYTES: usize = 512 * 1024;
 
 pub fn initialize_state(paths: &ServerPaths) -> Result<()> {
     fs::create_dir_all(&paths.state_dir)
@@ -355,6 +364,7 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
             Err(error) => return Err(error.into()),
         };
         let backend = backend.clone();
+        let negotiated = negotiated.clone();
         tokio::spawn(async move {
             let result: Result<()> = async {
                 let first_message = read_message(&mut recv)
@@ -365,11 +375,12 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
                 }
                 match backend {
                     ConnectionBackend::Local { manager, files } => {
-                        handle_worker_message(manager, files, send, recv, first_message).await
+                        handle_worker_message(manager, files, send, recv, first_message, negotiated)
+                            .await
                     }
                     ConnectionBackend::Worker { router, account } => {
                         router
-                            .proxy_stream(&account, send, recv, first_message)
+                            .proxy_stream(&account, send, recv, first_message, negotiated)
                             .await
                     }
                 }
@@ -561,10 +572,25 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let first_message = read_message(&mut recv)
+    let hello = read_message(&mut recv)
         .await?
         .context("request stream ended before its first message")?;
-    handle_worker_message(manager, files, send, recv, first_message).await
+    let negotiated = match hello {
+        WireMessage {
+            body:
+                Some(wire_message::Body::WorkerStreamHello(WorkerStreamHello {
+                    protocol_version,
+                    capabilities,
+                })),
+        } => {
+            validate_worker_selection(protocol_version, &capabilities, &ProtocolSupport::runtime())?
+        }
+        _ => bail!("expected WorkerStreamHello as first worker stream message"),
+    };
+    let request = read_message(&mut recv)
+        .await?
+        .context("worker stream ended before its request")?;
+    handle_worker_message(manager, files, send, recv, request, negotiated).await
 }
 
 async fn handle_worker_message<W, R>(
@@ -573,6 +599,7 @@ async fn handle_worker_message<W, R>(
     mut send: W,
     recv: R,
     first_message: WireMessage,
+    negotiated: NegotiatedProtocol,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -674,6 +701,7 @@ where
                 attach.resume_token,
                 send,
                 recv,
+                negotiated,
             )
             .await?;
             return Ok(());
@@ -920,6 +948,7 @@ async fn handle_attach<W, R>(
     resume_token: String,
     mut send: W,
     mut recv: R,
+    negotiated: NegotiatedProtocol,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -934,7 +963,14 @@ where
             return Ok(());
         }
     };
-    let (snapshot, mut events) = terminal.snapshot_and_subscribe()?;
+    let semantic = negotiated.has(CAPABILITY_SEMANTIC_STATE, 2);
+    let (snapshot, initial_state, mut events) = if semantic {
+        let (state, events) = terminal.semantic_state_and_subscribe()?;
+        (None, Some(state), events)
+    } else {
+        let (snapshot, events) = terminal.snapshot_and_subscribe()?;
+        (Some(snapshot), None, events)
+    };
     let info = terminal.info();
     send_response(
         &mut send,
@@ -945,10 +981,13 @@ where
             read_only,
             history: Vec::new(),
             resume_token: lease.resume_token.clone(),
-            snapshot: Some(snapshot),
+            snapshot,
         }),
     )
     .await?;
+    if let Some(state) = initial_state {
+        write_terminal_state(&mut send, &info.id, &state).await?;
+    }
 
     if info.status != "running" {
         write_terminal_event(
@@ -1011,11 +1050,16 @@ where
                 event = events.recv() => {
                     match event {
                         Ok(PtyEvent::Output(bytes)) => {
-                            write_terminal_event(
-                                &mut send,
-                                &info.id,
-                                terminal_event::Event::Output(bytes),
-                            ).await?;
+                            if semantic {
+                                let state = terminal.semantic_state()?;
+                                write_terminal_state(&mut send, &info.id, &state).await?;
+                            } else {
+                                write_terminal_event(
+                                    &mut send,
+                                    &info.id,
+                                    terminal_event::Event::Output(bytes),
+                                ).await?;
+                            }
                         }
                         Ok(PtyEvent::Exited(code)) => {
                             write_terminal_event(
@@ -1043,13 +1087,19 @@ where
                             // A tmux-style authoritative grid lets a slow client
                             // recover exactly instead of continuing after a gap
                             // in the byte stream.
-                            let (snapshot, replacement) = terminal.snapshot_and_subscribe()?;
-                            events = replacement;
-                            write_terminal_event(
-                                &mut send,
-                                &info.id,
-                                terminal_event::Event::Snapshot(snapshot),
-                            ).await?;
+                            if semantic {
+                                let (state, replacement) = terminal.semantic_state_and_subscribe()?;
+                                events = replacement;
+                                write_terminal_state(&mut send, &info.id, &state).await?;
+                            } else {
+                                let (snapshot, replacement) = terminal.snapshot_and_subscribe()?;
+                                events = replacement;
+                                write_terminal_event(
+                                    &mut send,
+                                    &info.id,
+                                    terminal_event::Event::Snapshot(snapshot),
+                                ).await?;
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
@@ -1125,11 +1175,53 @@ where
     .await
 }
 
+fn terminal_state_chunks(state: &State) -> Result<Vec<TerminalStateChunk>> {
+    let encoded = state.encode_to_vec();
+    if encoded.len() > MAX_ENCODED_STATE_BYTES {
+        bail!("terminal state exceeds the semantic state transport limit")
+    }
+    let transfer_id = uuid::Uuid::new_v4().as_bytes().to_vec();
+    let digest = Sha256::digest(&encoded).to_vec();
+    let chunk_count = encoded.len().max(1).div_ceil(TERMINAL_STATE_CHUNK_BYTES);
+    let total_size = u32::try_from(encoded.len())?;
+    let chunk_count = u32::try_from(chunk_count)?;
+    let mut chunks = Vec::with_capacity(chunk_count as usize);
+    for chunk_index in 0..chunk_count {
+        let start = chunk_index as usize * TERMINAL_STATE_CHUNK_BYTES;
+        let end = (start + TERMINAL_STATE_CHUNK_BYTES).min(encoded.len());
+        chunks.push(TerminalStateChunk {
+            transfer_id: transfer_id.clone(),
+            chunk_index,
+            chunk_count,
+            total_size,
+            sha256: digest.clone(),
+            data: encoded[start..end].to_vec(),
+        });
+    }
+    Ok(chunks)
+}
+
+async fn write_terminal_state<W>(send: &mut W, terminal_id: &str, state: &State) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    for chunk in terminal_state_chunks(state)? {
+        write_terminal_event(
+            send,
+            terminal_id,
+            terminal_event::Event::SemanticStateChunk(chunk),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::*;
+    use crate::terminal_engine::TerminalEngine;
 
     #[test]
     fn initialization_creates_private_state_without_overwriting_partial_identity() {
@@ -1157,5 +1249,34 @@ mod tests {
         let state = temporary.path().join("state");
         symlink(&actual, &state).unwrap();
         assert!(initialize_state(&ServerPaths::new(state)).is_err());
+    }
+
+    #[test]
+    fn semantic_state_transport_fragments_with_shared_identity_and_digest() {
+        let mut engine = TerminalEngine::new(2, 8, 8, Box::new(std::io::sink())).unwrap();
+        engine.advance(b"hello");
+        let mut state = engine.semantic_state().unwrap();
+        state.title = "x".repeat(TERMINAL_STATE_CHUNK_BYTES + 1);
+        let encoded = state.encode_to_vec();
+        let chunks = terminal_state_chunks(&state).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chunk_index, 0);
+        assert_eq!(chunks[1].chunk_index, 1);
+        assert_eq!(chunks[0].transfer_id.len(), 16);
+        assert_eq!(chunks[0].transfer_id, chunks[1].transfer_id);
+        assert_eq!(chunks[0].sha256, Sha256::digest(&encoded).to_vec());
+        assert_eq!(chunks.concat_data(), encoded);
+    }
+
+    trait ChunkTestData {
+        fn concat_data(&self) -> Vec<u8>;
+    }
+
+    impl ChunkTestData for [TerminalStateChunk] {
+        fn concat_data(&self) -> Vec<u8> {
+            self.iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect()
+        }
     }
 }

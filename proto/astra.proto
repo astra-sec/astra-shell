@@ -12,6 +12,8 @@ message WireMessage {
     TerminalCommand terminal_command = 6;
     TerminalEvent terminal_event = 7;
     ClientHello client_hello = 8;
+    // Gateway-to-worker metadata. Network clients must never send this.
+    WorkerStreamHello worker_stream_hello = 9;
   }
 }
 
@@ -39,6 +41,10 @@ message CapabilityOffer {
 message CapabilitySelection {
   string name = 1;
   uint32 version = 2;
+}
+message WorkerStreamHello {
+  uint32 protocol_version = 1;
+  repeated CapabilitySelection capabilities = 2;
 }
 message AuthRequest {
   string public_key = 1;
@@ -308,7 +314,18 @@ message TerminalEvent {
     bool interactive = 13;
     TerminalSnapshot snapshot = 14;
     LeaseChanged lease_changed = 15;
+    TerminalStateChunk semantic_state_chunk = 16;
   }
+}
+// One reliable fragment of an encoded astra.terminal.v2.State. The receiver
+// validates size, ordering, digest and the complete State before publication.
+message TerminalStateChunk {
+  bytes transfer_id = 1;
+  uint32 chunk_index = 2;
+  uint32 chunk_count = 3;
+  uint32 total_size = 4;
+  bytes sha256 = 5;
+  bytes data = 6;
 }
 message LeaseChanged {
   bool read_only = 1;

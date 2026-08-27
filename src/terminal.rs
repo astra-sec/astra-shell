@@ -120,6 +120,13 @@ impl Terminal {
         Ok((engine.semantic_state()?, receiver))
     }
 
+    pub fn semantic_state(&self) -> Result<State> {
+        self.engine
+            .lock()
+            .expect("terminal engine poisoned")
+            .semantic_state()
+    }
+
     pub fn subscribe_to_leases(&self) -> broadcast::Receiver<LeaseEvent> {
         self.lease_events.subscribe()
     }
