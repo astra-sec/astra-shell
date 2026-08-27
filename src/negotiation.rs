@@ -155,6 +155,13 @@ pub fn negotiate_client_hello(
             capabilities.insert(supported.name.to_owned(), capability_maximum);
         }
     }
+    if capabilities.contains_key(CAPABILITY_CLIPBOARD_WRITE)
+        && !capabilities
+            .get(CAPABILITY_SEMANTIC_STATE)
+            .is_some_and(|version| *version >= 2)
+    {
+        capabilities.remove(CAPABILITY_CLIPBOARD_WRITE);
+    }
 
     Ok(NegotiatedProtocol {
         version: maximum,
@@ -211,6 +218,7 @@ pub fn validate_worker_selection(
             "worker stream selected a capability more than once"
         );
     }
+    validate_capability_dependencies(&capabilities)?;
     Ok(NegotiatedProtocol {
         version,
         capabilities,
@@ -253,6 +261,7 @@ pub fn validate_server_hello(
             selected.name
         );
     }
+    validate_capability_dependencies(&capabilities)?;
     Ok(NegotiatedProtocol {
         version: server.protocol_version,
         capabilities,
@@ -349,6 +358,17 @@ fn validate_capability_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_capability_dependencies(capabilities: &BTreeMap<String, u32>) -> Result<()> {
+    ensure!(
+        !capabilities.contains_key(CAPABILITY_CLIPBOARD_WRITE)
+            || capabilities
+                .get(CAPABILITY_SEMANTIC_STATE)
+                .is_some_and(|version| *version >= 2),
+        "terminal.clipboard_write requires terminal.semantic_state v2"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use prost::Message;
@@ -418,6 +438,32 @@ mod tests {
         let negotiated = validate_server_hello(&new_client, &old_server).unwrap();
         assert_eq!(negotiated.version, MINIMUM_PROTOCOL_VERSION);
         assert!(negotiated.capabilities.is_empty());
+    }
+
+    #[test]
+    fn clipboard_write_is_never_selected_without_semantic_state_v2() {
+        let support = ProtocolSupport::runtime();
+        let mut hello = client_hello("client", &support);
+        hello
+            .capabilities
+            .retain(|offer| offer.name == CAPABILITY_CLIPBOARD_WRITE);
+        let negotiated = negotiate_client_hello(&hello, &support).unwrap();
+        assert!(!negotiated.has(CAPABILITY_CLIPBOARD_WRITE, 1));
+
+        let mut valid_hello = client_hello("client", &support);
+        valid_hello.capabilities.retain(|offer| {
+            offer.name == CAPABILITY_CLIPBOARD_WRITE || offer.name == CAPABILITY_SEMANTIC_STATE
+        });
+        let invalid_server = ServerHello {
+            protocol_version: PROTOCOL_VERSION,
+            challenge: vec![],
+            server_instance: String::new(),
+            capabilities: vec![CapabilitySelection {
+                name: CAPABILITY_CLIPBOARD_WRITE.into(),
+                version: 1,
+            }],
+        };
+        assert!(validate_server_hello(&valid_hello, &invalid_server).is_err());
     }
 
     #[test]
