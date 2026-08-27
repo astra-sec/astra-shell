@@ -25,12 +25,14 @@ use crate::protocol::{
     GitStatusRequest, GitStatusResponse, ReadFileChunkRequest, UploadStatusResponse,
     WatchFilesRequest, WriteFileChunkRequest,
 };
+use crate::resources::{
+    QuotaExceeded, ResourceAccount, ResourceClaim, ResourcePolicy, ResourceReservation,
+};
 
 pub const FILE_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FILE_CHUNK_SIZE: usize = 1024 * 1024;
 const MAX_DIRECTORY_PAGE_SIZE: usize = 500;
 const MAX_REMOTE_PATH_SIZE: usize = 16 * 1024;
-const MAX_TRACKED_UPLOADS: usize = 128;
 const MAX_GIT_STATUS_SIZE: usize = 4 * 1024 * 1024;
 const MAX_GIT_STATUS_ENTRIES: usize = 20_000;
 const MAX_WATCHED_FILES: usize = 128;
@@ -60,6 +62,10 @@ impl FileServiceError {
             _ => "filesystem",
         };
         Self::new(code, format!("{action}: {error}"))
+    }
+
+    fn quota(error: QuotaExceeded) -> Self {
+        Self::new("quota", error.to_string())
     }
 }
 
@@ -163,7 +169,6 @@ impl UploadState {
     }
 }
 
-#[derive(Clone, Debug)]
 struct Upload {
     transfer_id: String,
     requested_path: Vec<u8>,
@@ -175,6 +180,7 @@ struct Upload {
     mode: u32,
     committed_offset: u64,
     state: UploadState,
+    _resources: Option<ResourceReservation>,
 }
 
 impl Upload {
@@ -195,10 +201,18 @@ impl Upload {
 pub struct FileService {
     root: Arc<PathBuf>,
     uploads: Arc<Mutex<HashMap<String, Upload>>>,
+    resources: ResourceAccount,
 }
 
 impl FileService {
     pub fn new(root: PathBuf) -> FileResult<Self> {
+        let policy = ResourcePolicy::default();
+        let resources = ResourceAccount::standalone("file service", policy.user)
+            .map_err(|error| FileServiceError::new("quota", error.to_string()))?;
+        Self::with_resources(root, resources)
+    }
+
+    pub fn with_resources(root: PathBuf, resources: ResourceAccount) -> FileResult<Self> {
         let root = root.canonicalize().map_err(|error| {
             FileServiceError::io(format!("invalid file root {}", root.display()), error)
         })?;
@@ -211,6 +225,7 @@ impl FileService {
         Ok(Self {
             root: Arc::new(root),
             uploads: Arc::new(Mutex::new(HashMap::new())),
+            resources,
         })
     }
 
@@ -423,15 +438,7 @@ impl FileService {
             }
             return Ok(existing.status());
         }
-        if uploads.len() >= MAX_TRACKED_UPLOADS {
-            uploads.retain(|_, upload| upload.state == UploadState::Active);
-            if uploads.len() >= MAX_TRACKED_UPLOADS {
-                return Err(FileServiceError::new(
-                    "quota",
-                    format!("at most {MAX_TRACKED_UPLOADS} uploads may be active"),
-                ));
-            }
-        }
+        uploads.retain(|_, upload| upload.state == UploadState::Active);
 
         if target.exists() {
             let target_metadata = fs::metadata(&target).map_err(|error| {
@@ -453,6 +460,7 @@ impl FileService {
                     mode,
                     committed_offset: request.size,
                     state: UploadState::Completed,
+                    _resources: None,
                 };
                 let status = completed.status();
                 uploads.insert(request.transfer_id, completed);
@@ -465,6 +473,11 @@ impl FileService {
                 ));
             }
         }
+
+        let resources = self
+            .resources
+            .reserve(ResourceClaim::upload(request.size))
+            .map_err(FileServiceError::quota)?;
 
         let file = open_upload_file(&temporary)?;
         let committed_offset = file
@@ -496,6 +509,7 @@ impl FileService {
             mode,
             committed_offset,
             state: UploadState::Active,
+            _resources: Some(resources),
         };
         let status = upload.status();
         uploads.insert(request.transfer_id, upload);
@@ -676,6 +690,7 @@ impl FileService {
             let _ = directory.sync_all();
         }
         upload.state = UploadState::Completed;
+        upload._resources.take();
         Ok(upload.status())
     }
 
@@ -697,6 +712,7 @@ impl FileService {
                 }
             }
             upload.state = UploadState::Aborted;
+            upload._resources.take();
         }
         Ok(upload.status())
     }
@@ -1310,6 +1326,79 @@ mod tests {
             "completed"
         );
         assert_eq!(fs::read(root.path().join("resumed.txt")).unwrap(), contents);
+    }
+
+    #[test]
+    fn upload_count_and_bytes_are_reserved_until_abort() {
+        let root = tempfile::tempdir().unwrap();
+        let mut policy = ResourcePolicy::default();
+        policy.user.uploads = 1;
+        policy.user.upload_bytes = 4;
+        let resources = ResourceAccount::standalone("test user", policy.user).unwrap();
+        let service = FileService::with_resources(root.path().to_path_buf(), resources).unwrap();
+        let first_id = Uuid::new_v4().to_string();
+        service
+            .begin_upload(BeginUploadRequest {
+                transfer_id: first_id.clone(),
+                path: b"first.bin".to_vec(),
+                size: 4,
+                sha256: Vec::new(),
+                overwrite: false,
+                mode: 0o600,
+            })
+            .unwrap();
+        let second_id = Uuid::new_v4().to_string();
+        let error = service
+            .begin_upload(BeginUploadRequest {
+                transfer_id: second_id.clone(),
+                path: b"second.bin".to_vec(),
+                size: 1,
+                sha256: Vec::new(),
+                overwrite: false,
+                mode: 0o600,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "quota");
+        service.abort_upload(&first_id).unwrap();
+        assert!(
+            service
+                .begin_upload(BeginUploadRequest {
+                    transfer_id: second_id,
+                    path: b"second.bin".to_vec(),
+                    size: 1,
+                    sha256: Vec::new(),
+                    overwrite: false,
+                    mode: 0o600,
+                })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn upload_byte_quota_fails_before_creating_a_temporary_file() {
+        let root = tempfile::tempdir().unwrap();
+        let mut policy = ResourcePolicy::default();
+        policy.user.upload_bytes = 3;
+        let resources = ResourceAccount::standalone("test user", policy.user).unwrap();
+        let service = FileService::with_resources(root.path().to_path_buf(), resources).unwrap();
+        let transfer_id = Uuid::new_v4().to_string();
+        let error = service
+            .begin_upload(BeginUploadRequest {
+                transfer_id: transfer_id.clone(),
+                path: b"too-large.bin".to_vec(),
+                size: 4,
+                sha256: Vec::new(),
+                overwrite: false,
+                mode: 0o600,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "quota");
+        assert!(
+            !root
+                .path()
+                .join(format!(".astra-upload-{transfer_id}.part"))
+                .exists()
+        );
     }
 
     #[test]
