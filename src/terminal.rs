@@ -22,6 +22,7 @@ use crate::protocol::{
     TerminalLifecycle, TerminalSnapshot,
 };
 use crate::{
+    resources::{ResourceAccount, ResourceClaim, ResourcePolicy, ResourceReservation},
     terminal_engine::TerminalEngine,
     terminal_state_v2::{HistoryPage, HistoryPageRequest, State},
 };
@@ -79,6 +80,7 @@ pub struct LeaseGrant {
 }
 
 pub struct Terminal {
+    _resources: ResourceReservation,
     info: RwLock<TerminalInfo>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -324,10 +326,23 @@ pub struct TerminalManager {
     terminals: Arc<RwLock<HashMap<String, Arc<Terminal>>>>,
     next_display_id: Arc<Mutex<u64>>,
     session_root: PathBuf,
+    resources: ResourceAccount,
+    resource_policy: ResourcePolicy,
 }
 
 impl TerminalManager {
     pub fn new(session_root: PathBuf) -> Result<Self> {
+        let policy = ResourcePolicy::default();
+        let resources = ResourceAccount::standalone("terminal manager", policy.user)?;
+        Self::with_resources(session_root, resources, policy)
+    }
+
+    pub fn with_resources(
+        session_root: PathBuf,
+        resources: ResourceAccount,
+        resource_policy: ResourcePolicy,
+    ) -> Result<Self> {
+        resource_policy.validate()?;
         let session_root = session_root
             .canonicalize()
             .with_context(|| format!("invalid session root {}", session_root.display()))?;
@@ -335,6 +350,8 @@ impl TerminalManager {
             terminals: Arc::new(RwLock::new(HashMap::new())),
             next_display_id: Arc::new(Mutex::new(1)),
             session_root,
+            resources,
+            resource_policy,
         })
     }
 
@@ -411,6 +428,9 @@ impl TerminalManager {
             bail!("argv[0] cannot be empty")
         }
 
+        let resource_claim = ResourceClaim::terminal(rows, cols, &self.resource_policy)?;
+        let resources = self.resources.reserve(resource_claim)?;
+
         let display_id = self.allocate_display_id()?;
         let id = Uuid::new_v4().to_string();
         let name = if request.name.is_empty() {
@@ -477,6 +497,7 @@ impl TerminalManager {
             lifecycle: TerminalLifecycle::Running as i32,
         };
         let terminal = Arc::new(Terminal {
+            _resources: resources,
             info: RwLock::new(info),
             master: Mutex::new(pty.master),
             writer: writer.clone(),

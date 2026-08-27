@@ -16,6 +16,7 @@ use crate::{
         AttachmentInfo, AttachmentRole, AttachmentState, SessionCatalog, SpawnRequest,
         TerminalInfo, WorkspaceInfo,
     },
+    resources::{ResourceAccount, ResourceClaim, ResourcePolicy, ResourceReservation},
     terminal::{Terminal, TerminalManager},
 };
 
@@ -29,11 +30,14 @@ pub struct SessionManager {
     catalog: Arc<RwLock<SessionCatalog>>,
     catalog_path: Arc<PathBuf>,
     attachments: Arc<RwLock<HashMap<String, AttachmentInfo>>>,
+    resources: ResourceAccount,
+    resource_policy: ResourcePolicy,
 }
 
 pub struct ActiveAttachment {
     manager: SessionManager,
     info: AttachmentInfo,
+    _resources: ResourceReservation,
 }
 
 impl ActiveAttachment {
@@ -60,14 +64,40 @@ impl Drop for ActiveAttachment {
 
 impl SessionManager {
     pub fn new(session_root: PathBuf, catalog_path: PathBuf) -> Result<Self> {
-        let terminals = TerminalManager::new(session_root)?;
+        let policy = ResourcePolicy::default();
+        let resources = ResourceAccount::standalone("session", policy.user)?;
+        Self::with_resources(session_root, catalog_path, resources, policy)
+    }
+
+    pub fn with_resources(
+        session_root: PathBuf,
+        catalog_path: PathBuf,
+        resources: ResourceAccount,
+        resource_policy: ResourcePolicy,
+    ) -> Result<Self> {
+        resource_policy.validate()?;
+        let terminals = TerminalManager::with_resources(
+            session_root,
+            resources.clone(),
+            resource_policy.clone(),
+        )?;
         let catalog = load_or_create_catalog(&catalog_path)?;
         Ok(Self {
             terminals,
             catalog: Arc::new(RwLock::new(catalog)),
             catalog_path: Arc::new(catalog_path),
             attachments: Arc::new(RwLock::new(HashMap::new())),
+            resources,
+            resource_policy,
         })
+    }
+
+    pub fn resource_account(&self) -> ResourceAccount {
+        self.resources.clone()
+    }
+
+    pub fn resource_policy(&self) -> &ResourcePolicy {
+        &self.resource_policy
     }
 
     pub fn session_root(&self) -> &Path {
@@ -234,6 +264,7 @@ impl SessionManager {
     ) -> Result<ActiveAttachment> {
         validate_uuid(connection_id, "connection ID")?;
         self.workspace(&terminal.workspace_id)?;
+        let resources = self.resources.reserve(ResourceClaim::attachment())?;
         let info = AttachmentInfo {
             id: Uuid::new_v4().to_string(),
             connection_id: connection_id.to_owned(),
@@ -254,6 +285,7 @@ impl SessionManager {
         Ok(ActiveAttachment {
             manager: self.clone(),
             info,
+            _resources: resources,
         })
     }
 
@@ -459,6 +491,22 @@ mod tests {
         SessionManager::new(root, directory.path().join("session-catalog.pb")).unwrap()
     }
 
+    fn manager_with_policy(
+        directory: &tempfile::TempDir,
+        policy: ResourcePolicy,
+    ) -> SessionManager {
+        let root = directory.path().join("home");
+        fs::create_dir(&root).unwrap();
+        let resources = ResourceAccount::standalone("test user", policy.user).unwrap();
+        SessionManager::with_resources(
+            root,
+            directory.path().join("session-catalog.pb"),
+            resources,
+            policy,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn workspace_catalog_persists_uuid_revision_and_safe_deletion() {
         let directory = tempfile::tempdir().unwrap();
@@ -513,6 +561,68 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn attachment_quota_rejects_before_registry_mutation_and_releases_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut policy = ResourcePolicy::default();
+        policy.user.attachments = 1;
+        let manager = manager_with_policy(&directory, policy);
+        let workspace_id = manager.default_workspace_id();
+        let terminal = TerminalInfo {
+            id: Uuid::new_v4().to_string(),
+            workspace_id: workspace_id.clone(),
+            ..Default::default()
+        };
+        let connection_id = Uuid::new_v4().to_string();
+        let first = manager
+            .register_attachment(&connection_id, &terminal, true)
+            .unwrap();
+        let error = manager
+            .register_attachment(&connection_id, &terminal, true)
+            .err()
+            .expect("second attachment should exceed quota");
+        assert!(
+            error
+                .downcast_ref::<crate::resources::QuotaExceeded>()
+                .is_some()
+        );
+        assert_eq!(
+            manager.list_attachments(&workspace_id, "").unwrap().len(),
+            1
+        );
+        drop(first);
+        assert!(
+            manager
+                .register_attachment(&connection_id, &terminal, true)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_quota_rejects_new_pty_without_ending_the_active_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut policy = ResourcePolicy::default();
+        policy.user.terminals = 1;
+        let manager = manager_with_policy(&directory, policy);
+        let request = SpawnRequest {
+            argv: vec!["/bin/sleep".into(), "30".into()],
+            workspace_id: manager.default_workspace_id(),
+            ..Default::default()
+        };
+        let first = manager.spawn(request.clone(), true).unwrap();
+        let error = manager
+            .spawn(request, true)
+            .err()
+            .expect("second terminal should exceed quota");
+        assert!(
+            error
+                .downcast_ref::<crate::resources::QuotaExceeded>()
+                .is_some()
+        );
+        assert_eq!(first.info().status, "running");
+        first.kill().unwrap();
     }
 
     #[test]
