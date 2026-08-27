@@ -5,7 +5,7 @@ use astra_wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
 use astra_wezterm_term::{
     AstraCellView, AstraCursorShape, AstraCursorView, AstraKeyboardEncoding, AstraModesView,
     AstraMouseEncoding, AstraMouseTracking, AstraRowView, AstraScreenKind, AstraScreenView,
-    CellAttributes, Terminal, TerminalConfiguration, TerminalSize,
+    CellAttributes, Clipboard, Terminal, TerminalConfiguration, TerminalSize,
 };
 use uuid::Uuid;
 
@@ -58,7 +58,7 @@ impl TerminalEngine {
         );
         let config = Arc::new(AstraTerminalConfiguration { scrollback_rows });
         let terminal = Terminal::new(
-            terminal_size(rows, columns),
+            terminal_size(rows, columns, 0, 0),
             config,
             "Astra",
             env!("CARGO_PKG_VERSION"),
@@ -79,13 +79,24 @@ impl TerminalEngine {
         self.terminal.advance_bytes(bytes);
     }
 
-    pub fn resize(&mut self, rows: u32, columns: u32) -> Result<()> {
+    pub fn set_clipboard(&mut self, clipboard: &Arc<dyn Clipboard>) {
+        self.terminal.set_clipboard(clipboard);
+    }
+
+    pub fn resize(
+        &mut self,
+        rows: u32,
+        columns: u32,
+        pixel_width: u32,
+        pixel_height: u32,
+    ) -> Result<()> {
         ensure!(
             (1..=terminal_state_v2::MAX_DIMENSION).contains(&rows)
                 && (1..=terminal_state_v2::MAX_DIMENSION).contains(&columns),
             "terminal dimensions are out of range"
         );
-        self.terminal.resize(terminal_size(rows, columns));
+        self.terminal
+            .resize(terminal_size(rows, columns, pixel_width, pixel_height));
         Ok(())
     }
 
@@ -334,12 +345,12 @@ fn push_legacy_color(codes: &mut Vec<String>, color: Option<&Color>, prefix: u32
     }
 }
 
-fn terminal_size(rows: u32, columns: u32) -> TerminalSize {
+fn terminal_size(rows: u32, columns: u32, pixel_width: u32, pixel_height: u32) -> TerminalSize {
     TerminalSize {
         rows: rows as usize,
         cols: columns as usize,
-        pixel_width: 0,
-        pixel_height: 0,
+        pixel_width: pixel_width as usize,
+        pixel_height: pixel_height as usize,
         dpi: 0,
     }
 }
@@ -771,9 +782,7 @@ mod tests {
         let sink = ReplySink::default();
         let mut engine = TerminalEngine::new(3, 12, 32, Box::new(sink)).unwrap();
 
-        engine.advance(
-            b"\x1b[?1h\x1b=\x1b[?9h\x1b[?1006h\x1b[?1007l\x1b[?2004h\x1b[=5u",
-        );
+        engine.advance(b"\x1b[?1h\x1b=\x1b[?9h\x1b[?1006h\x1b[?1007l\x1b[?2004h\x1b[=5u");
         let state = engine.semantic_state().unwrap();
         let modes = state.modes.unwrap();
 
@@ -807,7 +816,7 @@ mod tests {
             .unwrap()
             .logical_line_id;
 
-        engine.resize(3, 5).unwrap();
+        engine.resize(3, 5, 0, 0).unwrap();
         let after = engine.semantic_state().unwrap();
         let after_rows = &after.primary.as_ref().unwrap().included_rows;
         assert!(
@@ -889,5 +898,49 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(&*captured.lock().unwrap(), b"\x1b[1;1R");
+    }
+
+    #[test]
+    fn terminal_capability_queries_report_real_geometry_and_deny_private_data() {
+        let sink = ReplySink::default();
+        let captured = sink.0.clone();
+        let mut engine = TerminalEngine::new(24, 80, 0, Box::new(sink)).unwrap();
+        engine.resize(30, 100, 1000, 600).unwrap();
+        engine.advance(b"\x1b[c\x1b[5n\x1b[18t\x1b[16t\x1b[14t\x1b[21t\x1b]52;c;?\x07");
+
+        for _ in 0..100 {
+            if captured.lock().unwrap().len() >= 30 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let replies = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(replies.contains("\x1b[?65;6;18;22c"), "{replies:?}");
+        assert!(!replies.contains(";52c"), "{replies:?}");
+        assert!(replies.contains("\x1b[0n"), "{replies:?}");
+        assert!(replies.contains("\x1b[8;30;100t"), "{replies:?}");
+        assert!(replies.contains("\x1b[6;20;10t"), "{replies:?}");
+        assert!(replies.contains("\x1b[4;600;1000t"), "{replies:?}");
+        assert!(
+            !replies.contains("]l"),
+            "title reporting must remain disabled"
+        );
+        assert!(
+            !replies.contains("]52;"),
+            "clipboard reads must never be answered"
+        );
+    }
+
+    #[test]
+    fn pixel_queries_safely_degrade_when_the_client_cannot_measure_pixels() {
+        let sink = ReplySink::default();
+        let captured = sink.0.clone();
+        let mut engine = TerminalEngine::new(24, 80, 0, Box::new(sink)).unwrap();
+        engine.advance(b"\x1b[16t\x1b[14t");
+
+        for _ in 0..10 {
+            std::thread::yield_now();
+        }
+        assert!(captured.lock().unwrap().is_empty());
     }
 }

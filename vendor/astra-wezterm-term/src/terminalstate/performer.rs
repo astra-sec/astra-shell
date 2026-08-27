@@ -814,6 +814,9 @@ impl<'a> Performer<'a> {
             }
             OperatingSystemCommand::ITermProprietary(iterm) => match iterm {
                 ITermProprietary::RequestCellSize => {
+                    if self.pixel_width == 0 || self.pixel_height == 0 {
+                        return;
+                    }
                     let screen = self.screen();
                     let height = screen.physical_rows;
                     let width = screen.physical_cols;

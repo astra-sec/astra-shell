@@ -11,6 +11,7 @@ use std::{
 use std::fs;
 
 use anyhow::{Context, Result, anyhow, bail};
+use astra_wezterm_term::{Clipboard, ClipboardSelection as EngineClipboardSelection};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::broadcast;
 use tracing::warn;
@@ -29,6 +30,7 @@ const MAX_TERM_LENGTH: usize = 64;
 const MAX_LOCALE_VALUE_LENGTH: usize = 256;
 const MAX_PROGRAM_TITLE_LENGTH: usize = 512;
 const SAFE_BASE_ENVIRONMENT: &[&str] = &["HOME", "USER", "LOGNAME", "SHELL", "PATH"];
+const MAX_CLIPBOARD_WRITE_BYTES: usize = 256 * 1024;
 const UTF8_LOCALE_FALLBACKS: &[&str] = &["C.UTF-8", "C.utf8", "UTF-8", "en_US.UTF-8"];
 
 struct PreparedTerminalEnvironment {
@@ -43,6 +45,16 @@ pub enum PtyEvent {
     Exited(i32),
     Error(String),
     Interactive(bool),
+    ClipboardWrite {
+        selection: ClipboardSelection,
+        contents: Option<Vec<u8>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardSelection {
+    Clipboard,
+    Primary,
 }
 
 #[derive(Clone, Debug)]
@@ -219,24 +231,38 @@ impl Terminal {
         Ok(())
     }
 
-    pub fn resize(&self, lease_id: &str, sequence: u64, rows: u32, cols: u32) -> Result<()> {
+    pub fn resize(
+        &self,
+        lease_id: &str,
+        sequence: u64,
+        rows: u32,
+        cols: u32,
+        pixel_width: u32,
+        pixel_height: u32,
+    ) -> Result<()> {
         if !(1..=1000).contains(&rows) || !(1..=1000).contains(&cols) {
             bail!("terminal dimensions must be between 1 and 1000")
+        }
+        if (pixel_width == 0) != (pixel_height == 0)
+            || pixel_width > u16::MAX as u32
+            || pixel_height > u16::MAX as u32
+        {
+            bail!("terminal pixel dimensions must both be zero or between 1 and 65535")
         }
         let mut lease = self.validate_lease(lease_id, sequence)?;
         // Resize the server grid before notifying the PTY. The foreground
         // process may redraw immediately after TIOCSWINSZ, and those bytes must
         // be parsed using the new geometry.
         let mut engine = self.engine.lock().expect("terminal engine poisoned");
-        engine.resize(rows, cols)?;
+        engine.resize(rows, cols, pixel_width, pixel_height)?;
         self.master
             .lock()
             .expect("terminal master poisoned")
             .resize(PtySize {
                 rows: rows as u16,
                 cols: cols as u16,
-                pixel_width: 0,
-                pixel_height: 0,
+                pixel_width: pixel_width as u16,
+                pixel_height: pixel_height as u16,
             })?;
         {
             let mut info = self.info.write().expect("terminal info poisoned");
@@ -423,7 +449,13 @@ impl TerminalManager {
             writer: writer.clone(),
             child: Mutex::new(child),
             shell_pid,
-            engine: Mutex::new(initial_terminal_engine(rows, cols, default_shell, writer)?),
+            engine: Mutex::new(initial_terminal_engine(
+                rows,
+                cols,
+                default_shell,
+                writer,
+                events.clone(),
+            )?),
             events,
             lease_events,
             lease: Mutex::new(None),
@@ -524,11 +556,40 @@ impl Write for HostReplyWriter {
     }
 }
 
+struct HostClipboard {
+    events: broadcast::Sender<PtyEvent>,
+}
+
+impl Clipboard for HostClipboard {
+    fn set_contents(
+        &self,
+        selection: EngineClipboardSelection,
+        data: Option<String>,
+    ) -> Result<()> {
+        if data
+            .as_ref()
+            .is_some_and(|contents| contents.len() > MAX_CLIPBOARD_WRITE_BYTES)
+        {
+            bail!("OSC 52 clipboard write exceeds the 256 KiB host-effect limit")
+        }
+        let selection = match selection {
+            EngineClipboardSelection::Clipboard => ClipboardSelection::Clipboard,
+            EngineClipboardSelection::PrimarySelection => ClipboardSelection::Primary,
+        };
+        let _ = self.events.send(PtyEvent::ClipboardWrite {
+            selection,
+            contents: data.map(String::into_bytes),
+        });
+        Ok(())
+    }
+}
+
 fn initial_terminal_engine(
     rows: u32,
     cols: u32,
     include_welcome: bool,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    events: broadcast::Sender<PtyEvent>,
 ) -> Result<TerminalEngine> {
     let mut engine = TerminalEngine::new(
         rows,
@@ -536,6 +597,8 @@ fn initial_terminal_engine(
         SCREEN_SCROLLBACK_ROWS,
         Box::new(HostReplyWriter(writer)),
     )?;
+    let clipboard: Arc<dyn Clipboard> = Arc::new(HostClipboard { events });
+    engine.set_clipboard(&clipboard);
     if include_welcome && let Some(banner) = system_welcome_banner() {
         engine.advance(&banner);
     }
@@ -887,7 +950,7 @@ mod tests {
             TerminalEngine::new(8, 30, SCREEN_SCROLLBACK_ROWS, Box::new(std::io::sink())).unwrap();
         engine.advance(b"\x1b[2J\x1b[Hshell history\r\n$ codex");
         engine.advance(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[1;36mCodex\x1b[0m");
-        engine.resize(10, 36).unwrap();
+        engine.resize(10, 36, 0, 0).unwrap();
         engine.advance(b"\x1b[2J\x1b[H\x1b[1;36mCodex\x1b[0m\r\n");
         // Split a multi-byte wide character exactly as separate PTY reads can.
         let wide = "状态：运行中 ✅".as_bytes();
@@ -969,6 +1032,38 @@ mod tests {
         );
         engine.advance(b"\x1b]2;   \x07");
         assert_eq!(clean_program_title(engine.title().as_bytes()), None);
+    }
+
+    #[test]
+    fn osc_52_is_a_bounded_write_only_host_effect() {
+        let (events, _) = broadcast::channel(8);
+        let mut receiver = events.subscribe();
+        let clipboard: Arc<dyn Clipboard> = Arc::new(HostClipboard {
+            events: events.clone(),
+        });
+        let mut engine = TerminalEngine::new(24, 80, 0, Box::new(std::io::sink())).unwrap();
+        engine.set_clipboard(&clipboard);
+
+        engine.advance(b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            PtyEvent::ClipboardWrite {
+                selection: ClipboardSelection::Clipboard,
+                contents: Some(contents),
+            } if contents == b"hello"
+        ));
+
+        engine.advance(b"\x1b]52;c;?\x07");
+        assert!(receiver.try_recv().is_err());
+        assert!(
+            clipboard
+                .set_contents(
+                    EngineClipboardSelection::Clipboard,
+                    Some("x".repeat(MAX_CLIPBOARD_WRITE_BYTES + 1)),
+                )
+                .is_err()
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]

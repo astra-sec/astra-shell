@@ -12,6 +12,7 @@ pub const CAPABILITY_LEGACY_ANSI_SNAPSHOT: &str = "terminal.legacy_ansi_snapshot
 pub const CAPABILITY_SEMANTIC_STATE: &str = "terminal.semantic_state";
 pub const CAPABILITY_HISTORY_PAGING: &str = "terminal.history_paging";
 pub const CAPABILITY_DATAGRAM_STATE: &str = "terminal.datagram_state";
+pub const CAPABILITY_CLIPBOARD_WRITE: &str = "terminal.clipboard_write";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityRange {
@@ -43,6 +44,11 @@ impl ProtocolSupport {
                     name: CAPABILITY_SEMANTIC_STATE,
                     minimum_version: 2,
                     maximum_version: 2,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_CLIPBOARD_WRITE,
+                    minimum_version: 1,
+                    maximum_version: 1,
                 },
             ],
         }

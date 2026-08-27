@@ -304,6 +304,10 @@ message TerminalCommand {
 message Resize {
   uint32 rows = 1;
   uint32 cols = 2;
+  // Physical size of the same text area. Both are zero when the client cannot
+  // measure pixels; otherwise both must be non-zero.
+  uint32 pixel_width = 3;
+  uint32 pixel_height = 4;
 }
 message TerminalEvent {
   string terminal_id = 1;
@@ -315,7 +319,18 @@ message TerminalEvent {
     TerminalSnapshot snapshot = 14;
     LeaseChanged lease_changed = 15;
     TerminalStateChunk semantic_state_chunk = 16;
+    ClipboardWrite clipboard_write = 17;
   }
+}
+enum ClipboardSelection {
+  CLIPBOARD_SELECTION_UNSPECIFIED = 0;
+  CLIPBOARD_SELECTION_CLIPBOARD = 1;
+  CLIPBOARD_SELECTION_PRIMARY = 2;
+}
+message ClipboardWrite {
+  ClipboardSelection selection = 1;
+  bytes contents = 2;
+  bool clear = 3;
 }
 // One reliable fragment of an encoded astra.terminal.v2.State. The receiver
 // validates size, ordering, digest and the complete State before publication.

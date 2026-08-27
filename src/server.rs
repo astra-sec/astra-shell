@@ -19,17 +19,18 @@ use crate::{
     auth::{authentication_payload, verify_authorized_key, verify_authorized_keys},
     files::{FileResult, FileService},
     negotiation::{
-        CAPABILITY_SEMANTIC_STATE, NegotiatedProtocol, ProtocolSupport, negotiate_client_hello,
-        selections, validate_worker_selection,
+        CAPABILITY_CLIPBOARD_WRITE, CAPABILITY_SEMANTIC_STATE, NegotiatedProtocol, ProtocolSupport,
+        negotiate_client_hello, selections, validate_worker_selection,
     },
     process_lock::ProcessLock,
     protocol::{
-        AckResponse, AttachResponse, AuthResult, ErrorResponse, LeaseChanged, ListResponse,
-        Response, ServerHello, SpawnResponse, TerminalEvent, TerminalStateChunk, WireMessage,
-        WorkerStreamHello, read_message, request, response, terminal_command, terminal_event,
-        wire_message, write_message,
+        AckResponse, AttachResponse, AuthResult, ClipboardSelection as WireClipboardSelection,
+        ClipboardWrite, ErrorResponse, LeaseChanged, ListResponse, Response, ServerHello,
+        SpawnResponse, TerminalEvent, TerminalStateChunk, WireMessage, WorkerStreamHello,
+        read_message, request, response, terminal_command, terminal_event, wire_message,
+        write_message,
     },
-    terminal::{PtyEvent, Terminal, TerminalManager},
+    terminal::{ClipboardSelection, PtyEvent, Terminal, TerminalManager},
     terminal_state_v2::{MAX_ENCODED_STATE_BYTES, State},
     worker::WorkerRouter,
 };
@@ -964,6 +965,7 @@ where
         }
     };
     let semantic = negotiated.has(CAPABILITY_SEMANTIC_STATE, 2);
+    let clipboard_write = semantic && negotiated.has(CAPABILITY_CLIPBOARD_WRITE, 1);
     let (snapshot, initial_state, mut events) = if semantic {
         let (state, events) = terminal.semantic_state_and_subscribe()?;
         (None, Some(state), events)
@@ -1022,6 +1024,8 @@ where
                                         command.sequence,
                                         size.rows,
                                         size.cols,
+                                        size.pixel_width,
+                                        size.pixel_height,
                                     )?;
                                 }
                                 Some(terminal_command::Command::Detach(_)) | None => break,
@@ -1082,6 +1086,25 @@ where
                                 &info.id,
                                 terminal_event::Event::Interactive(interactive),
                             ).await?;
+                        }
+                        Ok(PtyEvent::ClipboardWrite { selection, contents }) => {
+                            if clipboard_write {
+                                let selection = match selection {
+                                    ClipboardSelection::Clipboard => {
+                                        WireClipboardSelection::Clipboard
+                                    }
+                                    ClipboardSelection::Primary => WireClipboardSelection::Primary,
+                                };
+                                write_terminal_event(
+                                    &mut send,
+                                    &info.id,
+                                    terminal_event::Event::ClipboardWrite(ClipboardWrite {
+                                        selection: selection as i32,
+                                        clear: contents.is_none(),
+                                        contents: contents.unwrap_or_default(),
+                                    }),
+                                ).await?;
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             // A tmux-style authoritative grid lets a slow client

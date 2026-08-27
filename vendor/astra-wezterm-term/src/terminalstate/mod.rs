@@ -1318,7 +1318,6 @@ impl TerminalState {
                 ident.push_str(";6"); // Selective erase
                 ident.push_str(";18"); // windowing extensions
                 ident.push_str(";22"); // ANSI color, vt525
-                ident.push_str(";52"); // Clipboard access
                 ident.push('c');
 
                 self.writer.write(ident.as_bytes()).ok();
@@ -2089,6 +2088,9 @@ impl TerminalState {
             }
 
             Window::ReportCellSizePixels => {
+                if self.pixel_width == 0 || self.pixel_height == 0 {
+                    return;
+                }
                 let screen = self.screen();
                 let height = screen.physical_rows;
                 let width = screen.physical_cols;
@@ -2101,6 +2103,9 @@ impl TerminalState {
             }
 
             Window::ReportTextAreaSizePixels => {
+                if self.pixel_width == 0 || self.pixel_height == 0 {
+                    return;
+                }
                 let response = Box::new(Window::ResizeWindowPixels {
                     width: Some(self.pixel_width as i64),
                     height: Some(self.pixel_height as i64),

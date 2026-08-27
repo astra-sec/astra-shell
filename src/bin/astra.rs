@@ -747,6 +747,8 @@ async fn attach_terminal(
                     command: Some(terminal_command::Command::Resize(Resize {
                         rows: rows as u32,
                         cols: cols as u32,
+                        pixel_width: 0,
+                        pixel_height: 0,
                     })),
                 },
             )
@@ -800,6 +802,9 @@ async fn attach_terminal(
                                     Some(terminal_event::Event::SemanticStateChunk(_)) => {
                                         return Err(anyhow!("server sent semantic terminal state to the ANSI command-line client"));
                                     }
+                                    Some(terminal_event::Event::ClipboardWrite(_)) => {
+                                        return Err(anyhow!("server sent an unnegotiated clipboard host effect"));
+                                    }
                                     None => {}
                                 }
                                 continue;
@@ -851,6 +856,8 @@ async fn attach_terminal(
                                 command: Some(terminal_command::Command::Resize(Resize {
                                     rows: rows as u32,
                                     cols: cols as u32,
+                                    pixel_width: 0,
+                                    pixel_height: 0,
                                 })),
                             },
                         ).await {

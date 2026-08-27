@@ -653,18 +653,25 @@ pub struct Resize {
     pub rows: u32,
     #[prost(uint32, tag = "2")]
     pub cols: u32,
+    #[prost(uint32, tag = "3")]
+    pub pixel_width: u32,
+    #[prost(uint32, tag = "4")]
+    pub pixel_height: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub struct TerminalEvent {
     #[prost(string, tag = "1")]
     pub terminal_id: String,
-    #[prost(oneof = "terminal_event::Event", tags = "10, 11, 12, 13, 14, 15, 16")]
+    #[prost(
+        oneof = "terminal_event::Event",
+        tags = "10, 11, 12, 13, 14, 15, 16, 17"
+    )]
     pub event: Option<terminal_event::Event>,
 }
 
 pub mod terminal_event {
-    use super::{LeaseChanged, TerminalSnapshot, TerminalStateChunk};
+    use super::{ClipboardWrite, LeaseChanged, TerminalSnapshot, TerminalStateChunk};
 
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Event {
@@ -682,7 +689,27 @@ pub mod terminal_event {
         LeaseChanged(LeaseChanged),
         #[prost(message, tag = "16")]
         SemanticStateChunk(TerminalStateChunk),
+        #[prost(message, tag = "17")]
+        ClipboardWrite(ClipboardWrite),
     }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ClipboardWrite {
+    #[prost(enumeration = "ClipboardSelection", tag = "1")]
+    pub selection: i32,
+    #[prost(bytes = "vec", tag = "2")]
+    pub contents: Vec<u8>,
+    #[prost(bool, tag = "3")]
+    pub clear: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum ClipboardSelection {
+    Unspecified = 0,
+    Clipboard = 1,
+    Primary = 2,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -770,5 +797,33 @@ mod tests {
         let terminal = TerminalInfo::decode(encoded.as_slice()).unwrap();
         assert_eq!(terminal.id, "legacy");
         assert_eq!(terminal.display_id, 0);
+    }
+
+    #[test]
+    fn terminal_geometry_and_host_effect_fields_are_n_minus_one_safe() {
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyResize {
+            #[prost(uint32, tag = "1")]
+            rows: u32,
+            #[prost(uint32, tag = "2")]
+            cols: u32,
+        }
+
+        let resize = Resize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 600,
+        };
+        let legacy = LegacyResize::decode(resize.encode_to_vec().as_slice()).unwrap();
+        assert_eq!((legacy.rows, legacy.cols), (30, 100));
+
+        let decoded = Resize::decode(
+            LegacyResize { rows: 24, cols: 80 }
+                .encode_to_vec()
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!((decoded.pixel_width, decoded.pixel_height), (0, 0));
     }
 }

@@ -22,6 +22,7 @@
 |---|---|---|---|
 | `terminal.legacy_ansi_snapshot` | 旧 `TerminalSnapshot` + ANSI replay | 是 | 迁移期保留 |
 | `terminal.semantic_state` | 可靠分片传输的 `astra.terminal.v2.State`；禁止混发 raw PTY | 是（Apple client/server v2） | `TERM-03`、`TERM-04` 已完成；CLI 未实现 replica，因此只 offer legacy capability |
+| `terminal.clipboard_write` | semantic attachment 上的 OSC 52 单向、受限剪贴板写事件；不包含读取 | 是（Apple client/server v1） | 必须同时选择 `terminal.semantic_state` v2；CLI 不 offer |
 | `terminal.history_paging` | 使用 v2 `Anchor` 的历史分页 | 否 | `HIST-02` 完成 |
 | `terminal.datagram_state` | generation 累计 patch 可走 QUIC DATAGRAM | 否 | `SYNC-01` 至 `SYNC-03` 完成 |
 

@@ -1,6 +1,6 @@
 # Astra server TerminalEngine
 
-状态：`TERM-03/04` 实现说明。服务端权威终端模型、可靠 semantic attach 和 Apple replica 已进入实现；增量同步、历史分页和输入模式仍属于后续任务。
+状态：`TERM-03` 至 `TERM-06` 服务端实现说明。服务端权威终端模型、可靠 semantic attach、输入模式与宿主能力边界已经实现；增量同步和历史分页仍属于后续任务。
 
 ## 权威数据路径
 
@@ -52,7 +52,9 @@ wire generation 和 row/cursor version 相对于当前 epoch 计算。新 epoch 
 
 WezTerm 的 DA/DSR 等 PTY reply 通过宿主提供的 writer 回写同一个 PTY。writer 与用户输入共用 mutex，避免字节交错；reply 不经过客户端 round trip。
 
-graphics、clipboard、notification、download 等未完成安全策略的 host effects 不得因为 parser 能识别就自动变成 Astra capability。它们属于 `TERM-06`，必须经过显式能力与安全决策。
+DA/DSR 和尺寸查询由服务端直接回答。字符尺寸始终可用；像素尺寸由客户端随 `Resize` 提交，两个像素字段必须同时为零或同时有效。像素未知时，服务端不伪造 `0x0` 响应，而是对像素查询安全地不响应。title reporting、checksum、graphics、notification 和 download 默认关闭且不在 DA 中宣称。
+
+OSC 52 是单向、显式协商的 host effect：服务端最多接受 256 KiB UTF-8 写入，通过 `terminal.clipboard_write` v1 结构化事件交给 semantic client；query 永不读取或回传客户端剪贴板，未协商的 attachment 不收到事件。Primary DA 不宣称通用 clipboard access。OSC 8 hyperlink 只作为语义 State 数据传输，是否打开以及允许的 URL scheme 必须由客户端在用户点击时决定。
 
 每次语义导出都运行 Terminal State v2 validator；超出 schema 大小、引用或 enum 约束时返回错误并拒绝整个 State，不部分发送，也不 panic。历史总容量、按字节配额和分页不是本任务职责，仍由 `HIST-01` 至 `HIST-03` 与 `OPS-01` 完成。
 
@@ -70,7 +72,8 @@ graphics、clipboard、notification、download 等未完成安全策略的 host 
 - resize/reflow 后 logical line ID 与 wire epoch 保持。
 - retained rows 上方结构插入会轮换 epoch，并从 generation 1 重新开始。
 - primary history 与 alternate viewport 共享 schema 的 4096-row 总预算；截取后仍完整包含当前 primary viewport。
-- DSR host reply 写入宿主 sink。
+- DA/DSR、字符/像素尺寸查询写入宿主 sink；未知像素、title 和 OSC 52 read 安全降级。
+- OSC 52 write 形成有大小上限的结构化 host effect，超限写入被拒绝。
 - RIS 后旧内容不再进入后续语义 State；ANSI 兼容视图从语义 State 生成。
 
 独立 fork package 也必须能在默认 `astra-headless` feature 下完成 `cargo test`。完整 server suite 是最终集成门禁。
