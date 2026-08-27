@@ -18,7 +18,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::protocol::{
-    EnvironmentVariable, LOCALE_ENVIRONMENT_VARIABLES, SpawnRequest, TerminalInfo, TerminalSnapshot,
+    EnvironmentVariable, LOCALE_ENVIRONMENT_VARIABLES, SpawnRequest, TerminalInfo,
+    TerminalLifecycle, TerminalSnapshot,
 };
 use crate::{
     terminal_engine::TerminalEngine,
@@ -456,6 +457,8 @@ impl TerminalManager {
             display_id,
             custom_name: None,
             interactive: Some(true),
+            workspace_id: request.workspace_id,
+            lifecycle: TerminalLifecycle::Running as i32,
         };
         let terminal = Arc::new(Terminal {
             info: RwLock::new(info),
@@ -1093,6 +1096,7 @@ mod tests {
                 cols: 80,
                 term: "xterm-256color".into(),
                 environment: Vec::new(),
+                workspace_id: String::new(),
             })
             .unwrap();
         assert!(manager.has_active_terminals());

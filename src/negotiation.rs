@@ -13,6 +13,7 @@ pub const CAPABILITY_SEMANTIC_STATE: &str = "terminal.semantic_state";
 pub const CAPABILITY_HISTORY_PAGING: &str = "terminal.history_paging";
 pub const CAPABILITY_DATAGRAM_STATE: &str = "terminal.datagram_state";
 pub const CAPABILITY_CLIPBOARD_WRITE: &str = "terminal.clipboard_write";
+pub const CAPABILITY_SESSION_OBJECTS: &str = "session.objects";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityRange {
@@ -52,6 +53,11 @@ impl ProtocolSupport {
                 },
                 CapabilityRange {
                     name: CAPABILITY_CLIPBOARD_WRITE,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_SESSION_OBJECTS,
                     minimum_version: 1,
                     maximum_version: 1,
                 },
@@ -413,6 +419,20 @@ mod tests {
         assert_eq!(
             validate_server_hello(&hello, &server_hello).unwrap(),
             negotiated
+        );
+    }
+
+    #[test]
+    fn runtime_peers_negotiate_formal_session_objects() {
+        let support = ProtocolSupport::runtime();
+        let hello = client_hello("astra", &support);
+        let negotiated = negotiate_client_hello(&hello, &support).unwrap();
+        assert!(negotiated.has(CAPABILITY_SESSION_OBJECTS, 1));
+        assert!(
+            !ProtocolSupport::command_line_client()
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == CAPABILITY_SESSION_OBJECTS)
         );
     }
 

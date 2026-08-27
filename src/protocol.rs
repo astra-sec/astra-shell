@@ -105,6 +105,8 @@ pub struct WorkerStreamHello {
     pub protocol_version: u32,
     #[prost(message, repeated, tag = "2")]
     pub capabilities: Vec<CapabilitySelection>,
+    #[prost(string, tag = "3")]
+    pub connection_id: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -129,7 +131,7 @@ pub struct Request {
     pub request_id: String,
     #[prost(
         oneof = "request::Command",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35"
     )]
     pub command: Option<request::Command>,
 }
@@ -179,6 +181,18 @@ pub mod request {
         WatchFiles(WatchFilesRequest),
         #[prost(message, tag = "29")]
         RenameTerminal(RenameTerminalRequest),
+        #[prost(message, tag = "30")]
+        ListWorkspaces(ListWorkspacesRequest),
+        #[prost(message, tag = "31")]
+        CreateWorkspace(CreateWorkspaceRequest),
+        #[prost(message, tag = "32")]
+        RenameWorkspace(RenameWorkspaceRequest),
+        #[prost(message, tag = "33")]
+        DeleteWorkspace(DeleteWorkspaceRequest),
+        #[prost(message, tag = "34")]
+        ListTerminals(ListTerminalsRequest),
+        #[prost(message, tag = "35")]
+        ListAttachments(ListAttachmentsRequest),
     }
 }
 
@@ -201,6 +215,8 @@ pub struct SpawnRequest {
     pub term: String,
     #[prost(message, repeated, tag = "7")]
     pub environment: Vec<EnvironmentVariable>,
+    #[prost(string, tag = "8")]
+    pub workspace_id: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -221,12 +237,16 @@ pub struct AttachRequest {
     pub takeover: bool,
     #[prost(string, tag = "4")]
     pub resume_token: String,
+    #[prost(string, tag = "5")]
+    pub workspace_id: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub struct CloseRequest {
     #[prost(string, tag = "1")]
     pub terminal_id: String,
+    #[prost(string, tag = "2")]
+    pub workspace_id: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -235,6 +255,47 @@ pub struct RenameTerminalRequest {
     pub terminal_id: String,
     #[prost(string, tag = "2")]
     pub name: String,
+    #[prost(string, tag = "3")]
+    pub workspace_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ListWorkspacesRequest {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CreateWorkspaceRequest {
+    #[prost(string, tag = "1")]
+    pub name: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RenameWorkspaceRequest {
+    #[prost(string, tag = "1")]
+    pub workspace_id: String,
+    #[prost(string, tag = "2")]
+    pub name: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DeleteWorkspaceRequest {
+    #[prost(string, tag = "1")]
+    pub workspace_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ListTerminalsRequest {
+    #[prost(string, tag = "1")]
+    pub workspace_id: String,
+    #[prost(bool, tag = "2")]
+    pub include_exited: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ListAttachmentsRequest {
+    #[prost(string, tag = "1")]
+    pub workspace_id: String,
+    #[prost(string, tag = "2")]
+    pub terminal_id: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -364,7 +425,7 @@ pub struct Response {
     pub request_id: String,
     #[prost(
         oneof = "response::Result",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26"
     )]
     pub result: Option<response::Result>,
 }
@@ -400,6 +461,14 @@ pub mod response {
         GitStatus(GitStatusResponse),
         #[prost(message, tag = "22")]
         FileChanges(FileChangesResponse),
+        #[prost(message, tag = "23")]
+        WorkspaceList(WorkspaceListResponse),
+        #[prost(message, tag = "24")]
+        Workspace(WorkspaceResponse),
+        #[prost(message, tag = "25")]
+        TerminalList(TerminalListResponse),
+        #[prost(message, tag = "26")]
+        AttachmentList(AttachmentListResponse),
     }
 }
 
@@ -565,6 +634,20 @@ pub struct TerminalInfo {
     pub custom_name: Option<String>,
     #[prost(bool, optional, tag = "11")]
     pub interactive: Option<bool>,
+    #[prost(string, tag = "12")]
+    pub workspace_id: String,
+    #[prost(enumeration = "TerminalLifecycle", tag = "13")]
+    pub lifecycle: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum TerminalLifecycle {
+    Unspecified = 0,
+    Creating = 1,
+    Running = 2,
+    Exited = 3,
+    Archived = 4,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -577,6 +660,89 @@ pub struct ListResponse {
 pub struct SpawnResponse {
     #[prost(message, optional, tag = "1")]
     pub terminal: Option<TerminalInfo>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct WorkspaceInfo {
+    #[prost(string, tag = "1")]
+    pub id: String,
+    #[prost(string, tag = "2")]
+    pub name: String,
+    #[prost(uint64, tag = "3")]
+    pub revision: u64,
+    #[prost(uint64, tag = "4")]
+    pub created_at_unix_ms: u64,
+    #[prost(bool, tag = "5")]
+    pub is_default: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct WorkspaceListResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub workspaces: Vec<WorkspaceInfo>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct WorkspaceResponse {
+    #[prost(message, optional, tag = "1")]
+    pub workspace: Option<WorkspaceInfo>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TerminalListResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub terminals: Vec<TerminalInfo>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum AttachmentRole {
+    Unspecified = 0,
+    Viewer = 1,
+    Controller = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum AttachmentState {
+    Unspecified = 0,
+    Subscribing = 1,
+    Snapshotting = 2,
+    Live = 3,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AttachmentInfo {
+    #[prost(string, tag = "1")]
+    pub id: String,
+    #[prost(string, tag = "2")]
+    pub connection_id: String,
+    #[prost(string, tag = "3")]
+    pub workspace_id: String,
+    #[prost(string, tag = "4")]
+    pub terminal_id: String,
+    #[prost(enumeration = "AttachmentRole", tag = "5")]
+    pub role: i32,
+    #[prost(enumeration = "AttachmentState", tag = "6")]
+    pub state: i32,
+    #[prost(uint64, tag = "7")]
+    pub created_at_unix_ms: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AttachmentListResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub attachments: Vec<AttachmentInfo>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SessionCatalog {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub default_workspace_id: String,
+    #[prost(message, repeated, tag = "3")]
+    pub workspaces: Vec<WorkspaceInfo>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -607,6 +773,8 @@ pub struct AttachResponse {
     pub resume_token: String,
     #[prost(message, optional, tag = "6")]
     pub snapshot: Option<TerminalSnapshot>,
+    #[prost(message, optional, tag = "7")]
+    pub attachment: Option<AttachmentInfo>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -631,6 +799,8 @@ pub struct TerminalCommand {
     pub lease_id: String,
     #[prost(uint64, tag = "3")]
     pub sequence: u64,
+    #[prost(string, tag = "4")]
+    pub attachment_id: String,
     #[prost(oneof = "terminal_command::Command", tags = "10, 11, 12, 13")]
     pub command: Option<terminal_command::Command>,
 }
@@ -667,6 +837,8 @@ pub struct Resize {
 pub struct TerminalEvent {
     #[prost(string, tag = "1")]
     pub terminal_id: String,
+    #[prost(string, tag = "2")]
+    pub attachment_id: String,
     #[prost(
         oneof = "terminal_event::Event",
         tags = "10, 11, 12, 13, 14, 15, 16, 17, 18"
@@ -895,6 +1067,7 @@ mod tests {
             terminal_id: "terminal".into(),
             lease_id: String::new(),
             sequence: 1,
+            attachment_id: "attachment".into(),
             command: Some(terminal_command::Command::HistoryPage(HistoryPageRequest {
                 epoch: vec![1; 16],
                 before: Some(crate::terminal_state_v2::Anchor {
@@ -910,6 +1083,7 @@ mod tests {
 
         let event = TerminalEvent {
             terminal_id: "terminal".into(),
+            attachment_id: "attachment".into(),
             event: Some(terminal_event::Event::HistoryPageChunk(HistoryPageChunk {
                 transfer_id: vec![2; 16],
                 chunk_index: 0,
@@ -922,5 +1096,46 @@ mod tests {
         let legacy = LegacyTerminalEvent::decode(event.encode_to_vec().as_slice()).unwrap();
         assert_eq!(legacy.terminal_id, "terminal");
         assert!(legacy.event.is_none());
+    }
+
+    #[test]
+    fn session_object_fields_are_additive_for_n_minus_one_messages() {
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacySpawnRequest {
+            #[prost(string, tag = "1")]
+            name: String,
+        }
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyRequest {
+            #[prost(string, tag = "1")]
+            request_id: String,
+            #[prost(oneof = "legacy_request::Command", tags = "10, 11, 12, 13")]
+            command: Option<legacy_request::Command>,
+        }
+        mod legacy_request {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Command {
+                #[prost(message, tag = "10")]
+                List(super::ListRequest),
+                #[prost(message, tag = "11")]
+                Spawn(super::ListRequest),
+            }
+        }
+
+        let spawn = SpawnRequest {
+            name: "shell".into(),
+            workspace_id: "workspace".into(),
+            ..Default::default()
+        };
+        let legacy = LegacySpawnRequest::decode(spawn.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy.name, "shell");
+
+        let request = Request {
+            request_id: "request".into(),
+            command: Some(request::Command::ListWorkspaces(ListWorkspacesRequest {})),
+        };
+        let legacy = LegacyRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy.request_id, "request");
+        assert!(legacy.command.is_none());
     }
 }

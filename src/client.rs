@@ -247,7 +247,10 @@ impl AstraClient {
 
     pub async fn close(&self, terminal_id: String) -> Result<String> {
         let response = self
-            .unary(request::Command::Close(CloseRequest { terminal_id }))
+            .unary(request::Command::Close(CloseRequest {
+                terminal_id,
+                workspace_id: String::new(),
+            }))
             .await?;
         match response.result {
             Some(response::Result::Ack(ack)) => Ok(ack.message),
@@ -274,6 +277,7 @@ impl AstraClient {
                     read_only,
                     takeover,
                     resume_token,
+                    workspace_id: String::new(),
                 })),
             })),
         )

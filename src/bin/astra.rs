@@ -202,6 +202,7 @@ async fn run() -> Result<()> {
                     cols: 80,
                     term: client_term()?,
                     environment: client_locale_environment()?,
+                    workspace_id: String::new(),
                 })
                 .await?;
             attach_terminal(client, terminal.id, false, false).await?;
@@ -249,6 +250,7 @@ async fn run() -> Result<()> {
                     cols: arguments.cols,
                     term: client_term()?,
                     environment: client_locale_environment()?,
+                    workspace_id: String::new(),
                 })
                 .await?;
             println!("{}", terminal_reference(&terminal));
@@ -744,6 +746,7 @@ async fn attach_terminal(
                     terminal_id: terminal_id.clone(),
                     lease_id: lease_id.clone(),
                     sequence,
+                    attachment_id: String::new(),
                     command: Some(terminal_command::Command::Resize(Resize {
                         rows: rows as u32,
                         cols: cols as u32,
@@ -826,6 +829,7 @@ async fn attach_terminal(
                                     terminal_id: terminal_id.clone(),
                                     lease_id: lease_id.clone(),
                                     sequence,
+                                    attachment_id: String::new(),
                                     command: Some(terminal_command::Command::Detach(true)),
                                 },
                             ).await;
@@ -838,6 +842,7 @@ async fn attach_terminal(
                                 terminal_id: terminal_id.clone(),
                                 lease_id: lease_id.clone(),
                                 sequence,
+                                attachment_id: String::new(),
                                 command: Some(terminal_command::Command::Input(input[..length].to_vec())),
                             },
                         ).await {
@@ -856,6 +861,7 @@ async fn attach_terminal(
                                 terminal_id: terminal_id.clone(),
                                 lease_id: lease_id.clone(),
                                 sequence,
+                                attachment_id: String::new(),
                                 command: Some(terminal_command::Command::Resize(Resize {
                                     rows: rows as u32,
                                     cols: cols as u32,

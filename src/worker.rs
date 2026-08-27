@@ -72,6 +72,7 @@ impl WorkerRouter {
             &WireMessage::new(wire_message::Body::WorkerStreamHello(WorkerStreamHello {
                 protocol_version: negotiated.version,
                 capabilities: selections(&negotiated),
+                connection_id: String::new(),
             })),
         )
         .await?;

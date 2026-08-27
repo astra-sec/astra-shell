@@ -585,6 +585,7 @@ where
                 Some(wire_message::Body::WorkerStreamHello(WorkerStreamHello {
                     protocol_version,
                     capabilities,
+                    ..
                 })),
         } => {
             validate_worker_selection(protocol_version, &capabilities, &ProtocolSupport::runtime())?
@@ -859,6 +860,22 @@ where
             .await?;
             send_file_ack(&mut send, request_id, result, "file renamed").await?;
         }
+        Some(
+            request::Command::ListWorkspaces(_)
+            | request::Command::CreateWorkspace(_)
+            | request::Command::RenameWorkspace(_)
+            | request::Command::DeleteWorkspace(_)
+            | request::Command::ListTerminals(_)
+            | request::Command::ListAttachments(_),
+        ) => {
+            send_error(
+                &mut send,
+                request_id,
+                "unsupported",
+                anyhow!("session.objects runtime is not enabled"),
+            )
+            .await?;
+        }
         None => {
             send_error(
                 &mut send,
@@ -988,6 +1005,7 @@ where
             history: Vec::new(),
             resume_token: lease.resume_token.clone(),
             snapshot,
+            attachment: None,
         }),
     )
     .await?;
@@ -1203,6 +1221,7 @@ where
         send,
         &WireMessage::new(wire_message::Body::TerminalEvent(TerminalEvent {
             terminal_id: terminal_id.into(),
+            attachment_id: String::new(),
             event: Some(event),
         })),
     )
