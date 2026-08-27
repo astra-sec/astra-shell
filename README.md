@@ -69,6 +69,24 @@ Rootless 模式使用 `state/authorized_keys`，daemon 只能代表启动它的 
 
 `astrad` 默认以前台模式运行，适合由 systemd、launchd 或其他进程管理器托管。
 
+### 资源配额
+
+Rootless 与 managed 模式使用同一套分层 `ResourceGovernor`。默认每用户允许 8 个认证连接、256 条活动 Stream、64 个 Terminal、256 个 Attachment、256 MiB Terminal 基础内存容量、512 MiB history 容量、256 个活动文件操作、16 个活动 upload 和 8 GiB 声明 upload bytes。每个 Terminal admission 至少预留 4 MiB 基础内存和 8 MiB history；大初始网格会增加基础内存 claim。
+
+所有限制都能从 `astrad serve --help` 中的 `--max-global-*`、`--max-user-*` 和 `--terminal-*` 参数覆盖。例如：
+
+```bash
+./target/debug/astrad serve \
+  --listen 127.0.0.1:4433 \
+  --state-dir state \
+  --session-root /home/mimi/astra-shell \
+  --max-user-terminals 32 \
+  --max-user-history-mib 1024 \
+  --terminal-history-mib 16
+```
+
+多个维度同时生效，实际可创建数量由最先耗尽的维度决定。0 不表示无限，零值或 global 无法容纳一个完整 user capacity 的配置会在 daemon 启动前失败。超限返回稳定的 `quota` 错误，只拒绝新资源，不结束已经运行的 Terminal。managed gateway 按 UID 预留完整 user worker capacity，root gateway 不解析 Terminal 内容；内部 worker 不能接受客户端自报或提高的配额。完整所有权与默认值见 [`docs/adr/0003-resource-quota-model.md`](docs/adr/0003-resource-quota-model.md)。
+
 ### 启动客户端
 
 连接参数采用 SSH 风格的 `[USER@]HOST`、`-p PORT`、`-l USER` 和 `-i IDENTITY`。不写 `-i` 时依次尝试 `~/.ssh/id_ed25519` 和 `~/.ssh/id_rsa`；不写用户时使用 `USER`/`LOGNAME`。下面的开发凭据位于项目 `state/`，所以显式使用 `-i`：
@@ -235,17 +253,17 @@ cargo clippy --all-targets -- -D warnings
 ./scripts/managed-smoke.sh
 ```
 
-两个 smoke test 都只在 `.local-test/` 内生成一次性服务端、SSH 密钥和 Astra known-hosts。它们会验证首次 `accept-new`、后续严格主机校验以及显式证书 pin。Managed 测试还会验证目标 UID、跨账户拒绝、UTF-8 locale fallback、`TERM`/`IUTF8` 以及 gateway 重启后 PTY 恢复。
+两个 smoke test 都只在 `.local-test/` 内生成一次性服务端、SSH 密钥和 Astra known-hosts。它们会验证首次 `accept-new`、后续严格主机校验以及显式证书 pin。Rootless 测试还会以一个 Terminal 的低配额重启 daemon，验证第二个 Terminal 收到 `quota` 且已 admission 的 Terminal 不受影响。Managed 测试会验证目标 UID、跨账户拒绝、UTF-8 locale fallback、`TERM`/`IUTF8` 以及 gateway 重启后 PTY 恢复。
 
 ## MVP 边界
 
 这还不是完整产品：
 
 - managed 模式已经按 Unix 账户、supplementary groups、GID 和 UID 隔离，但尚未接入 PAM、账户锁定/过期策略；
-- 尚未实现按来源地址的认证速率限制、连接配额和审计日志后端，公开暴露前仍需补齐并接受独立安全审计；
+- 已实现认证后连接、Stream、worker、Terminal/Attachment、容量和文件/upload 配额；尚未实现认证前按来源地址的速率限制、Retry 和审计日志后端，公开暴露前仍需补齐并接受独立安全审计；
 - 认证兼容 OpenSSH Ed25519/RSA 密钥格式和 `authorized_keys`，客户端会自动选择 `~/.ssh/id_ed25519` 或 `~/.ssh/id_rsa`，但暂不支持 ssh-agent、加密私钥、ECDSA、SSH 用户证书及 authorized_keys options；
 - QUIC 主机身份已经支持独立的 SSH 式 TOFU 文件，但当前 pin 的是完整自签名证书；正式的证书轮换机制尚未实现；
-- 保存的是有界原始输出，不是语义 screen/grid 快照；
+- 服务端维护唯一权威语义 screen/grid/history 并向新客户端发送 State v2；原始输出/ANSI snapshot 只保留为登记的 N/N-1 兼容路径；
 - 暂无 QUIC DATAGRAM 累计状态同步、预测和端口转发；Astra Files/1 已支持单文件传输和基本目录操作，但尚未提供递归目录同步、稀疏文件、ACL/xattr 和 GUI；
 - 暂无 SSH stdio fallback；
 - rootless 模式的 PTY 仍由 gateway 进程持有；managed 模式已经使用可跨 gateway 重启存活、空闲时自动回收的独立用户 worker，但尚未提供正式的 worker 升级管理命令。
