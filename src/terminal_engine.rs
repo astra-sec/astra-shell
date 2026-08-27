@@ -298,6 +298,15 @@ impl TerminalEngine {
         )
     }
 
+    #[cfg(test)]
+    fn oldest_history_identity(&self) -> Option<(u64, usize)> {
+        let view = self.terminal.astra_view();
+        (view.primary.history_row_count() > 0).then(|| {
+            let identity = view.primary.rows(0, 1).next().unwrap().identity;
+            (identity.logical_line_id, identity.cell_offset)
+        })
+    }
+
     /// Transitional serializer for clients that negotiated the registered
     /// legacy ANSI capability. This is derived from semantic state and is
     /// never fed back into the authoritative engine.
@@ -1238,27 +1247,11 @@ mod tests {
         let (history_rows, history_bytes) = engine.history_usage();
         assert_eq!(history_rows, 10_000);
         assert!(history_bytes <= limits.bytes);
-        let before = engine.semantic_state().unwrap();
-        let before_oldest = before
-            .primary
-            .as_ref()
-            .unwrap()
-            .oldest_available
-            .as_ref()
-            .unwrap()
-            .logical_line_id;
+        let before_oldest = engine.oldest_history_identity().unwrap();
 
         engine.advance(b"y\r\n");
         assert_eq!(engine.history_usage().0, 10_000);
-        let after = engine.semantic_state().unwrap();
-        let after_oldest = after
-            .primary
-            .as_ref()
-            .unwrap()
-            .oldest_available
-            .as_ref()
-            .unwrap()
-            .logical_line_id;
+        let after_oldest = engine.oldest_history_identity().unwrap();
         assert!(after_oldest > before_oldest);
     }
 
@@ -1431,6 +1424,34 @@ mod tests {
         assert!(reset.reset_required);
         assert!(reset.included_rows.is_empty());
         assert_ne!(reset.epoch, request.epoch);
+    }
+
+    #[test]
+    fn history_page_reports_current_boundaries_for_a_trimmed_anchor() {
+        let mut engine = TerminalEngine::new(2, 8, 3, Box::new(ReplySink::default())).unwrap();
+        engine.advance(b"line-0\r\nline-1\r\nline-2");
+        let old_state = engine.semantic_state().unwrap();
+        let old_anchor = old_state.primary.as_ref().unwrap().oldest_available.clone();
+
+        engine.advance(b"\r\nline-3\r\nline-4\r\nline-5\r\nline-6");
+        let current = engine.semantic_state().unwrap();
+        let current_primary = current.primary.as_ref().unwrap();
+        let anchor_key = |anchor: &Option<Anchor>| {
+            let anchor = anchor.as_ref().unwrap();
+            (anchor.logical_line_id, anchor.cell_offset)
+        };
+        assert!(anchor_key(&current_primary.oldest_available) > anchor_key(&old_anchor));
+        let request = HistoryPageRequest {
+            epoch: current.epoch.clone(),
+            before: old_anchor,
+            maximum_rows: 2,
+        };
+        let page = engine.history_page(10, &request).unwrap();
+        assert!(page.included_rows.is_empty());
+        assert!(!page.more_before);
+        assert!(!page.reset_required);
+        assert_eq!(page.oldest_available, current_primary.oldest_available);
+        assert_eq!(page.newest_available, current_primary.newest_available);
     }
 
     #[test]
