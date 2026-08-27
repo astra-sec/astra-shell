@@ -6,6 +6,7 @@ pub mod known_hosts;
 pub mod negotiation;
 pub(crate) mod process_lock;
 pub mod protocol;
+pub mod resources;
 pub mod server;
 pub mod session;
 pub mod terminal;
