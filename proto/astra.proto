@@ -16,13 +16,29 @@ message WireMessage {
 }
 
 message ClientHello {
+  // Legacy exact-version hint. New clients keep this at 1 so an N-1 server can
+  // parse and accept the hello, then advertise their real range below.
   uint32 protocol_version = 1;
   string username = 2;
+  uint32 minimum_protocol_version = 3;
+  uint32 maximum_protocol_version = 4;
+  repeated CapabilityOffer capabilities = 5;
 }
 message ServerHello {
+  // The version selected from the client/server overlap.
   uint32 protocol_version = 1;
   bytes challenge = 2;
   string server_instance = 3;
+  repeated CapabilitySelection capabilities = 4;
+}
+message CapabilityOffer {
+  string name = 1;
+  uint32 minimum_version = 2;
+  uint32 maximum_version = 3;
+}
+message CapabilitySelection {
+  string name = 1;
+  uint32 version = 2;
 }
 message AuthRequest {
   string public_key = 1;

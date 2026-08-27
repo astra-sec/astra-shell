@@ -3,12 +3,17 @@ pub mod auth;
 pub mod client;
 pub mod files;
 pub mod known_hosts;
+pub mod negotiation;
 pub(crate) mod process_lock;
 pub mod protocol;
 pub mod server;
 pub mod terminal;
+pub mod terminal_engine;
+pub mod terminal_state_v2;
 pub mod worker;
 
 pub const ALPN: &[u8] = b"astra/1";
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const LEGACY_CLIENT_HELLO_VERSION: u32 = 1;
+pub const MINIMUM_PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const SSHSIG_NAMESPACE: &str = "astra-shell-auth-v1";

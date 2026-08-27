@@ -1,0 +1,17 @@
+[package]
+name = "wezterm-char-props"
+version = "0.1.3"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[features]
+default = ["std"]
+std = ["serde/std", "ucd-trie/std", "phf/std"]
+use_serde = ["serde"]
+
+[dependencies]
+phf = { version = "0.11", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
+ucd-trie = { version = "0.1", default-features = false }
+

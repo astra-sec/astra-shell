@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::protocol::{
     EnvironmentVariable, LOCALE_ENVIRONMENT_VARIABLES, SpawnRequest, TerminalInfo, TerminalSnapshot,
 };
+use crate::{terminal_engine::TerminalEngine, terminal_state_v2::State};
 
 // Match tmux's default history-limit: enough context for normal use without
 // letting many wide panes retain unbounded cell grids.
@@ -35,19 +36,6 @@ struct PreparedTerminalEnvironment {
     locale: Vec<EnvironmentVariable>,
     used_locale_fallback: bool,
 }
-
-#[derive(Default)]
-struct TerminalCallbacks {
-    program_title: Option<String>,
-}
-
-impl vt100::Callbacks for TerminalCallbacks {
-    fn set_window_title(&mut self, _screen: &mut vt100::Screen, title: &[u8]) {
-        self.program_title = clean_program_title(title);
-    }
-}
-
-type TerminalParser = vt100::Parser<TerminalCallbacks>;
 
 #[derive(Clone, Debug)]
 pub enum PtyEvent {
@@ -77,13 +65,10 @@ pub struct LeaseGrant {
 pub struct Terminal {
     info: RwLock<TerminalInfo>,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Mutex<Box<dyn Child + Send>>,
     shell_pid: Option<i32>,
-    // Like tmux's pane grid, this parser is the daemon's authoritative terminal
-    // state. Attachments receive a rendering of this grid instead of replaying
-    // an arbitrary suffix of the PTY byte stream.
-    screen: Mutex<TerminalParser>,
+    engine: Mutex<TerminalEngine>,
     events: broadcast::Sender<PtyEvent>,
     lease_events: broadcast::Sender<LeaseEvent>,
     lease: Mutex<Option<Lease>>,
@@ -91,17 +76,19 @@ pub struct Terminal {
 
 impl Terminal {
     pub fn info(&self) -> TerminalInfo {
-        // Lock in the same screen -> info order used by resize so title reads
+        // Lock in the same engine -> info order used by resize so title reads
         // cannot deadlock with a concurrent geometry update.
         let program_title = self
-            .screen
+            .engine
             .lock()
-            .expect("terminal screen poisoned")
-            .callbacks()
-            .program_title
-            .clone();
+            .expect("terminal engine poisoned")
+            .program_title()
+            .map(str::to_owned);
         let mut info = self.info.read().expect("terminal info poisoned").clone();
-        if let Some(program_title) = program_title {
+        if let Some(program_title) = program_title
+            .as_deref()
+            .and_then(|title| clean_program_title(title.as_bytes()))
+        {
             info.name = program_title;
         }
         info
@@ -115,14 +102,22 @@ impl Terminal {
             .custom_name = (!cleaned.is_empty()).then(|| cleaned.to_owned());
     }
 
-    pub fn snapshot_and_subscribe(&self) -> (TerminalSnapshot, broadcast::Receiver<PtyEvent>) {
+    pub fn snapshot_and_subscribe(
+        &self,
+    ) -> Result<(TerminalSnapshot, broadcast::Receiver<PtyEvent>)> {
         // The PTY reader publishes while holding this same lock. Subscribing
         // before rendering therefore gives an atomic boundary: output is
         // represented either by the snapshot or by the receiver, never lost
         // or duplicated.
-        let mut screen = self.screen.lock().expect("terminal screen poisoned");
+        let mut engine = self.engine.lock().expect("terminal engine poisoned");
         let receiver = self.events.subscribe();
-        (render_snapshot(&mut screen), receiver)
+        Ok((engine.legacy_snapshot()?, receiver))
+    }
+
+    pub fn semantic_state_and_subscribe(&self) -> Result<(State, broadcast::Receiver<PtyEvent>)> {
+        let mut engine = self.engine.lock().expect("terminal engine poisoned");
+        let receiver = self.events.subscribe();
+        Ok((engine.semantic_state()?, receiver))
     }
 
     pub fn subscribe_to_leases(&self) -> broadcast::Receiver<LeaseEvent> {
@@ -225,8 +220,8 @@ impl Terminal {
         // Resize the server grid before notifying the PTY. The foreground
         // process may redraw immediately after TIOCSWINSZ, and those bytes must
         // be parsed using the new geometry.
-        let mut screen = self.screen.lock().expect("terminal screen poisoned");
-        screen.screen_mut().set_size(rows as u16, cols as u16);
+        let mut engine = self.engine.lock().expect("terminal engine poisoned");
+        engine.resize(rows, cols)?;
         self.master
             .lock()
             .expect("terminal master poisoned")
@@ -245,7 +240,7 @@ impl Terminal {
             .as_mut()
             .expect("validated lease disappeared")
             .last_sequence = sequence;
-        drop(screen);
+        drop(engine);
         Ok(())
     }
 
@@ -399,7 +394,7 @@ impl TerminalManager {
         let shell_pid = child.process_id().map(|pid| pid as i32);
         drop(pty.slave);
         let reader = pty.master.try_clone_reader()?;
-        let writer = pty.master.take_writer()?;
+        let writer = Arc::new(Mutex::new(pty.master.take_writer()?));
         let (events, _) = broadcast::channel(1024);
         let (lease_events, _) = broadcast::channel(16);
         let info = TerminalInfo {
@@ -418,10 +413,10 @@ impl TerminalManager {
         let terminal = Arc::new(Terminal {
             info: RwLock::new(info),
             master: Mutex::new(pty.master),
-            writer: Mutex::new(writer),
+            writer: writer.clone(),
             child: Mutex::new(child),
             shell_pid,
-            screen: Mutex::new(initial_terminal_screen(rows, cols, default_shell)),
+            engine: Mutex::new(initial_terminal_engine(rows, cols, default_shell, writer)?),
             events,
             lease_events,
             lease: Mutex::new(None),
@@ -507,45 +502,37 @@ fn parse_display_id(selector: &str) -> Option<u64> {
     (display_id != 0).then_some(display_id)
 }
 
-fn initial_terminal_screen(rows: u32, cols: u32, include_welcome: bool) -> TerminalParser {
-    let mut screen = TerminalParser::new_with_callbacks(
-        rows as u16,
-        cols as u16,
-        SCREEN_SCROLLBACK_ROWS,
-        TerminalCallbacks::default(),
-    );
-    if include_welcome && let Some(banner) = system_welcome_banner() {
-        screen.process(&banner);
+struct HostReplyWriter(Arc<Mutex<Box<dyn Write + Send>>>);
+
+impl Write for HostReplyWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("terminal writer poisoned")
+            .write(bytes)
     }
-    screen
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().expect("terminal writer poisoned").flush()
+    }
 }
 
-fn render_snapshot(parser: &mut TerminalParser) -> TerminalSnapshot {
-    let screen = parser.screen();
-    let (rows, cols) = screen.size();
-    let alternate_screen = screen.alternate_screen();
-    let contents = screen.state_formatted();
-    // vt100 intentionally exposes only the active grid. Leave through 1049 so
-    // the normal grid's saved cursor and attributes are restored, render it,
-    // then switch back through mode 47 (which does not clear the alternate
-    // grid) and replay its already-captured state. This preserves both grids
-    // and the exact state that a later 1049l must restore.
-    let normal_contents = if alternate_screen {
-        parser.process(b"\x1b[?1049l");
-        let normal = parser.screen().state_formatted();
-        parser.process(b"\x1b[?47h");
-        parser.process(&contents);
-        normal
-    } else {
-        Vec::new()
-    };
-    TerminalSnapshot {
-        rows: u32::from(rows),
-        cols: u32::from(cols),
-        contents,
-        alternate_screen,
-        normal_contents,
+fn initial_terminal_engine(
+    rows: u32,
+    cols: u32,
+    include_welcome: bool,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+) -> Result<TerminalEngine> {
+    let mut engine = TerminalEngine::new(
+        rows,
+        cols,
+        SCREEN_SCROLLBACK_ROWS,
+        Box::new(HostReplyWriter(writer)),
+    )?;
+    if include_welcome && let Some(banner) = system_welcome_banner() {
+        engine.advance(&banner);
     }
+    Ok(engine)
 }
 
 fn clean_program_title(title: &[u8]) -> Option<String> {
@@ -789,8 +776,8 @@ fn start_reader(terminal: Arc<Terminal>, mut reader: Box<dyn Read + Send>) {
                     Ok(0) => break,
                     Ok(length) => {
                         let chunk = buffer[..length].to_vec();
-                        let mut screen = terminal.screen.lock().expect("terminal screen poisoned");
-                        screen.process(&chunk);
+                        let mut engine = terminal.engine.lock().expect("terminal engine poisoned");
+                        engine.advance(&chunk);
                         let _ = terminal.events.send(PtyEvent::Output(chunk));
                     }
                     Err(error) => {
@@ -851,47 +838,13 @@ fn start_child_monitor(
 mod tests {
     use super::*;
 
-    fn restore_snapshot(snapshot: &TerminalSnapshot) -> TerminalParser {
-        let mut restored = TerminalParser::new_with_callbacks(
-            snapshot.rows as u16,
-            snapshot.cols as u16,
-            SCREEN_SCROLLBACK_ROWS,
-            TerminalCallbacks::default(),
-        );
-        restored.process(b"\x1bc");
-        if snapshot.alternate_screen {
-            restored.process(&snapshot.normal_contents);
-            restored.process(b"\x1b[?1049h");
-        }
-        restored.process(&snapshot.contents);
-        restored
-    }
-
-    fn assert_active_screens_equal(left: &TerminalParser, right: &TerminalParser) {
-        let left = left.screen();
-        let right = right.screen();
-        assert_eq!(left.size(), right.size());
-        assert_eq!(left.contents(), right.contents());
-        assert_eq!(left.cursor_position(), right.cursor_position());
-        assert_eq!(left.alternate_screen(), right.alternate_screen());
-        assert_eq!(left.application_keypad(), right.application_keypad());
-        assert_eq!(left.application_cursor(), right.application_cursor());
-        assert_eq!(left.bracketed_paste(), right.bracketed_paste());
-        assert_eq!(left.mouse_protocol_mode(), right.mouse_protocol_mode());
-        assert_eq!(
-            left.mouse_protocol_encoding(),
-            right.mouse_protocol_encoding()
-        );
-        assert_eq!(left.fgcolor(), right.fgcolor());
-        assert_eq!(left.bgcolor(), right.bgcolor());
-        assert_eq!(left.bold(), right.bold());
-        assert_eq!(left.italic(), right.italic());
-        for row in 0..left.size().0 {
-            assert_eq!(left.row_wrapped(row), right.row_wrapped(row));
-            for col in 0..left.size().1 {
-                assert_eq!(left.cell(row, col), right.cell(row, col));
-            }
-        }
+    fn semantic_text(screen: &crate::terminal_state_v2::Screen) -> String {
+        screen
+            .included_rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .map(|cell| cell.grapheme.as_str())
+            .collect()
     }
 
     fn variable(name: &str, value: &str) -> EnvironmentVariable {
@@ -922,67 +875,84 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_round_trips_full_screen_tui_wide_cells_modes_and_resize() {
-        let mut source = TerminalParser::new_with_callbacks(
-            8,
-            30,
-            SCREEN_SCROLLBACK_ROWS,
-            TerminalCallbacks::default(),
-        );
-        source.process(b"\x1b[2J\x1b[Hshell history\r\n$ codex");
-        source.process(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[1;36mCodex\x1b[0m");
-        source.screen_mut().set_size(10, 36);
-        source.process(b"\x1b[2J\x1b[H\x1b[1;36mCodex\x1b[0m\r\n");
+    fn authoritative_engine_exports_full_tui_state_and_legacy_compatibility_view() {
+        let mut engine =
+            TerminalEngine::new(8, 30, SCREEN_SCROLLBACK_ROWS, Box::new(std::io::sink())).unwrap();
+        engine.advance(b"\x1b[2J\x1b[Hshell history\r\n$ codex");
+        engine.advance(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[1;36mCodex\x1b[0m");
+        engine.resize(10, 36).unwrap();
+        engine.advance(b"\x1b[2J\x1b[H\x1b[1;36mCodex\x1b[0m\r\n");
         // Split a multi-byte wide character exactly as separate PTY reads can.
         let wide = "状态：运行中 ✅".as_bytes();
-        source.process(&wide[..4]);
-        source.process(&wide[4..]);
-        source.process(
+        engine.advance(&wide[..4]);
+        engine.advance(&wide[4..]);
+        engine.advance(
             b"\x1b[5;4H\x1b[38;5;214mworking\x1b[3m...\x1b[?1h\x1b[?2004h\x1b[?1002h\x1b[?1006h",
         );
 
-        let snapshot = render_snapshot(&mut source);
-        let mut restored = restore_snapshot(&snapshot);
+        let state = engine.semantic_state().unwrap();
+        assert_eq!(state.rows, 10);
+        assert_eq!(state.cols, 36);
+        assert_eq!(
+            state.active_screen,
+            crate::terminal_state_v2::ScreenKind::Alternate as i32
+        );
+        let primary_text = semantic_text(state.primary.as_ref().unwrap());
+        let alternate_text = semantic_text(state.alternate.as_ref().unwrap());
+        assert!(primary_text.contains("shellhistory"), "{primary_text:?}");
+        assert!(
+            alternate_text.contains("状态：运行中"),
+            "{alternate_text:?}"
+        );
+        assert!(
+            state
+                .alternate
+                .as_ref()
+                .unwrap()
+                .included_rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .any(|cell| cell.grapheme == "状" && cell.width == 2)
+        );
+        let modes = state.modes.as_ref().unwrap();
+        assert!(modes.application_cursor_keys);
+        assert!(modes.bracketed_paste);
+        assert_eq!(
+            modes.mouse_encoding,
+            crate::terminal_state_v2::MouseEncoding::Sgr as i32
+        );
+
+        let snapshot = engine.legacy_snapshot().unwrap();
         assert!(snapshot.alternate_screen);
         assert!(!snapshot.normal_contents.is_empty());
-        assert_active_screens_equal(&source, &restored);
-
-        // The hidden normal grid must also survive. This is what becomes
-        // visible when Codex/vim exits its alternate screen after reconnect.
-        source.process(b"\x1b[?1049l");
-        restored.process(b"\x1b[?1049l");
-        assert_active_screens_equal(&source, &restored);
+        assert!(snapshot.contents.starts_with(b"\x1b[2J\x1b[H"));
     }
 
     #[test]
-    fn snapshot_replaces_stale_client_contents_instead_of_replaying_history() {
-        let mut source = TerminalParser::new_with_callbacks(
-            4,
-            16,
-            SCREEN_SCROLLBACK_ROWS,
-            TerminalCallbacks::default(),
-        );
-        source.process(b"\x1b[2J\x1b[2;3Hauthoritative");
-        let snapshot = render_snapshot(&mut source);
+    fn semantic_reset_discards_stale_contents_before_snapshot_serialization() {
+        let mut engine =
+            TerminalEngine::new(4, 16, SCREEN_SCROLLBACK_ROWS, Box::new(std::io::sink())).unwrap();
+        engine.advance(b"stale client data\r\nthat must vanish");
+        engine.advance(b"\x1bc\x1b[2;3Hauthoritative");
 
-        let mut restored = TerminalParser::new_with_callbacks(
-            4,
-            16,
-            SCREEN_SCROLLBACK_ROWS,
-            TerminalCallbacks::default(),
-        );
-        restored.process(b"stale client data\r\nthat must vanish");
-        restored.process(b"\x1bc");
-        restored.process(&snapshot.contents);
-        assert_active_screens_equal(&source, &restored);
+        let state = engine.semantic_state().unwrap();
+        let text = semantic_text(state.primary.as_ref().unwrap());
+        assert!(text.contains("authoritative"));
+        assert!(!text.contains("stale"));
+        let snapshot = engine.legacy_snapshot().unwrap();
+        assert!(snapshot.contents.starts_with(b"\x1b[2J\x1b[H"));
     }
 
     #[test]
     fn captures_and_sanitizes_program_reported_terminal_titles() {
-        let mut parser = initial_terminal_screen(24, 80, false);
-        parser.process(b"\x1b]0;xy@rome:~/Projects/astra\x07");
+        let mut engine = TerminalEngine::new(24, 80, 0, Box::new(std::io::sink())).unwrap();
+        assert_eq!(engine.program_title(), None);
+        engine.advance(b"\x1b]0;xy@rome:~/Projects/astra\x07");
         assert_eq!(
-            parser.callbacks().program_title.as_deref(),
+            engine
+                .program_title()
+                .and_then(|title| clean_program_title(title.as_bytes()))
+                .as_deref(),
             Some("xy@rome:~/Projects/astra")
         );
 
@@ -990,8 +960,8 @@ mod tests {
             clean_program_title(b"  Codex\x01 Session  ").as_deref(),
             Some("Codex Session")
         );
-        parser.process(b"\x1b]2;   \x07");
-        assert_eq!(parser.callbacks().program_title, None);
+        engine.advance(b"\x1b]2;   \x07");
+        assert_eq!(clean_program_title(engine.title().as_bytes()), None);
     }
 
     #[tokio::test]

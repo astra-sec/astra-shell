@@ -12,10 +12,11 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{error, info, trace, warn};
 
 use crate::{
-    ALPN, PROTOCOL_VERSION,
+    ALPN,
     accounts::{SystemAccount, authorized_key_files, effective_uid},
     auth::{authentication_payload, verify_authorized_key, verify_authorized_keys},
     files::{FileResult, FileService},
+    negotiation::{NegotiatedProtocol, ProtocolSupport, negotiate_client_hello, selections},
     process_lock::ProcessLock,
     protocol::{
         AckResponse, AttachResponse, AuthResult, ErrorResponse, LeaseChanged, ListResponse,
@@ -326,7 +327,7 @@ fn validate_managed_gateway_state(_paths: &ServerPaths) -> Result<()> {
 async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Result<()> {
     let connection = incoming.await.context("QUIC handshake failed")?;
     let remote = connection.remote_address();
-    let (username, fingerprint, backend) = match tokio::time::timeout(
+    let (username, fingerprint, backend, negotiated) = match tokio::time::timeout(
         std::time::Duration::from_secs(15),
         authenticate_connection(&state, &connection),
     )
@@ -338,7 +339,14 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
             bail!("client authentication timed out")
         }
     };
-    info!(%remote, %username, %fingerprint, "client authenticated");
+    info!(
+        %remote,
+        %username,
+        %fingerprint,
+        protocol_version = negotiated.version,
+        capabilities = negotiated.capabilities.len(),
+        "client authenticated"
+    );
 
     loop {
         let (send, mut recv) = match connection.accept_bi().await {
@@ -377,35 +385,29 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
 async fn authenticate_connection(
     state: &ServerState,
     connection: &quinn::Connection,
-) -> Result<(String, String, ConnectionBackend)> {
+) -> Result<(String, String, ConnectionBackend, NegotiatedProtocol)> {
     let (mut auth_send, mut auth_recv, first_message) =
         accept_authentication_stream(connection).await?;
-    let username = match first_message {
+    let hello = match first_message {
         WireMessage {
             body: Some(wire_message::Body::ClientHello(hello)),
-        } if hello.protocol_version == PROTOCOL_VERSION && !hello.username.is_empty() => {
-            hello.username
-        }
-        WireMessage {
-            body: Some(wire_message::Body::ClientHello(hello)),
-        } if hello.protocol_version != PROTOCOL_VERSION => bail!(
-            "client protocol version {} is incompatible with server version {}",
-            hello.protocol_version,
-            PROTOCOL_VERSION
-        ),
-        WireMessage {
-            body: Some(wire_message::Body::ClientHello(_)),
-        } => bail!("ClientHello has no target Unix username"),
+        } => hello,
         _ => bail!("expected ClientHello"),
     };
+    if hello.username.is_empty() {
+        bail!("ClientHello has no target Unix username")
+    }
+    let negotiated = negotiate_client_hello(&hello, &ProtocolSupport::runtime())?;
+    let username = hello.username;
 
     let challenge: [u8; 32] = rand::random();
     write_message(
         &mut auth_send,
         &WireMessage::new(wire_message::Body::ServerHello(ServerHello {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: negotiated.version,
             challenge: challenge.to_vec(),
             server_instance: state.instance_id.clone(),
+            capabilities: selections(&negotiated),
         })),
     )
     .await?;
@@ -453,7 +455,7 @@ async fn authenticate_connection(
             return Err(error.context("client authentication failed"));
         }
     };
-    Ok((username, fingerprint, backend))
+    Ok((username, fingerprint, backend, negotiated))
 }
 
 async fn accept_authentication_stream(
@@ -932,7 +934,7 @@ where
             return Ok(());
         }
     };
-    let (snapshot, mut events) = terminal.snapshot_and_subscribe();
+    let (snapshot, mut events) = terminal.snapshot_and_subscribe()?;
     let info = terminal.info();
     send_response(
         &mut send,
@@ -1041,7 +1043,7 @@ where
                             // A tmux-style authoritative grid lets a slow client
                             // recover exactly instead of continuing after a gap
                             // in the byte stream.
-                            let (snapshot, replacement) = terminal.snapshot_and_subscribe();
+                            let (snapshot, replacement) = terminal.snapshot_and_subscribe()?;
                             events = replacement;
                             write_terminal_event(
                                 &mut send,

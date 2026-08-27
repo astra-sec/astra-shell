@@ -57,6 +57,12 @@ pub struct ClientHello {
     pub protocol_version: u32,
     #[prost(string, tag = "2")]
     pub username: String,
+    #[prost(uint32, tag = "3")]
+    pub minimum_protocol_version: u32,
+    #[prost(uint32, tag = "4")]
+    pub maximum_protocol_version: u32,
+    #[prost(message, repeated, tag = "5")]
+    pub capabilities: Vec<CapabilityOffer>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -67,6 +73,26 @@ pub struct ServerHello {
     pub challenge: Vec<u8>,
     #[prost(string, tag = "3")]
     pub server_instance: String,
+    #[prost(message, repeated, tag = "4")]
+    pub capabilities: Vec<CapabilitySelection>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CapabilityOffer {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(uint32, tag = "2")]
+    pub minimum_version: u32,
+    #[prost(uint32, tag = "3")]
+    pub maximum_version: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CapabilitySelection {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(uint32, tag = "2")]
+    pub version: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]

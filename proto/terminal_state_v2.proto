@@ -1,0 +1,213 @@
+syntax = "proto3";
+
+package astra.terminal.v2;
+
+// A bounded, semantic terminal state segment. It is independent from the
+// terminal engine's memory layout and from any renderer/parser implementation.
+message State {
+  uint32 schema_version = 1;
+  // Exactly 16 opaque bytes. A changed epoch invalidates every generation,
+  // row version, logical line ID, style ID, and hyperlink ID from the old epoch.
+  bytes epoch = 2;
+  uint64 generation = 3;
+  uint32 rows = 4;
+  uint32 cols = 5;
+  Screen primary = 6;
+  Screen alternate = 7;
+  ScreenKind active_screen = 8;
+  repeated Style styles = 9;
+  repeated Hyperlink hyperlinks = 10;
+  Modes modes = 11;
+  string title = 12;
+  string working_directory = 13;
+  Palette palette = 14;
+}
+
+enum ScreenKind {
+  SCREEN_KIND_UNSPECIFIED = 0;
+  SCREEN_KIND_PRIMARY = 1;
+  SCREEN_KIND_ALTERNATE = 2;
+}
+
+// Rows are a contiguous bounded segment ordered from oldest to newest. The
+// primary segment may include history before the viewport. The alternate
+// screen has no history and therefore starts its viewport at row zero.
+message Screen {
+  repeated Row included_rows = 1;
+  uint32 viewport_start = 2;
+  Cursor cursor = 3;
+  optional Cursor saved_cursor = 4;
+  Anchor oldest_available = 5;
+  Anchor newest_available = 6;
+  Anchor included_start = 7;
+  Anchor included_end = 8;
+  uint32 scroll_margin_top = 9;
+  uint32 scroll_margin_bottom = 10;
+  uint32 scroll_margin_left = 11;
+  uint32 scroll_margin_right = 12;
+  repeated uint32 tab_stops = 13;
+}
+
+// A position in an engine-owned logical line. The logical line ID survives
+// soft-wrap and reflow; cell_offset is measured in terminal columns.
+message Anchor {
+  uint64 logical_line_id = 1;
+  uint32 cell_offset = 2;
+}
+
+// One physical row for State.cols. Multiple rows can share a logical line ID;
+// their start.cell_offset and wrapped_to_next describe the current reflow.
+message Row {
+  Anchor start = 1;
+  uint64 row_version = 2;
+  repeated Cell cells = 3;
+  bool wrapped_to_next = 4;
+}
+
+// Cells are sparse and ordered by column. Missing columns are default-style
+// blanks. One entry represents one grapheme, not one Unicode scalar.
+message Cell {
+  uint32 column = 1;
+  string grapheme = 2;
+  uint32 width = 3;
+  uint32 style_id = 4;
+  // Zero means no hyperlink.
+  uint64 hyperlink_id = 5;
+}
+
+message Cursor {
+  uint32 x = 1;
+  uint32 y = 2;
+  Anchor anchor = 3;
+  CursorShape shape = 4;
+  bool visible = 5;
+  uint64 version = 6;
+  // The cursor is displayed in the last column, but the next printable
+  // grapheme first wraps to the following row (DECAWM pending-wrap state).
+  bool wrap_pending = 7;
+}
+
+enum CursorShape {
+  CURSOR_SHAPE_UNSPECIFIED = 0;
+  CURSOR_SHAPE_BLOCK = 1;
+  CURSOR_SHAPE_UNDERLINE = 2;
+  CURSOR_SHAPE_BAR = 3;
+}
+
+message Style {
+  // Zero is the implicit default style and is not present in this table.
+  uint32 id = 1;
+  Color foreground = 2;
+  Color background = 3;
+  Color underline_color = 4;
+  Intensity intensity = 5;
+  Underline underline = 6;
+  Blink blink = 7;
+  bool italic = 8;
+  bool reverse = 9;
+  bool strikethrough = 10;
+  bool invisible = 11;
+  bool overline = 12;
+  SemanticType semantic_type = 13;
+  VerticalAlign vertical_align = 14;
+}
+
+message Color {
+  oneof value {
+    // Presence means the terminal default for this color role.
+    bool default_color = 1;
+    uint32 palette_index = 2;
+    // Packed as 0xRRGGBB. Values above 0xFFFFFF are invalid.
+    uint32 rgb = 3;
+  }
+}
+
+enum Intensity {
+  INTENSITY_NORMAL = 0;
+  INTENSITY_BOLD = 1;
+  INTENSITY_FAINT = 2;
+}
+
+enum Underline {
+  UNDERLINE_NONE = 0;
+  UNDERLINE_SINGLE = 1;
+  UNDERLINE_DOUBLE = 2;
+  UNDERLINE_CURLY = 3;
+  UNDERLINE_DOTTED = 4;
+  UNDERLINE_DASHED = 5;
+}
+
+enum Blink {
+  BLINK_NONE = 0;
+  BLINK_SLOW = 1;
+  BLINK_RAPID = 2;
+}
+
+enum SemanticType {
+  SEMANTIC_TYPE_OUTPUT = 0;
+  SEMANTIC_TYPE_INPUT = 1;
+  SEMANTIC_TYPE_PROMPT = 2;
+}
+
+enum VerticalAlign {
+  VERTICAL_ALIGN_BASELINE = 0;
+  VERTICAL_ALIGN_SUPERSCRIPT = 1;
+  VERTICAL_ALIGN_SUBSCRIPT = 2;
+}
+
+message Hyperlink {
+  uint64 id = 1;
+  string uri = 2;
+  string explicit_id = 3;
+}
+
+message Modes {
+  bool application_cursor_keys = 1;
+  bool application_keypad = 2;
+  bool bracketed_paste = 3;
+  bool focus_tracking = 4;
+  bool origin = 5;
+  bool insert = 6;
+  bool auto_wrap = 7;
+  bool reverse_wraparound = 8;
+  bool newline = 9;
+  bool left_right_margin = 10;
+  bool reverse_video = 11;
+  MouseTracking mouse_tracking = 12;
+  MouseEncoding mouse_encoding = 13;
+  KeyboardEncoding keyboard_encoding = 14;
+  uint32 keyboard_flags = 15;
+}
+
+enum MouseTracking {
+  MOUSE_TRACKING_NONE = 0;
+  MOUSE_TRACKING_X10 = 1;
+  MOUSE_TRACKING_VT200 = 2;
+  MOUSE_TRACKING_BUTTON_EVENT = 3;
+  MOUSE_TRACKING_ANY_EVENT = 4;
+}
+
+enum MouseEncoding {
+  MOUSE_ENCODING_DEFAULT = 0;
+  MOUSE_ENCODING_UTF8 = 1;
+  MOUSE_ENCODING_SGR = 2;
+  MOUSE_ENCODING_SGR_PIXELS = 3;
+}
+
+enum KeyboardEncoding {
+  KEYBOARD_ENCODING_XTERM = 0;
+  KEYBOARD_ENCODING_CSI_U = 1;
+  KEYBOARD_ENCODING_KITTY = 2;
+}
+
+// Palette entries are packed 0xRRGGBB values. A complete State carries all
+// 256 indexed colors plus the named colors used by default-style cells.
+message Palette {
+  repeated uint32 indexed_rgb = 1 [packed = true];
+  uint32 foreground_rgb = 2;
+  uint32 background_rgb = 3;
+  uint32 cursor_fg_rgb = 4;
+  uint32 cursor_bg_rgb = 5;
+  uint32 selection_fg_rgb = 6;
+  uint32 selection_bg_rgb = 7;
+}

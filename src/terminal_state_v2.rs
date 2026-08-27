@@ -1,0 +1,941 @@
+use std::collections::HashSet;
+
+use anyhow::{Result, ensure};
+use prost::Message;
+
+pub const SCHEMA_VERSION: u32 = 2;
+pub const EPOCH_BYTES: usize = 16;
+pub const MAX_ENCODED_STATE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_DIMENSION: u32 = 1_000;
+pub const MAX_INCLUDED_ROWS: usize = 4_096;
+pub const MAX_CELLS: usize = 1_000_000;
+pub const MAX_GRAPHEME_BYTES: usize = 256;
+pub const MAX_STYLES: usize = 4_096;
+pub const MAX_HYPERLINKS: usize = 4_096;
+pub const MAX_HYPERLINK_URI_BYTES: usize = 16 * 1024;
+pub const MAX_HYPERLINK_EXPLICIT_ID_BYTES: usize = 1_024;
+pub const MAX_TITLE_BYTES: usize = 512;
+pub const MAX_WORKING_DIRECTORY_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, PartialEq, Message)]
+pub struct State {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(bytes = "vec", tag = "2")]
+    pub epoch: Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub generation: u64,
+    #[prost(uint32, tag = "4")]
+    pub rows: u32,
+    #[prost(uint32, tag = "5")]
+    pub cols: u32,
+    #[prost(message, optional, tag = "6")]
+    pub primary: Option<Screen>,
+    #[prost(message, optional, tag = "7")]
+    pub alternate: Option<Screen>,
+    #[prost(enumeration = "ScreenKind", tag = "8")]
+    pub active_screen: i32,
+    #[prost(message, repeated, tag = "9")]
+    pub styles: Vec<Style>,
+    #[prost(message, repeated, tag = "10")]
+    pub hyperlinks: Vec<Hyperlink>,
+    #[prost(message, optional, tag = "11")]
+    pub modes: Option<Modes>,
+    #[prost(string, tag = "12")]
+    pub title: String,
+    #[prost(string, tag = "13")]
+    pub working_directory: String,
+    #[prost(message, optional, tag = "14")]
+    pub palette: Option<Palette>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum ScreenKind {
+    Unspecified = 0,
+    Primary = 1,
+    Alternate = 2,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Screen {
+    #[prost(message, repeated, tag = "1")]
+    pub included_rows: Vec<Row>,
+    #[prost(uint32, tag = "2")]
+    pub viewport_start: u32,
+    #[prost(message, optional, tag = "3")]
+    pub cursor: Option<Cursor>,
+    #[prost(message, optional, tag = "4")]
+    pub saved_cursor: Option<Cursor>,
+    #[prost(message, optional, tag = "5")]
+    pub oldest_available: Option<Anchor>,
+    #[prost(message, optional, tag = "6")]
+    pub newest_available: Option<Anchor>,
+    #[prost(message, optional, tag = "7")]
+    pub included_start: Option<Anchor>,
+    #[prost(message, optional, tag = "8")]
+    pub included_end: Option<Anchor>,
+    #[prost(uint32, tag = "9")]
+    pub scroll_margin_top: u32,
+    #[prost(uint32, tag = "10")]
+    pub scroll_margin_bottom: u32,
+    #[prost(uint32, tag = "11")]
+    pub scroll_margin_left: u32,
+    #[prost(uint32, tag = "12")]
+    pub scroll_margin_right: u32,
+    #[prost(uint32, repeated, packed = "true", tag = "13")]
+    pub tab_stops: Vec<u32>,
+}
+
+#[derive(Clone, PartialEq, Eq, Message)]
+pub struct Anchor {
+    #[prost(uint64, tag = "1")]
+    pub logical_line_id: u64,
+    #[prost(uint32, tag = "2")]
+    pub cell_offset: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Row {
+    #[prost(message, optional, tag = "1")]
+    pub start: Option<Anchor>,
+    #[prost(uint64, tag = "2")]
+    pub row_version: u64,
+    #[prost(message, repeated, tag = "3")]
+    pub cells: Vec<Cell>,
+    #[prost(bool, tag = "4")]
+    pub wrapped_to_next: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Cell {
+    #[prost(uint32, tag = "1")]
+    pub column: u32,
+    #[prost(string, tag = "2")]
+    pub grapheme: String,
+    #[prost(uint32, tag = "3")]
+    pub width: u32,
+    #[prost(uint32, tag = "4")]
+    pub style_id: u32,
+    #[prost(uint64, tag = "5")]
+    pub hyperlink_id: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Cursor {
+    #[prost(uint32, tag = "1")]
+    pub x: u32,
+    #[prost(uint32, tag = "2")]
+    pub y: u32,
+    #[prost(message, optional, tag = "3")]
+    pub anchor: Option<Anchor>,
+    #[prost(enumeration = "CursorShape", tag = "4")]
+    pub shape: i32,
+    #[prost(bool, tag = "5")]
+    pub visible: bool,
+    #[prost(uint64, tag = "6")]
+    pub version: u64,
+    #[prost(bool, tag = "7")]
+    pub wrap_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum CursorShape {
+    Unspecified = 0,
+    Block = 1,
+    Underline = 2,
+    Bar = 3,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Style {
+    #[prost(uint32, tag = "1")]
+    pub id: u32,
+    #[prost(message, optional, tag = "2")]
+    pub foreground: Option<Color>,
+    #[prost(message, optional, tag = "3")]
+    pub background: Option<Color>,
+    #[prost(message, optional, tag = "4")]
+    pub underline_color: Option<Color>,
+    #[prost(enumeration = "Intensity", tag = "5")]
+    pub intensity: i32,
+    #[prost(enumeration = "Underline", tag = "6")]
+    pub underline: i32,
+    #[prost(enumeration = "Blink", tag = "7")]
+    pub blink: i32,
+    #[prost(bool, tag = "8")]
+    pub italic: bool,
+    #[prost(bool, tag = "9")]
+    pub reverse: bool,
+    #[prost(bool, tag = "10")]
+    pub strikethrough: bool,
+    #[prost(bool, tag = "11")]
+    pub invisible: bool,
+    #[prost(bool, tag = "12")]
+    pub overline: bool,
+    #[prost(enumeration = "SemanticType", tag = "13")]
+    pub semantic_type: i32,
+    #[prost(enumeration = "VerticalAlign", tag = "14")]
+    pub vertical_align: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Color {
+    #[prost(oneof = "color::Value", tags = "1, 2, 3")]
+    pub value: Option<color::Value>,
+}
+
+pub mod color {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Value {
+        #[prost(bool, tag = "1")]
+        DefaultColor(bool),
+        #[prost(uint32, tag = "2")]
+        PaletteIndex(u32),
+        #[prost(uint32, tag = "3")]
+        Rgb(u32),
+    }
+}
+
+macro_rules! terminal_enum {
+    ($name:ident { $($variant:ident = $value:expr),+ $(,)? }) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+        #[repr(i32)]
+        pub enum $name { $($variant = $value),+ }
+    };
+}
+
+terminal_enum!(Intensity { Normal = 0, Bold = 1, Faint = 2 });
+terminal_enum!(Underline {
+    None = 0,
+    Single = 1,
+    Double = 2,
+    Curly = 3,
+    Dotted = 4,
+    Dashed = 5,
+});
+terminal_enum!(Blink { None = 0, Slow = 1, Rapid = 2 });
+terminal_enum!(SemanticType { Output = 0, Input = 1, Prompt = 2 });
+terminal_enum!(VerticalAlign { Baseline = 0, Superscript = 1, Subscript = 2 });
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Hyperlink {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(string, tag = "2")]
+    pub uri: String,
+    #[prost(string, tag = "3")]
+    pub explicit_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Modes {
+    #[prost(bool, tag = "1")]
+    pub application_cursor_keys: bool,
+    #[prost(bool, tag = "2")]
+    pub application_keypad: bool,
+    #[prost(bool, tag = "3")]
+    pub bracketed_paste: bool,
+    #[prost(bool, tag = "4")]
+    pub focus_tracking: bool,
+    #[prost(bool, tag = "5")]
+    pub origin: bool,
+    #[prost(bool, tag = "6")]
+    pub insert: bool,
+    #[prost(bool, tag = "7")]
+    pub auto_wrap: bool,
+    #[prost(bool, tag = "8")]
+    pub reverse_wraparound: bool,
+    #[prost(bool, tag = "9")]
+    pub newline: bool,
+    #[prost(bool, tag = "10")]
+    pub left_right_margin: bool,
+    #[prost(bool, tag = "11")]
+    pub reverse_video: bool,
+    #[prost(enumeration = "MouseTracking", tag = "12")]
+    pub mouse_tracking: i32,
+    #[prost(enumeration = "MouseEncoding", tag = "13")]
+    pub mouse_encoding: i32,
+    #[prost(enumeration = "KeyboardEncoding", tag = "14")]
+    pub keyboard_encoding: i32,
+    #[prost(uint32, tag = "15")]
+    pub keyboard_flags: u32,
+}
+
+terminal_enum!(MouseTracking {
+    None = 0,
+    X10 = 1,
+    Vt200 = 2,
+    ButtonEvent = 3,
+    AnyEvent = 4,
+});
+terminal_enum!(MouseEncoding { Default = 0, Utf8 = 1, Sgr = 2, SgrPixels = 3 });
+terminal_enum!(KeyboardEncoding { Xterm = 0, CsiU = 1, Kitty = 2 });
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Palette {
+    #[prost(uint32, repeated, packed = "true", tag = "1")]
+    pub indexed_rgb: Vec<u32>,
+    #[prost(uint32, tag = "2")]
+    pub foreground_rgb: u32,
+    #[prost(uint32, tag = "3")]
+    pub background_rgb: u32,
+    #[prost(uint32, tag = "4")]
+    pub cursor_fg_rgb: u32,
+    #[prost(uint32, tag = "5")]
+    pub cursor_bg_rgb: u32,
+    #[prost(uint32, tag = "6")]
+    pub selection_fg_rgb: u32,
+    #[prost(uint32, tag = "7")]
+    pub selection_bg_rgb: u32,
+}
+
+pub fn validate(state: &State) -> Result<()> {
+    ensure!(
+        state.schema_version == SCHEMA_VERSION,
+        "unsupported terminal state schema version {}",
+        state.schema_version
+    );
+    ensure!(
+        state.epoch.len() == EPOCH_BYTES,
+        "terminal state epoch must be {EPOCH_BYTES} bytes"
+    );
+    ensure!(
+        state.generation > 0,
+        "terminal state generation must be nonzero"
+    );
+    ensure!(
+        (1..=MAX_DIMENSION).contains(&state.rows),
+        "terminal rows are out of range"
+    );
+    ensure!(
+        (1..=MAX_DIMENSION).contains(&state.cols),
+        "terminal cols are out of range"
+    );
+    ensure!(
+        state.encoded_len() <= MAX_ENCODED_STATE_BYTES,
+        "terminal state exceeds {MAX_ENCODED_STATE_BYTES} encoded bytes"
+    );
+    ensure!(
+        state.title.len() <= MAX_TITLE_BYTES,
+        "terminal title is too large"
+    );
+    ensure!(
+        state.working_directory.len() <= MAX_WORKING_DIRECTORY_BYTES,
+        "terminal working directory is too large"
+    );
+
+    let active = ScreenKind::try_from(state.active_screen)
+        .map_err(|_| anyhow::anyhow!("unknown active screen enum"))?;
+    ensure!(
+        active != ScreenKind::Unspecified,
+        "active screen is unspecified"
+    );
+
+    validate_modes(
+        state
+            .modes
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("terminal modes are missing"))?,
+    )?;
+    validate_palette(
+        state
+            .palette
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("terminal palette is missing"))?,
+    )?;
+
+    ensure!(state.styles.len() <= MAX_STYLES, "too many terminal styles");
+    let mut style_ids = HashSet::with_capacity(state.styles.len());
+    for style in &state.styles {
+        validate_style(style)?;
+        ensure!(
+            style.id != 0 && style_ids.insert(style.id),
+            "terminal style IDs must be unique and nonzero"
+        );
+    }
+
+    ensure!(
+        state.hyperlinks.len() <= MAX_HYPERLINKS,
+        "too many terminal hyperlinks"
+    );
+    let mut hyperlink_ids = HashSet::with_capacity(state.hyperlinks.len());
+    for hyperlink in &state.hyperlinks {
+        ensure!(
+            hyperlink.id != 0 && hyperlink_ids.insert(hyperlink.id),
+            "terminal hyperlink IDs must be unique and nonzero"
+        );
+        ensure!(!hyperlink.uri.is_empty(), "terminal hyperlink URI is empty");
+        ensure!(
+            hyperlink.uri.len() <= MAX_HYPERLINK_URI_BYTES,
+            "terminal hyperlink URI is too large"
+        );
+        ensure!(
+            hyperlink.explicit_id.len() <= MAX_HYPERLINK_EXPLICIT_ID_BYTES,
+            "terminal hyperlink explicit ID is too large"
+        );
+    }
+
+    let primary = state
+        .primary
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("primary screen is missing"))?;
+    let alternate = state
+        .alternate
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("alternate screen is missing"))?;
+    ensure!(
+        primary.included_rows.len() + alternate.included_rows.len() <= MAX_INCLUDED_ROWS,
+        "too many included terminal rows"
+    );
+
+    let mut cell_count = 0usize;
+    validate_screen(
+        primary,
+        false,
+        state,
+        &style_ids,
+        &hyperlink_ids,
+        &mut cell_count,
+    )?;
+    validate_screen(
+        alternate,
+        true,
+        state,
+        &style_ids,
+        &hyperlink_ids,
+        &mut cell_count,
+    )?;
+    ensure!(cell_count <= MAX_CELLS, "too many terminal cells");
+    Ok(())
+}
+
+fn validate_modes(modes: &Modes) -> Result<()> {
+    MouseTracking::try_from(modes.mouse_tracking)
+        .map_err(|_| anyhow::anyhow!("unknown mouse tracking enum"))?;
+    MouseEncoding::try_from(modes.mouse_encoding)
+        .map_err(|_| anyhow::anyhow!("unknown mouse encoding enum"))?;
+    KeyboardEncoding::try_from(modes.keyboard_encoding)
+        .map_err(|_| anyhow::anyhow!("unknown keyboard encoding enum"))?;
+    Ok(())
+}
+
+fn validate_palette(palette: &Palette) -> Result<()> {
+    ensure!(
+        palette.indexed_rgb.len() == 256,
+        "terminal palette must contain 256 indexed colors"
+    );
+    for rgb in palette.indexed_rgb.iter().copied().chain([
+        palette.foreground_rgb,
+        palette.background_rgb,
+        palette.cursor_fg_rgb,
+        palette.cursor_bg_rgb,
+        palette.selection_fg_rgb,
+        palette.selection_bg_rgb,
+    ]) {
+        ensure!(rgb <= 0x00ff_ffff, "terminal palette RGB is out of range");
+    }
+    Ok(())
+}
+
+fn validate_style(style: &Style) -> Result<()> {
+    validate_color(
+        style
+            .foreground
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("style foreground is missing"))?,
+    )?;
+    validate_color(
+        style
+            .background
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("style background is missing"))?,
+    )?;
+    validate_color(
+        style
+            .underline_color
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("style underline color is missing"))?,
+    )?;
+    Intensity::try_from(style.intensity).map_err(|_| anyhow::anyhow!("unknown intensity enum"))?;
+    Underline::try_from(style.underline).map_err(|_| anyhow::anyhow!("unknown underline enum"))?;
+    Blink::try_from(style.blink).map_err(|_| anyhow::anyhow!("unknown blink enum"))?;
+    SemanticType::try_from(style.semantic_type)
+        .map_err(|_| anyhow::anyhow!("unknown semantic type enum"))?;
+    VerticalAlign::try_from(style.vertical_align)
+        .map_err(|_| anyhow::anyhow!("unknown vertical align enum"))?;
+    Ok(())
+}
+
+fn validate_color(color: &Color) -> Result<()> {
+    match color
+        .value
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("style color is missing a value"))?
+    {
+        color::Value::DefaultColor(_) => Ok(()),
+        color::Value::PaletteIndex(index) => {
+            ensure!(*index < 256, "style palette index is out of range");
+            Ok(())
+        }
+        color::Value::Rgb(rgb) => {
+            ensure!(*rgb <= 0x00ff_ffff, "style RGB is out of range");
+            Ok(())
+        }
+    }
+}
+
+fn validate_screen(
+    screen: &Screen,
+    alternate: bool,
+    state: &State,
+    style_ids: &HashSet<u32>,
+    hyperlink_ids: &HashSet<u64>,
+    cell_count: &mut usize,
+) -> Result<()> {
+    ensure!(
+        !screen.included_rows.is_empty(),
+        "terminal screen has no included rows"
+    );
+    let viewport_start = usize::try_from(screen.viewport_start)?;
+    if alternate {
+        ensure!(
+            viewport_start == 0 && screen.included_rows.len() == state.rows as usize,
+            "alternate screen must contain exactly one viewport and no history"
+        );
+    }
+    let viewport_end = viewport_start
+        .checked_add(state.rows as usize)
+        .ok_or_else(|| anyhow::anyhow!("terminal viewport overflows"))?;
+    ensure!(
+        viewport_end <= screen.included_rows.len(),
+        "terminal viewport is not fully included"
+    );
+    validate_margins_and_tabs(screen, state)?;
+    let oldest = required_anchor(&screen.oldest_available, "oldest available anchor")?;
+    let newest = required_anchor(&screen.newest_available, "newest available anchor")?;
+    let included_start = required_anchor(&screen.included_start, "included start anchor")?;
+    let included_end = required_anchor(&screen.included_end, "included end anchor")?;
+    ensure!(
+        anchor_key(oldest) <= anchor_key(included_start),
+        "included rows start before available history"
+    );
+    ensure!(
+        anchor_key(included_start) <= anchor_key(included_end),
+        "included row range is reversed"
+    );
+    ensure!(
+        anchor_key(included_end) <= anchor_key(newest),
+        "included rows end after available history"
+    );
+
+    let first_start = required_anchor(&screen.included_rows[0].start, "first row anchor")?;
+    let last_start = required_anchor(
+        &screen.included_rows[screen.included_rows.len() - 1].start,
+        "last row anchor",
+    )?;
+    ensure!(
+        first_start == included_start && last_start == included_end,
+        "included row boundary anchors do not match rows"
+    );
+
+    let mut previous: Option<&Anchor> = None;
+    for (index, row) in screen.included_rows.iter().enumerate() {
+        let start = required_anchor(&row.start, "row anchor")?;
+        ensure!(
+            row.row_version > 0 && row.row_version <= state.generation,
+            "row version is outside the state generation"
+        );
+        if let Some(previous) = previous {
+            ensure!(
+                anchor_key(previous) < anchor_key(start),
+                "terminal row anchors are not strictly ordered"
+            );
+        }
+        if let Some(next) = screen.included_rows.get(index + 1) {
+            let next_start = required_anchor(&next.start, "next row anchor")?;
+            if row.wrapped_to_next {
+                ensure!(
+                    next_start.logical_line_id == start.logical_line_id,
+                    "wrapped rows changed logical line ID"
+                );
+                let expected_offset = start
+                    .cell_offset
+                    .checked_add(state.cols)
+                    .ok_or_else(|| anyhow::anyhow!("wrapped row offset overflows"))?;
+                ensure!(
+                    next_start.cell_offset == expected_offset,
+                    "wrapped row offset does not advance by terminal cols"
+                );
+            } else {
+                ensure!(
+                    next_start.logical_line_id > start.logical_line_id,
+                    "hard line break did not advance logical line ID"
+                );
+            }
+        }
+        validate_cells(row, state.cols, style_ids, hyperlink_ids, cell_count)?;
+        previous = Some(start);
+    }
+
+    validate_cursor(required_cursor(&screen.cursor, "cursor")?, screen, state)?;
+    if let Some(saved) = &screen.saved_cursor {
+        validate_cursor(saved, screen, state)?;
+    }
+    Ok(())
+}
+
+fn validate_margins_and_tabs(screen: &Screen, state: &State) -> Result<()> {
+    ensure!(
+        screen.scroll_margin_top < screen.scroll_margin_bottom
+            && screen.scroll_margin_bottom <= state.rows,
+        "vertical scroll margins are invalid"
+    );
+    ensure!(
+        screen.scroll_margin_left < screen.scroll_margin_right
+            && screen.scroll_margin_right <= state.cols,
+        "horizontal scroll margins are invalid"
+    );
+    ensure!(
+        screen.tab_stops.len() <= state.cols as usize,
+        "too many tab stops"
+    );
+    let mut previous = None;
+    for stop in &screen.tab_stops {
+        ensure!(*stop < state.cols, "tab stop is outside terminal cols");
+        if let Some(previous) = previous {
+            ensure!(previous < *stop, "tab stops are not strictly ordered");
+        }
+        previous = Some(*stop);
+    }
+    Ok(())
+}
+
+fn validate_cells(
+    row: &Row,
+    cols: u32,
+    style_ids: &HashSet<u32>,
+    hyperlink_ids: &HashSet<u64>,
+    cell_count: &mut usize,
+) -> Result<()> {
+    *cell_count = cell_count
+        .checked_add(row.cells.len())
+        .ok_or_else(|| anyhow::anyhow!("terminal cell count overflows"))?;
+    ensure!(*cell_count <= MAX_CELLS, "too many terminal cells");
+    let mut previous_end = 0;
+    for (index, cell) in row.cells.iter().enumerate() {
+        ensure!(!cell.grapheme.is_empty(), "terminal grapheme is empty");
+        ensure!(
+            cell.grapheme.len() <= MAX_GRAPHEME_BYTES,
+            "terminal grapheme is too large"
+        );
+        ensure!(
+            matches!(cell.width, 1 | 2),
+            "terminal grapheme width must be one or two"
+        );
+        let end = cell
+            .column
+            .checked_add(cell.width)
+            .ok_or_else(|| anyhow::anyhow!("terminal cell column overflows"))?;
+        ensure!(end <= cols, "terminal cell extends beyond terminal cols");
+        if index > 0 {
+            ensure!(
+                cell.column >= previous_end,
+                "terminal cells overlap or are out of order"
+            );
+        }
+        ensure!(
+            cell.style_id == 0 || style_ids.contains(&cell.style_id),
+            "terminal cell references an unknown style"
+        );
+        ensure!(
+            cell.hyperlink_id == 0 || hyperlink_ids.contains(&cell.hyperlink_id),
+            "terminal cell references an unknown hyperlink"
+        );
+        previous_end = end;
+    }
+    Ok(())
+}
+
+fn validate_cursor(cursor: &Cursor, screen: &Screen, state: &State) -> Result<()> {
+    ensure!(
+        cursor.x < state.cols && cursor.y < state.rows,
+        "terminal cursor ({}, {}) is outside {}x{} viewport",
+        cursor.x,
+        cursor.y,
+        state.cols,
+        state.rows
+    );
+    ensure!(
+        cursor.version > 0 && cursor.version <= state.generation,
+        "terminal cursor version is outside the state generation"
+    );
+    let shape = CursorShape::try_from(cursor.shape)
+        .map_err(|_| anyhow::anyhow!("unknown cursor shape enum"))?;
+    ensure!(
+        shape != CursorShape::Unspecified,
+        "cursor shape is unspecified"
+    );
+    let viewport_index = screen.viewport_start as usize + cursor.y as usize;
+    let row_start = required_anchor(
+        &screen.included_rows[viewport_index].start,
+        "cursor row anchor",
+    )?;
+    let anchor = required_anchor(&cursor.anchor, "cursor anchor")?;
+    ensure!(
+        anchor.logical_line_id == row_start.logical_line_id,
+        "cursor anchor has the wrong logical line ID"
+    );
+    ensure!(
+        anchor.cell_offset == row_start.cell_offset + cursor.x,
+        "cursor anchor has the wrong cell offset"
+    );
+    Ok(())
+}
+
+fn required_anchor<'a>(anchor: &'a Option<Anchor>, name: &str) -> Result<&'a Anchor> {
+    let anchor = anchor
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("{name} is missing"))?;
+    ensure!(
+        anchor.logical_line_id != 0,
+        "{name} has logical line ID zero"
+    );
+    Ok(anchor)
+}
+
+fn required_cursor<'a>(cursor: &'a Option<Cursor>, name: &str) -> Result<&'a Cursor> {
+    cursor
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("{name} is missing"))
+}
+
+fn anchor_key(anchor: &Anchor) -> (u64, u32) {
+    (anchor.logical_line_id, anchor.cell_offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    const VALID_STATE_GOLDEN_SHA256: &str =
+        "05ebe14d0552f3932fb9b5b0d09ab983d01beac8b6980b9eacac461b43d57b49";
+
+    fn anchor(logical_line_id: u64, cell_offset: u32) -> Anchor {
+        Anchor {
+            logical_line_id,
+            cell_offset,
+        }
+    }
+
+    fn screen(logical_line_id: u64, rows: u32, cols: u32) -> Screen {
+        let included_rows: Vec<_> = (0..rows)
+            .map(|row| Row {
+                start: Some(anchor(logical_line_id + row as u64, 0)),
+                row_version: 7,
+                cells: if row == 0 {
+                    vec![Cell {
+                        column: 0,
+                        grapheme: "界".into(),
+                        width: 2,
+                        style_id: 1,
+                        hyperlink_id: 1,
+                    }]
+                } else {
+                    vec![]
+                },
+                wrapped_to_next: false,
+            })
+            .collect();
+        Screen {
+            included_start: included_rows.first().unwrap().start.clone(),
+            included_end: included_rows.last().unwrap().start.clone(),
+            oldest_available: included_rows.first().unwrap().start.clone(),
+            newest_available: included_rows.last().unwrap().start.clone(),
+            included_rows,
+            viewport_start: 0,
+            cursor: Some(Cursor {
+                x: 0,
+                y: 0,
+                anchor: Some(anchor(logical_line_id, 0)),
+                shape: CursorShape::Block as i32,
+                visible: true,
+                version: 7,
+                wrap_pending: false,
+            }),
+            saved_cursor: None,
+            scroll_margin_top: 0,
+            scroll_margin_bottom: rows,
+            scroll_margin_left: 0,
+            scroll_margin_right: cols,
+            tab_stops: (8..cols).step_by(8).collect(),
+        }
+    }
+
+    fn valid_state() -> State {
+        State {
+            schema_version: SCHEMA_VERSION,
+            epoch: vec![7; EPOCH_BYTES],
+            generation: 7,
+            rows: 2,
+            cols: 10,
+            primary: Some(screen(1, 2, 10)),
+            alternate: Some(screen(100, 2, 10)),
+            active_screen: ScreenKind::Primary as i32,
+            styles: vec![Style {
+                id: 1,
+                foreground: Some(Color {
+                    value: Some(color::Value::PaletteIndex(2)),
+                }),
+                background: Some(Color {
+                    value: Some(color::Value::DefaultColor(true)),
+                }),
+                underline_color: Some(Color {
+                    value: Some(color::Value::Rgb(0x12_34_56)),
+                }),
+                intensity: Intensity::Bold as i32,
+                underline: Underline::Single as i32,
+                blink: Blink::None as i32,
+                italic: true,
+                reverse: false,
+                strikethrough: false,
+                invisible: false,
+                overline: false,
+                semantic_type: SemanticType::Output as i32,
+                vertical_align: VerticalAlign::Baseline as i32,
+            }],
+            hyperlinks: vec![Hyperlink {
+                id: 1,
+                uri: "https://example.test".into(),
+                explicit_id: "link".into(),
+            }],
+            modes: Some(Modes {
+                application_cursor_keys: true,
+                application_keypad: false,
+                bracketed_paste: true,
+                focus_tracking: false,
+                origin: false,
+                insert: false,
+                auto_wrap: true,
+                reverse_wraparound: false,
+                newline: false,
+                left_right_margin: false,
+                reverse_video: false,
+                mouse_tracking: MouseTracking::None as i32,
+                mouse_encoding: MouseEncoding::Default as i32,
+                keyboard_encoding: KeyboardEncoding::Xterm as i32,
+                keyboard_flags: 0,
+            }),
+            title: "Astra".into(),
+            working_directory: "/tmp".into(),
+            palette: Some(Palette {
+                indexed_rgb: vec![0; 256],
+                foreground_rgb: 0xff_ff_ff,
+                background_rgb: 0,
+                cursor_fg_rgb: 0,
+                cursor_bg_rgb: 0xff_ff_ff,
+                selection_fg_rgb: 0xff_ff_ff,
+                selection_bg_rgb: 0x33_33_33,
+            }),
+        }
+    }
+
+    #[test]
+    fn valid_state_round_trips_and_validates() {
+        let state = valid_state();
+        validate(&state).unwrap();
+        let bytes = state.encode_to_vec();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            VALID_STATE_GOLDEN_SHA256
+        );
+        let decoded = State::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, state);
+        validate(&decoded).unwrap();
+    }
+
+    #[test]
+    fn rejects_physical_row_identity_after_reflow() {
+        let mut state = valid_state();
+        {
+            let primary = state.primary.as_mut().unwrap();
+            primary.included_rows[0].wrapped_to_next = true;
+            primary.included_rows[1].start = Some(anchor(1, state.cols));
+            primary.included_end = primary.included_rows[1].start.clone();
+            primary.newest_available = primary.included_end.clone();
+        }
+        validate(&state).unwrap();
+
+        {
+            let primary = state.primary.as_mut().unwrap();
+            primary.included_rows[1].start = Some(anchor(2, 0));
+            primary.included_end = primary.included_rows[1].start.clone();
+            primary.newest_available = primary.included_end.clone();
+        }
+        assert!(
+            validate(&state)
+                .unwrap_err()
+                .to_string()
+                .contains("wrapped rows changed logical line ID")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_references_and_partial_alternate_screen() {
+        let mut state = valid_state();
+        state.primary.as_mut().unwrap().included_rows[0].cells[0].style_id = 99;
+        assert!(
+            validate(&state)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown style")
+        );
+
+        let mut state = valid_state();
+        state.alternate.as_mut().unwrap().included_rows.pop();
+        assert!(
+            validate(&state)
+                .unwrap_err()
+                .to_string()
+                .contains("alternate screen")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_epoch_generation_and_dimensions() {
+        let mut state = valid_state();
+        state.epoch.pop();
+        assert!(validate(&state).unwrap_err().to_string().contains("epoch"));
+
+        let mut state = valid_state();
+        state.generation = 0;
+        assert!(
+            validate(&state)
+                .unwrap_err()
+                .to_string()
+                .contains("generation")
+        );
+
+        let mut state = valid_state();
+        state.cols = MAX_DIMENSION + 1;
+        assert!(validate(&state).unwrap_err().to_string().contains("cols"));
+    }
+
+    #[test]
+    fn rejects_oversized_and_unknown_enum_state() {
+        let mut state = valid_state();
+        state.title = "x".repeat(MAX_TITLE_BYTES + 1);
+        assert!(validate(&state).unwrap_err().to_string().contains("title"));
+
+        let mut state = valid_state();
+        state.modes.as_mut().unwrap().mouse_tracking = 99;
+        assert!(
+            validate(&state)
+                .unwrap_err()
+                .to_string()
+                .contains("mouse tracking")
+        );
+    }
+}

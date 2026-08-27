@@ -10,9 +10,10 @@ use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
 
 use crate::{
-    ALPN, PROTOCOL_VERSION,
+    ALPN,
     auth::{authentication_payload, sign_challenge},
     known_hosts::{StrictHostKeyChecking, verify_server_certificate},
+    negotiation::{NegotiatedProtocol, ProtocolSupport, client_hello, validate_server_hello},
     protocol::{
         AbortUploadRequest, AttachRequest, AttachResponse, BeginDownloadRequest,
         BeginDownloadResponse, BeginUploadRequest, CloseRequest, CommitUploadRequest,
@@ -112,6 +113,7 @@ pub struct AstraClient {
     _endpoint: quinn::Endpoint,
     connection: quinn::Connection,
     reconnect: ReconnectConfig,
+    negotiated: NegotiatedProtocol,
 }
 
 #[derive(Clone)]
@@ -205,16 +207,22 @@ impl AstraClient {
             connection.close(1_u32.into(), b"host certificate rejected");
             return Err(error);
         }
-        authenticate(&connection, &reconnect.identity, &reconnect.username).await?;
+        let negotiated =
+            authenticate(&connection, &reconnect.identity, &reconnect.username).await?;
         Ok(Self {
             _endpoint: endpoint,
             connection,
             reconnect,
+            negotiated,
         })
     }
 
     pub async fn reconnect(&self) -> Result<Self> {
         Self::connect_with_config(self.reconnect.clone()).await
+    }
+
+    pub fn negotiated_protocol(&self) -> &NegotiatedProtocol {
+        &self.negotiated
     }
 
     pub async fn list(&self) -> Result<Vec<crate::protocol::TerminalInfo>> {
@@ -502,16 +510,12 @@ async fn authenticate(
     connection: &quinn::Connection,
     identity: &Path,
     username: &str,
-) -> Result<()> {
+) -> Result<NegotiatedProtocol> {
     let (mut send, mut recv) = connection.open_bi().await?;
+    let client_hello = client_hello(username, &ProtocolSupport::runtime());
     write_message(
         &mut send,
-        &WireMessage::new(wire_message::Body::ClientHello(
-            crate::protocol::ClientHello {
-                protocol_version: PROTOCOL_VERSION,
-                username: username.into(),
-            },
-        )),
+        &WireMessage::new(wire_message::Body::ClientHello(client_hello.clone())),
     )
     .await?;
     let hello = match read_message(&mut recv).await? {
@@ -520,13 +524,7 @@ async fn authenticate(
         }) => hello,
         _ => bail!("server did not send ServerHello"),
     };
-    if hello.protocol_version != PROTOCOL_VERSION {
-        bail!(
-            "server protocol version {} is incompatible with client version {}",
-            hello.protocol_version,
-            PROTOCOL_VERSION
-        )
-    }
+    let negotiated = validate_server_hello(&client_hello, &hello)?;
     let payload = authentication_payload(&hello.challenge, username, &hello.server_instance);
     let (public_key, signature_pem) = sign_challenge(identity, &payload)?;
     write_message(
@@ -543,7 +541,7 @@ async fn authenticate(
     match read_message(&mut recv).await? {
         Some(WireMessage {
             body: Some(wire_message::Body::AuthResult(result)),
-        }) if result.ok => Ok(()),
+        }) if result.ok => Ok(negotiated),
         Some(WireMessage {
             body: Some(wire_message::Body::AuthResult(result)),
         }) => bail!("authentication failed: {}", result.message),
