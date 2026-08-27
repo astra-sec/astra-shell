@@ -6,7 +6,7 @@
 
 ## 背景
 
-现有 daemon 直接以全局 `HashMap<String, Terminal>` 暴露 `List/Spawn/Attach`。所谓 Apple `AstraHostWorkspace` 只是本机 UI 容器；服务端没有 Workspace，Attachment 也只是某条 QUIC Stream 的隐含状态。这个结构无法可靠回答 Terminal 属于哪个资源容器、一个用户有多少 Attachment，因而不能作为 `OPS-01` 配额、`SESS-02` 租约或后续独立 worker 的基础。
+现有 daemon 直接以全局 `HashMap<String, Terminal>` 暴露 `List/Spawn/Attach`。所谓 Apple `AstraHostWorkspace` 只是本机 UI 容器；服务端没有 Workspace，Attachment 也只是某条 QUIC Stream 的隐含状态。这个结构无法可靠回答 Terminal 属于哪个资源容器、一个用户有多少 Attachment，因而不能作为 `OPS-01` 配额、`SESS-02` 租约或用户 worker 生命周期治理的基础。
 
 ## 决策
 
@@ -68,7 +68,7 @@ Workspace 是资源容器，不是 tmux window 或共享“当前 pane”。标�
 
 - lease TTL、renew/release 和 resize owner（`SESS-02`）；
 - 用户/全局资源上限（`OPS-01`）；
-- 每 Terminal 独立进程与 sessiond 重接管（`WORK-01/02`）；
+- 每用户 worker 的发现、故障和升级生命周期（`WORK-01/02/03`，见 ADR 0005）；
 - 服务端同步客户端 layout；
 - daemon 或主机重启后恢复 PTY。
 

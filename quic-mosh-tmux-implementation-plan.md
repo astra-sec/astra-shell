@@ -4,6 +4,11 @@
 > 日期：2026-08-21
 > 暂定项目名：QTerm（仅用于本文指代）
 
+> 后续决策：本文关于“每 Terminal 一个 worker”的进程隔离、重接管和升级描述，已由
+> [ADR 0005](docs/adr/0005-per-user-worker-lifecycle.md) 取代。正式架构为每个 Unix UID
+> 一个长期非特权 worker，由它管理该用户的全部 Workspace、Terminal 和 PTY；原文保留
+> 作为规划历史，不再作为实现或验收前置。
+
 ## 1. 执行摘要
 
 本项目不是把 QUIC、Mosh 和 tmux 简单拼接，而是实现一个新的远程终端平台：

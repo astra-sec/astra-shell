@@ -9,7 +9,7 @@ Astra Shell 是一个以 QUIC 连接多个持久 PTY 的远程终端原型。`as
 - OpenSSH Ed25519/RSA 私钥、SSHSIG challenge-response 和 `authorized_keys`；
 - 客户端选择目标 Unix 用户，签名同时绑定用户名、服务实例和随机 challenge；
 - managed gateway 按 passwd 数据库查找用户及其 `~/.ssh/authorized_keys`；
-- 每个 UID 独立的降权 worker、Unix socket 和 PTY；
+- 每个 UID 一个独立的长期降权 worker 和 Unix socket，由该 worker 管理用户的全部 Workspace、Terminal 和 PTY；
 - root gateway 不创建 PTY，只代理认证后的协议字节流；
 - 一条 QUIC 连接上的多个独立双向请求流；
 - 创建、列出、附着和关闭多个 PTY；
@@ -269,4 +269,4 @@ cargo clippy --all-targets -- -D warnings
 - 暂无 SSH stdio fallback；
 - rootless 模式的 PTY 仍由 gateway 进程持有；managed 模式已经使用可跨 gateway 重启存活、空闲时自动回收的独立用户 worker，但尚未提供正式的 worker 升级管理命令。
 
-线协议定义见 [`proto/astra.proto`](proto/astra.proto)，总体产品方向见 [`quic-mosh-tmux-implementation-plan.md`](quic-mosh-tmux-implementation-plan.md)。
+线协议定义见 [`proto/astra.proto`](proto/astra.proto)，总体产品方向见 [`quic-mosh-tmux-implementation-plan.md`](quic-mosh-tmux-implementation-plan.md)。每用户 worker 的正式进程、故障和升级边界见 [`docs/adr/0005-per-user-worker-lifecycle.md`](docs/adr/0005-per-user-worker-lifecycle.md)。
