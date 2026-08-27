@@ -262,6 +262,8 @@ pub struct Modes {
     pub keyboard_encoding: i32,
     #[prost(uint32, tag = "15")]
     pub keyboard_flags: u32,
+    #[prost(bool, tag = "16")]
+    pub alternate_scroll: bool,
 }
 
 terminal_enum!(MouseTracking {
@@ -417,8 +419,22 @@ fn validate_modes(modes: &Modes) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("unknown mouse tracking enum"))?;
     MouseEncoding::try_from(modes.mouse_encoding)
         .map_err(|_| anyhow::anyhow!("unknown mouse encoding enum"))?;
-    KeyboardEncoding::try_from(modes.keyboard_encoding)
+    let keyboard_encoding = KeyboardEncoding::try_from(modes.keyboard_encoding)
         .map_err(|_| anyhow::anyhow!("unknown keyboard encoding enum"))?;
+    match keyboard_encoding {
+        KeyboardEncoding::Xterm | KeyboardEncoding::CsiU => {
+            ensure!(
+                modes.keyboard_flags == 0,
+                "keyboard flags require kitty encoding"
+            );
+        }
+        KeyboardEncoding::Kitty => {
+            ensure!(
+                modes.keyboard_flags & !0x1f == 0,
+                "unknown kitty keyboard flags"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -726,7 +742,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     const VALID_STATE_GOLDEN_SHA256: &str =
-        "05ebe14d0552f3932fb9b5b0d09ab983d01beac8b6980b9eacac461b43d57b49";
+        "a0d4babf5836c43c875c7fa3bbd0c856ba46dbccd7c5ec1ac98fba7c1206bb1a";
 
     fn anchor(logical_line_id: u64, cell_offset: u32) -> Anchor {
         Anchor {
@@ -832,6 +848,7 @@ mod tests {
                 mouse_encoding: MouseEncoding::Default as i32,
                 keyboard_encoding: KeyboardEncoding::Xterm as i32,
                 keyboard_flags: 0,
+                alternate_scroll: true,
             }),
             title: "Astra".into(),
             working_directory: "/tmp".into(),
@@ -948,6 +965,26 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("mouse tracking")
+        );
+
+        let mut state = valid_state();
+        state.modes.as_mut().unwrap().keyboard_flags = 1;
+        assert!(
+            validate(&state)
+                .unwrap_err()
+                .to_string()
+                .contains("kitty encoding")
+        );
+
+        let mut state = valid_state();
+        let modes = state.modes.as_mut().unwrap();
+        modes.keyboard_encoding = KeyboardEncoding::Kitty as i32;
+        modes.keyboard_flags = 0x20;
+        assert!(
+            validate(&state)
+                .unwrap_err()
+                .to_string()
+                .contains("kitty keyboard flags")
         );
     }
 }

@@ -19,6 +19,7 @@ pub enum AstraCursorShape {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AstraMouseTracking {
     None,
+    X10,
     Vt200,
     ButtonEvent,
     AnyEvent,
@@ -62,6 +63,7 @@ pub struct AstraModesView {
     pub newline: bool,
     pub left_right_margin: bool,
     pub reverse_video: bool,
+    pub alternate_scroll: bool,
     pub mouse_tracking: AstraMouseTracking,
     pub mouse_encoding: AstraMouseEncoding,
     pub keyboard_encoding: AstraKeyboardEncoding,
@@ -235,12 +237,15 @@ impl TerminalState {
                 newline: self.newline_mode,
                 left_right_margin: self.left_and_right_margin_mode,
                 reverse_video: self.reverse_video_mode,
+                alternate_scroll: self.alternate_scroll,
                 mouse_tracking: if self.any_event_mouse {
                     AstraMouseTracking::AnyEvent
                 } else if self.button_event_mouse {
                     AstraMouseTracking::ButtonEvent
                 } else if self.mouse_tracking {
                     AstraMouseTracking::Vt200
+                } else if self.x10_mouse {
+                    AstraMouseTracking::X10
                 } else {
                     AstraMouseTracking::None
                 },

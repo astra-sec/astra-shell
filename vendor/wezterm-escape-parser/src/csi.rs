@@ -903,6 +903,8 @@ pub enum DecPrivateModeCode {
     AutoWrap = 7,
     /// https://vt100.net/docs/vt510-rm/DECARM.html
     AutoRepeat = 8,
+    /// Original X10 mouse protocol: report button presses only.
+    X10Mouse = 9,
     StartBlinkingCursor = 12,
     ShowCursor = 25,
 
@@ -929,6 +931,9 @@ pub enum DecPrivateModeCode {
     /// enable mouse reporting itself, it just controls how reports
     /// will be encoded.
     SGRMouse = 1006,
+    /// Translate wheel input to cursor keys while the alternate screen is active
+    /// and no mouse tracking mode is enabled.
+    AlternateScroll = 1007,
     /// Use pixels rather than text cells in mouse reporting.  Does
     /// not enable mouse reporting itself, it just controls how
     /// reports will be encoded.

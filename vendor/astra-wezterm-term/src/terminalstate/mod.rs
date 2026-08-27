@@ -325,9 +325,13 @@ pub struct TerminalState {
     /// X10 (legacy), SGR, and SGR-Pixels style mouse tracking and
     /// reporting is enabled
     mouse_encoding: MouseEncoding,
+    /// Original X10 button-press-only mouse reporting mode (DECSET 9).
+    x10_mouse: bool,
     mouse_tracking: bool,
     /// Button events enabled
     button_event_mouse: bool,
+    /// Alternate scroll mode (DECSET 1007).
+    alternate_scroll: bool,
     current_mouse_buttons: Vec<MouseButton>,
     last_mouse_move: Option<MouseEvent>,
     cursor_visible: bool,
@@ -555,10 +559,12 @@ impl TerminalState {
             bracketed_paste: false,
             focus_tracking: false,
             mouse_encoding: MouseEncoding::X10,
+            x10_mouse: false,
             keyboard_encoding: KeyboardEncoding::Xterm,
             sixel_scrolls_right: false,
             any_event_mouse: false,
             button_event_mouse: false,
+            alternate_scroll: true,
             mouse_tracking: false,
             last_mouse_move: None,
             cursor_visible: true,
@@ -768,7 +774,7 @@ impl TerminalState {
     /// This is useful for the hosting GUI application to decide how best
     /// to dispatch mouse events to the terminal.
     pub fn is_mouse_grabbed(&self) -> bool {
-        self.mouse_tracking || self.button_event_mouse || self.any_event_mouse
+        self.x10_mouse || self.mouse_tracking || self.button_event_mouse || self.any_event_mouse
     }
 
     pub fn is_alt_screen_active(&self) -> bool {
@@ -1778,6 +1784,18 @@ impl TerminalState {
                 self.cursor_visible = false;
             }
 
+            Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::X10Mouse)) => {
+                self.x10_mouse = true;
+                self.last_mouse_move.take();
+            }
+            Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::X10Mouse)) => {
+                self.x10_mouse = false;
+                self.last_mouse_move.take();
+            }
+            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::X10Mouse)) => {
+                self.decqrm_response(mode, true, self.x10_mouse);
+            }
+
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::MouseTracking)) => {
                 self.mouse_tracking = true;
                 self.last_mouse_move.take();
@@ -1835,6 +1853,22 @@ impl TerminalState {
             }
             Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::FocusTracking)) => {
                 self.decqrm_response(mode, true, self.focus_tracking);
+            }
+
+            Mode::SetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::AlternateScroll,
+            )) => {
+                self.alternate_scroll = true;
+            }
+            Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::AlternateScroll,
+            )) => {
+                self.alternate_scroll = false;
+            }
+            Mode::QueryDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::AlternateScroll,
+            )) => {
+                self.decqrm_response(mode, true, self.alternate_scroll);
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::SGRMouse)) => {

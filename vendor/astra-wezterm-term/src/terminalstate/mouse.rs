@@ -77,7 +77,10 @@ impl TerminalState {
         let (button, _button) = self.mouse_report_button_number(&event);
 
         if self.mouse_encoding == MouseEncoding::SGR
-            && (self.mouse_tracking || self.button_event_mouse || self.any_event_mouse)
+            && (self.x10_mouse
+                || self.mouse_tracking
+                || self.button_event_mouse
+                || self.any_event_mouse)
         {
             log::trace!(
                 "wheel {event:?} ESC [<{};{};{}M",
@@ -94,7 +97,10 @@ impl TerminalState {
             )?;
             self.writer.flush()?;
         } else if self.mouse_encoding == MouseEncoding::SgrPixels
-            && (self.mouse_tracking || self.button_event_mouse || self.any_event_mouse)
+            && (self.x10_mouse
+                || self.mouse_tracking
+                || self.button_event_mouse
+                || self.any_event_mouse)
         {
             let height = self.screen.physical_rows as usize;
             let width = self.screen.physical_cols as usize;
@@ -116,9 +122,13 @@ impl TerminalState {
                     + 1
             )?;
             self.writer.flush()?;
-        } else if self.mouse_tracking || self.button_event_mouse || self.any_event_mouse {
+        } else if self.x10_mouse
+            || self.mouse_tracking
+            || self.button_event_mouse
+            || self.any_event_mouse
+        {
             self.encode_x10_or_utf8(event, button)?;
-        } else if self.screen.is_alt_screen_active() {
+        } else if self.screen.is_alt_screen_active() && self.alternate_scroll {
             // Send cursor keys instead (equivalent to xterm's alternateScroll mode)
             for _ in 0..self.config.alternate_buffer_wheel_scroll_speed() {
                 self.key_down(
@@ -141,7 +151,11 @@ impl TerminalState {
         self.current_mouse_buttons.retain(|&b| b != event_button);
         self.current_mouse_buttons.push(event_button);
 
-        if !(self.mouse_tracking || self.button_event_mouse || self.any_event_mouse) {
+        if !(self.x10_mouse
+            || self.mouse_tracking
+            || self.button_event_mouse
+            || self.any_event_mouse)
+        {
             return Ok(());
         }
 

@@ -29,6 +29,10 @@ impl TerminalConfiguration for AstraTerminalConfiguration {
     fn color_palette(&self) -> ColorPalette {
         ColorPalette::default()
     }
+
+    fn enable_kitty_keyboard(&self) -> bool {
+        true
+    }
 }
 
 /// The one authoritative VT model for an Astra PTY. It owns engine state and
@@ -238,9 +242,11 @@ fn render_legacy_screen(state: &State, screen: &Screen) -> Vec<u8> {
         legacy_mode(&mut output, 45, modes.reverse_wraparound);
         legacy_mode(&mut output, 69, modes.left_right_margin);
         legacy_mode(&mut output, 1004, modes.focus_tracking);
+        legacy_mode(&mut output, 1007, modes.alternate_scroll);
         legacy_mode(&mut output, 2004, modes.bracketed_paste);
         match MouseTracking::try_from(modes.mouse_tracking).unwrap_or(MouseTracking::None) {
-            MouseTracking::None | MouseTracking::X10 => {}
+            MouseTracking::None => {}
+            MouseTracking::X10 => legacy_mode(&mut output, 9, true),
             MouseTracking::Vt200 => legacy_mode(&mut output, 1000, true),
             MouseTracking::ButtonEvent => legacy_mode(&mut output, 1002, true),
             MouseTracking::AnyEvent => legacy_mode(&mut output, 1003, true),
@@ -507,8 +513,10 @@ fn export_modes(modes: AstraModesView) -> Modes {
         newline: modes.newline,
         left_right_margin: modes.left_right_margin,
         reverse_video: modes.reverse_video,
+        alternate_scroll: modes.alternate_scroll,
         mouse_tracking: match modes.mouse_tracking {
             AstraMouseTracking::None => MouseTracking::None as i32,
+            AstraMouseTracking::X10 => MouseTracking::X10 as i32,
             AstraMouseTracking::Vt200 => MouseTracking::Vt200 as i32,
             AstraMouseTracking::ButtonEvent => MouseTracking::ButtonEvent as i32,
             AstraMouseTracking::AnyEvent => MouseTracking::AnyEvent as i32,
@@ -756,6 +764,32 @@ mod tests {
                 .flat_map(|row| &row.cells)
                 .any(|cell| cell.grapheme == "red" || cell.grapheme == "r")
         );
+    }
+
+    #[test]
+    fn exports_authoritative_input_modes_including_x10_and_alternate_scroll() {
+        let sink = ReplySink::default();
+        let mut engine = TerminalEngine::new(3, 12, 32, Box::new(sink)).unwrap();
+
+        engine.advance(
+            b"\x1b[?1h\x1b=\x1b[?9h\x1b[?1006h\x1b[?1007l\x1b[?2004h\x1b[=5u",
+        );
+        let state = engine.semantic_state().unwrap();
+        let modes = state.modes.unwrap();
+
+        assert!(modes.application_cursor_keys);
+        assert!(modes.application_keypad);
+        assert!(modes.bracketed_paste);
+        assert!(!modes.alternate_scroll);
+        assert_eq!(modes.mouse_tracking, MouseTracking::X10 as i32);
+        assert_eq!(modes.mouse_encoding, MouseEncoding::Sgr as i32);
+        assert_eq!(modes.keyboard_encoding, KeyboardEncoding::Kitty as i32);
+        assert_eq!(modes.keyboard_flags, 5);
+
+        engine.advance(b"\x1b[?9l\x1b[?1003h\x1b[?1007h");
+        let modes = engine.semantic_state().unwrap().modes.unwrap();
+        assert!(modes.alternate_scroll);
+        assert_eq!(modes.mouse_tracking, MouseTracking::AnyEvent as i32);
     }
 
     #[test]

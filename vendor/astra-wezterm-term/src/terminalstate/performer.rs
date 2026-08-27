@@ -705,6 +705,7 @@ impl<'a> Performer<'a> {
                 self.application_keypad = false;
                 self.bracketed_paste = false;
                 self.focus_tracking = false;
+                self.x10_mouse = false;
                 self.mouse_tracking = false;
                 self.mouse_encoding = MouseEncoding::X10;
                 self.keyboard_encoding = KeyboardEncoding::Xterm;
@@ -712,6 +713,7 @@ impl<'a> Performer<'a> {
                 self.sixel_scrolls_right = false;
                 self.any_event_mouse = false;
                 self.button_event_mouse = false;
+                self.alternate_scroll = true;
                 self.current_mouse_buttons.clear();
                 self.cursor_visible = true;
                 self.g0_charset = CharSet::Ascii;

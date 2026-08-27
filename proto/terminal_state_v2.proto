@@ -177,6 +177,7 @@ message Modes {
   MouseEncoding mouse_encoding = 13;
   KeyboardEncoding keyboard_encoding = 14;
   uint32 keyboard_flags = 15;
+  bool alternate_scroll = 16;
 }
 
 enum MouseTracking {
