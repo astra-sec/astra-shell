@@ -244,4 +244,41 @@ if HOME="$run_dir/home" XDG_CONFIG_HOME="$run_dir/home/.config" target/debug/ast
 fi
 
 "${client[@]}" close "$terminal_id" >/dev/null
+
+# A quota rejection must be an application error and must not kill the resource
+# that already owns the admitted capacity.
+kill "$daemon_pid"
+wait "$daemon_pid" 2>/dev/null || true
+quota_log="$run_dir/quota-server.log"
+HOME="$run_dir/home" target/debug/astrad serve \
+  --listen "$listen" \
+  --state-dir "$run_dir/server" \
+  --session-root "$repo_dir" \
+  --max-user-terminals 1 >"$quota_log" 2>&1 &
+daemon_pid=$!
+quota_listen=""
+for _ in $(seq 1 50); do
+  quota_listen="$(awk '/^LISTEN / { print $2; exit }' "$quota_log")"
+  if [[ "$quota_listen" == "$listen" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$quota_listen" != "$listen" ]]; then
+  echo "quota test daemon did not restart on $listen; see $quota_log" >&2
+  exit 1
+fi
+
+admitted_id="$("${client[@]}" new --name quota-admitted -- /bin/sleep 30)"
+quota_status=0
+quota_error="$("${client[@]}" new --name quota-rejected -- /bin/sleep 30 2>&1)" || quota_status=$?
+if [[ "$quota_status" -eq 0 ]] || ! printf '%s' "$quota_error" | rg -q 'quota'; then
+  echo "second terminal was not rejected with a quota error: $quota_error" >&2
+  exit 1
+fi
+if ! "${client[@]}" list | awk -v id="$admitted_id" '$1 == id { found = 1 } END { exit !found }'; then
+  echo "quota rejection removed the already admitted terminal" >&2
+  exit 1
+fi
+"${client[@]}" close "$admitted_id" >/dev/null
 echo "smoke test passed; artifacts: $run_dir"
