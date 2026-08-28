@@ -405,7 +405,7 @@ pub async fn serve_worker(
             completed = requests.join_next(), if !requests.is_empty() => {
                 match completed {
                     Some(Ok(Ok(()))) => {}
-                    Some(Ok(Err(error))) => warn!(%error, "worker request failed"),
+                    Some(Ok(Err(error))) => warn!(error = ?error, "worker request failed"),
                     Some(Err(error)) => warn!(%error, "worker request task failed"),
                     None => {}
                 }

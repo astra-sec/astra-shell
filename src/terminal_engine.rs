@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, io::Write, sync::Arc};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use astra_wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
 use astra_wezterm_term::{
     AstraCellView, AstraCursorShape, AstraCursorView, AstraKeyboardEncoding, AstraModesView,
@@ -194,7 +194,9 @@ impl TerminalEngine {
             working_directory: view.working_directory.unwrap_or_default().to_owned(),
             palette: Some(export_palette(&view.palette)),
         };
-        terminal_state_v2::validate(&state).context("authoritative terminal state is invalid")?;
+        if let Err(error) = terminal_state_v2::validate(&state) {
+            bail!("authoritative terminal state is invalid: {error:#}");
+        }
         Ok(state)
     }
 
@@ -256,7 +258,15 @@ impl TerminalEngine {
         let mut tables = ExportTables::default();
         let included_rows = primary
             .rows(start_index, end_index - start_index)
-            .map(|row| export_row(row, self.epoch_sequence_start, generation, &mut tables))
+            .map(|row| {
+                export_row(
+                    row,
+                    primary.column_count(),
+                    self.epoch_sequence_start,
+                    generation,
+                    &mut tables,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         let included_start = included_rows.first().and_then(|row| row.start.clone());
         let included_end = included_rows.last().and_then(|row| row.start.clone());
@@ -552,7 +562,15 @@ fn export_screen(
     let maximum_rows = row_count - included_start_index;
     let included_rows = view
         .rows(included_start_index, maximum_rows)
-        .map(|row| export_row(row, epoch_sequence_start, generation, tables))
+        .map(|row| {
+            export_row(
+                row,
+                view.column_count(),
+                epoch_sequence_start,
+                generation,
+                tables,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     let oldest_available = view
         .rows(0, 1)
@@ -578,6 +596,8 @@ fn export_screen(
         epoch_sequence_start,
         &included_rows,
         included_viewport_start,
+        view.column_count(),
+        view.viewport_row_count(),
     )?;
     let saved_cursor = view
         .saved_cursor
@@ -587,6 +607,8 @@ fn export_screen(
                 epoch_sequence_start,
                 &included_rows,
                 included_viewport_start,
+                view.column_count(),
+                view.viewport_row_count(),
             )
         })
         .transpose()?;
@@ -606,6 +628,7 @@ fn export_screen(
         scroll_margin_right: u32::try_from(view.scroll_margin_right)?,
         tab_stops: view
             .tab_stops()
+            .filter(|column| *column < view.column_count())
             .map(u32::try_from)
             .collect::<std::result::Result<Vec<_>, _>>()?,
     })
@@ -613,6 +636,7 @@ fn export_screen(
 
 fn export_row(
     row: AstraRowView<'_>,
+    columns: usize,
     epoch_sequence_start: u64,
     generation: u64,
     tables: &mut ExportTables,
@@ -622,6 +646,11 @@ fn export_row(
     let wrapped_to_next = row.wrapped_to_next();
     let cells = row
         .cells()
+        .filter(|cell| {
+            cell.column()
+                .checked_add(cell.width())
+                .is_some_and(|end| end <= columns)
+        })
         .filter_map(|cell| tables.export_cell(cell).transpose())
         .collect::<Result<Vec<_>>>()?;
     Ok(Row {
@@ -640,20 +669,24 @@ fn export_cursor(
     epoch_sequence_start: u64,
     rows: &[Row],
     viewport_start: usize,
+    columns: usize,
+    viewport_rows: usize,
 ) -> Result<Cursor> {
     let display_x = if cursor.wrap_pending {
         cursor.x.saturating_sub(1)
     } else {
         cursor.x
-    };
+    }
+    .min(columns.saturating_sub(1));
+    let display_y = cursor.y.min(viewport_rows.saturating_sub(1));
     let row = rows
-        .get(viewport_start.saturating_add(cursor.y))
+        .get(viewport_start.saturating_add(display_y))
         .or_else(|| rows.get(viewport_start))
         .context("cursor is outside included viewport")?;
     let start = row.start.as_ref().context("cursor row has no anchor")?;
     Ok(Cursor {
         x: u32::try_from(display_x)?,
-        y: u32::try_from(cursor.y)?,
+        y: u32::try_from(display_y)?,
         anchor: Some(anchor(
             start.logical_line_id,
             usize::try_from(start.cell_offset)? + display_x,
@@ -665,7 +698,7 @@ fn export_cursor(
         },
         visible: cursor.visible,
         version: epoch_relative_version(cursor.version, epoch_sequence_start)?,
-        wrap_pending: cursor.wrap_pending,
+        wrap_pending: cursor.wrap_pending && display_x + 1 == columns,
     })
 }
 
@@ -1039,6 +1072,23 @@ mod tests {
                 >= 2
         );
         assert_eq!(before.epoch, after.epoch);
+    }
+
+    #[test]
+    fn exported_state_remains_valid_after_realistic_window_growth_and_shrink() {
+        let mut engine = TerminalEngine::new(24, 80, 10_000, Box::new(ReplySink::default())).unwrap();
+        engine.advance(
+            b"Welcome to Ubuntu 24.04.4 LTS\r\n$ printf 'ASTRA_LEASE_INPUT_OK\\n'\r\nASTRA_LEASE_INPUT_OK\r\n$ stty size\r\n24 80\r\n$ ",
+        );
+        engine.resize(56, 158, 1_264, 896).unwrap();
+        engine.semantic_state().unwrap();
+
+        // The engine deliberately retains tab stops and the saved cursor beyond a temporary
+        // narrower viewport so a later expansion can restore them. The semantic snapshot must
+        // project those retained values into the current grid rather than becoming invalid.
+        engine.advance(b"\x1b[150GX\x1b7");
+        engine.resize(44, 126, 1_008, 704).unwrap();
+        engine.semantic_state().unwrap();
     }
 
     #[test]

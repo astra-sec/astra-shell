@@ -124,6 +124,14 @@ impl<'a> AstraScreenView<'a> {
         self.screen.astra_row_count()
     }
 
+    pub fn column_count(&self) -> usize {
+        self.screen.physical_cols
+    }
+
+    pub fn viewport_row_count(&self) -> usize {
+        self.screen.physical_rows
+    }
+
     pub fn viewport_start(&self) -> usize {
         self.screen.astra_viewport_start()
     }
