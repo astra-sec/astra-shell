@@ -29,8 +29,8 @@ use crate::{
         ClipboardSelection as WireClipboardSelection, ClipboardWrite, ErrorResponse,
         HistoryPageChunk, LeaseChanged, LeaseControlAction, ListResponse, Response, ServerHello,
         SpawnResponse, TerminalEvent, TerminalListResponse, TerminalStateChunk, WireMessage,
-        WorkerStreamHello, WorkspaceListResponse, WorkspaceResponse, read_message, request,
-        response, terminal_command, terminal_event, wire_message, write_message,
+        WorkerStreamHello, WorkspaceListResponse, read_message, request, response,
+        terminal_command, terminal_event, wire_message, write_message,
     },
     resources::{QuotaExceeded, ResourceClaim, ResourceGovernor, ResourcePolicy},
     session::SessionManager,
@@ -984,59 +984,28 @@ where
             send_file_ack(&mut send, request_id, result, "file renamed").await?;
         }
         Some(request::Command::ListWorkspaces(_)) if session_objects => {
+            let workspace = manager.workspace(&manager.default_workspace_id())?;
             send_response(
                 &mut send,
                 request_id,
                 response::Result::WorkspaceList(WorkspaceListResponse {
-                    workspaces: manager.list_workspaces(),
+                    workspaces: vec![workspace],
                 }),
             )
             .await?;
         }
-        Some(request::Command::CreateWorkspace(create)) if session_objects => {
-            match manager.create_workspace(&create.name) {
-                Ok(workspace) => {
-                    send_response(
-                        &mut send,
-                        request_id,
-                        response::Result::Workspace(WorkspaceResponse {
-                            workspace: Some(workspace),
-                        }),
-                    )
-                    .await?;
-                }
-                Err(error) => send_error(&mut send, request_id, "workspace", error).await?,
-            }
-        }
-        Some(request::Command::RenameWorkspace(rename)) if session_objects => {
-            match manager.rename_workspace(&rename.workspace_id, &rename.name) {
-                Ok(workspace) => {
-                    send_response(
-                        &mut send,
-                        request_id,
-                        response::Result::Workspace(WorkspaceResponse {
-                            workspace: Some(workspace),
-                        }),
-                    )
-                    .await?;
-                }
-                Err(error) => send_error(&mut send, request_id, "workspace", error).await?,
-            }
-        }
-        Some(request::Command::DeleteWorkspace(delete)) if session_objects => {
-            match manager.delete_workspace(&delete.workspace_id) {
-                Ok(()) => {
-                    send_response(
-                        &mut send,
-                        request_id,
-                        response::Result::Ack(AckResponse {
-                            message: "workspace deleted".into(),
-                        }),
-                    )
-                    .await?;
-                }
-                Err(error) => send_error(&mut send, request_id, "conflict", error).await?,
-            }
+        Some(
+            request::Command::CreateWorkspace(_)
+            | request::Command::RenameWorkspace(_)
+            | request::Command::DeleteWorkspace(_),
+        ) if session_objects => {
+            send_error(
+                &mut send,
+                request_id,
+                "unsupported",
+                anyhow!("multiple Workspaces are not enabled; use the default Workspace"),
+            )
+            .await?;
         }
         Some(request::Command::ListTerminals(list)) if session_objects => {
             match manager.list_terminals(&list.workspace_id, list.include_exited) {
