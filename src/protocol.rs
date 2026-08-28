@@ -775,6 +775,8 @@ pub struct AttachResponse {
     pub snapshot: Option<TerminalSnapshot>,
     #[prost(message, optional, tag = "7")]
     pub attachment: Option<AttachmentInfo>,
+    #[prost(uint32, tag = "8")]
+    pub lease_ttl_ms: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -801,7 +803,7 @@ pub struct TerminalCommand {
     pub sequence: u64,
     #[prost(string, tag = "4")]
     pub attachment_id: String,
-    #[prost(oneof = "terminal_command::Command", tags = "10, 11, 12, 13")]
+    #[prost(oneof = "terminal_command::Command", tags = "10, 11, 12, 13, 14")]
     pub command: Option<terminal_command::Command>,
 }
 
@@ -818,7 +820,23 @@ pub mod terminal_command {
         Detach(bool),
         #[prost(message, tag = "13")]
         HistoryPage(HistoryPageRequest),
+        #[prost(message, tag = "14")]
+        LeaseControl(LeaseControl),
     }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct LeaseControl {
+    #[prost(enumeration = "LeaseControlAction", tag = "1")]
+    pub action: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum LeaseControlAction {
+    Unspecified = 0,
+    Renew = 1,
+    Release = 2,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -930,6 +948,10 @@ pub struct LeaseChanged {
     pub read_only: bool,
     #[prost(string, tag = "2")]
     pub reason: String,
+    #[prost(string, tag = "3")]
+    pub lease_id: String,
+    #[prost(uint32, tag = "4")]
+    pub lease_ttl_ms: u32,
 }
 
 impl WireMessage {
@@ -1096,6 +1118,65 @@ mod tests {
         let legacy = LegacyTerminalEvent::decode(event.encode_to_vec().as_slice()).unwrap();
         assert_eq!(legacy.terminal_id, "terminal");
         assert!(legacy.event.is_none());
+    }
+
+    #[test]
+    fn input_lease_fields_and_commands_are_additive_for_n_minus_one() {
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyAttachResponse {
+            #[prost(string, tag = "2")]
+            lease_id: String,
+            #[prost(bool, tag = "3")]
+            read_only: bool,
+            #[prost(string, tag = "5")]
+            resume_token: String,
+        }
+        let response = AttachResponse {
+            lease_id: "lease".into(),
+            read_only: false,
+            resume_token: "resume".into(),
+            lease_ttl_ms: 15_000,
+            ..Default::default()
+        };
+        let legacy = LegacyAttachResponse::decode(response.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy.lease_id, "lease");
+        assert_eq!(legacy.resume_token, "resume");
+
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyTerminalCommand {
+            #[prost(string, tag = "1")]
+            terminal_id: String,
+            #[prost(oneof = "legacy_lease_command::Command", tags = "10, 11, 12, 13")]
+            command: Option<legacy_lease_command::Command>,
+        }
+        mod legacy_lease_command {
+            use crate::protocol::Resize;
+            use crate::terminal_state_v2::HistoryPageRequest;
+
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Command {
+                #[prost(bytes, tag = "10")]
+                Input(Vec<u8>),
+                #[prost(message, tag = "11")]
+                Resize(Resize),
+                #[prost(bool, tag = "12")]
+                Detach(bool),
+                #[prost(message, tag = "13")]
+                HistoryPage(HistoryPageRequest),
+            }
+        }
+        let command = TerminalCommand {
+            terminal_id: "terminal".into(),
+            lease_id: "lease".into(),
+            sequence: 2,
+            attachment_id: "attachment".into(),
+            command: Some(terminal_command::Command::LeaseControl(LeaseControl {
+                action: LeaseControlAction::Renew as i32,
+            })),
+        };
+        let legacy = LegacyTerminalCommand::decode(command.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy.terminal_id, "terminal");
+        assert!(legacy.command.is_none());
     }
 
     #[test]

@@ -19,22 +19,22 @@ use crate::{
     auth::{authentication_payload, verify_authorized_key, verify_authorized_keys},
     files::{FileResult, FileService},
     negotiation::{
-        CAPABILITY_CLIPBOARD_WRITE, CAPABILITY_HISTORY_PAGING, CAPABILITY_SEMANTIC_STATE,
-        CAPABILITY_SESSION_OBJECTS, NegotiatedProtocol, ProtocolSupport, negotiate_client_hello,
-        selections, validate_worker_selection,
+        CAPABILITY_CLIPBOARD_WRITE, CAPABILITY_HISTORY_PAGING, CAPABILITY_INPUT_LEASE,
+        CAPABILITY_SEMANTIC_STATE, CAPABILITY_SESSION_OBJECTS, NegotiatedProtocol, ProtocolSupport,
+        negotiate_client_hello, selections, validate_worker_selection,
     },
     process_lock::ProcessLock,
     protocol::{
-        AckResponse, AttachResponse, AttachmentListResponse, AuthResult,
+        AckResponse, AttachResponse, AttachmentListResponse, AttachmentRole, AuthResult,
         ClipboardSelection as WireClipboardSelection, ClipboardWrite, ErrorResponse,
-        HistoryPageChunk, LeaseChanged, ListResponse, Response, ServerHello, SpawnResponse,
-        TerminalEvent, TerminalListResponse, TerminalStateChunk, WireMessage, WorkerStreamHello,
-        WorkspaceListResponse, WorkspaceResponse, read_message, request, response,
-        terminal_command, terminal_event, wire_message, write_message,
+        HistoryPageChunk, LeaseChanged, LeaseControlAction, ListResponse, Response, ServerHello,
+        SpawnResponse, TerminalEvent, TerminalListResponse, TerminalStateChunk, WireMessage,
+        WorkerStreamHello, WorkspaceListResponse, WorkspaceResponse, read_message, request,
+        response, terminal_command, terminal_event, wire_message, write_message,
     },
     resources::{QuotaExceeded, ResourceClaim, ResourceGovernor, ResourcePolicy},
     session::SessionManager,
-    terminal::{ClipboardSelection, PtyEvent, Terminal},
+    terminal::{ClipboardSelection, INPUT_LEASE_TTL, LeaseRevocationReason, PtyEvent, Terminal},
     terminal_state_v2::{
         HistoryPage, MAX_ENCODED_HISTORY_PAGE_BYTES, MAX_ENCODED_STATE_BYTES, State,
     },
@@ -1197,7 +1197,13 @@ where
     R: AsyncRead + Unpin,
 {
     let mut lease_events = terminal.subscribe_to_leases();
-    let lease = match terminal.acquire_lease(read_only, takeover, &resume_token) {
+    let input_lease = negotiated.has(CAPABILITY_INPUT_LEASE, 1);
+    let lease = match terminal.acquire_lease(
+        read_only,
+        takeover,
+        &resume_token,
+        input_lease.then_some(INPUT_LEASE_TTL),
+    ) {
         Ok(lease) => lease,
         Err(error) => {
             send_error(&mut send, request_id, "lease_conflict", error).await?;
@@ -1239,6 +1245,10 @@ where
             resume_token: lease.resume_token.clone(),
             snapshot,
             attachment: Some(attachment_info.clone()),
+            lease_ttl_ms: lease
+                .ttl
+                .map(|ttl| u32::try_from(ttl.as_millis()).unwrap_or(u32::MAX))
+                .unwrap_or(0),
         }),
     )
     .await?;
@@ -1262,6 +1272,14 @@ where
 
     let result: Result<()> = async {
         loop {
+            let lease_deadline = terminal.lease_deadline(&lease.lease_id);
+            let wait_for_lease_expiry = async {
+                if let Some(deadline) = lease_deadline {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
             tokio::select! {
                 incoming = read_message(&mut recv) => {
                     match incoming? {
@@ -1274,11 +1292,9 @@ where
                             )?;
                             match command.command {
                                 Some(terminal_command::Command::Input(bytes)) => {
-                                    if !terminal.owns_lease(&lease.lease_id) { continue; }
                                     terminal.write_input(&command.lease_id, command.sequence, &bytes)?;
                                 }
                                 Some(terminal_command::Command::Resize(size)) => {
-                                    if !terminal.owns_lease(&lease.lease_id) { continue; }
                                     terminal.resize(
                                         &command.lease_id,
                                         command.sequence,
@@ -1300,6 +1316,23 @@ where
                                         &page,
                                     ).await?;
                                 }
+                                Some(terminal_command::Command::LeaseControl(control)) => {
+                                    if !input_lease {
+                                        bail!("lease control requested without negotiated capability")
+                                    }
+                                    match LeaseControlAction::try_from(control.action) {
+                                        Ok(LeaseControlAction::Renew) => terminal.renew_lease(
+                                            &command.lease_id,
+                                            command.sequence,
+                                            INPUT_LEASE_TTL,
+                                        )?,
+                                        Ok(LeaseControlAction::Release) => terminal
+                                            .release_lease_command(&command.lease_id, command.sequence)?,
+                                        Ok(LeaseControlAction::Unspecified) | Err(_) => {
+                                            bail!("invalid lease control action")
+                                        }
+                                    }
+                                }
                                 Some(terminal_command::Command::Detach(_)) | None => break,
                             }
                         }
@@ -1310,19 +1343,30 @@ where
                 lease_event = lease_events.recv(), if !lease.lease_id.is_empty() => {
                     match lease_event {
                         Ok(event) if event.revoked_lease_id == lease.lease_id => {
+                            attachment.set_role(AttachmentRole::Viewer)?;
+                            let reason = match event.reason {
+                                LeaseRevocationReason::TakenOver => "taken_over",
+                                LeaseRevocationReason::Expired => "expired",
+                                LeaseRevocationReason::Released => "released",
+                            };
                             write_terminal_event(
                                 &mut send,
                                 &info.id,
                                 &attachment_info.id,
                                 terminal_event::Event::LeaseChanged(LeaseChanged {
                                     read_only: true,
-                                    reason: "taken_over".into(),
+                                    reason: reason.into(),
+                                    lease_id: event.revoked_lease_id,
+                                    lease_ttl_ms: 0,
                                 }),
                             ).await?;
                         }
                         Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                     }
+                }
+                _ = wait_for_lease_expiry, if input_lease && !lease.lease_id.is_empty() => {
+                    terminal.expire_lease_if_due(&lease.lease_id);
                 }
                 event = events.recv() => {
                     match event {

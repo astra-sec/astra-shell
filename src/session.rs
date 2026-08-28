@@ -50,6 +50,12 @@ impl ActiveAttachment {
         self.info.state = state as i32;
         Ok(())
     }
+
+    pub fn set_role(&mut self, role: AttachmentRole) -> Result<()> {
+        self.manager.set_attachment_role(&self.info.id, role)?;
+        self.info.role = role as i32;
+        Ok(())
+    }
 }
 
 impl Drop for ActiveAttachment {
@@ -63,6 +69,18 @@ impl Drop for ActiveAttachment {
 }
 
 impl SessionManager {
+    fn set_attachment_role(&self, attachment_id: &str, role: AttachmentRole) -> Result<()> {
+        let mut attachments = self
+            .attachments
+            .write()
+            .expect("attachment registry poisoned");
+        let attachment = attachments
+            .get_mut(attachment_id)
+            .context("attachment is no longer active")?;
+        attachment.role = role as i32;
+        Ok(())
+    }
+
     pub fn new(session_root: PathBuf, catalog_path: PathBuf) -> Result<Self> {
         let policy = ResourcePolicy::default();
         let resources = ResourceAccount::standalone("session", policy.user)?;

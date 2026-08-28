@@ -25,6 +25,7 @@
 | `terminal.clipboard_write` | semantic attachment 上的 OSC 52 单向、受限剪贴板写事件；不包含读取 | 是（Apple client/server v1） | 必须同时选择 `terminal.semantic_state` v2；CLI 不 offer |
 | `terminal.history_paging` | 使用 v2 `Anchor` 的可靠历史分页、trim 边界和客户端远端 viewport | 是（Apple client/server v1） | 必须同时选择 `terminal.semantic_state` v2；CLI 不 offer |
 | `session.objects` | Workspace CRUD、Terminal 归属和 Attachment 身份 | 是（Apple client/server v1） | 与 renderer capability 独立；CLI 保留 N-1 默认 Workspace 适配 |
+| `terminal.input_lease` | controller lease TTL、renew/release 与 controller-only resize owner | 是（server v1；Apple 完成 SESS-02 后启用） | 依赖 `session.objects` v1；未协商客户端保留 Stream 生命周期 lease |
 | `terminal.datagram_state` | generation 累计 patch 可走 QUIC DATAGRAM | 否 | `SYNC-01` 至 `SYNC-03` 完成 |
 
 Capability 名称存在不代表实现完成。runtime support list 只能加入已经通过对应架构任务验收的能力；禁止为了让 UI 走新分支而提前 offer。

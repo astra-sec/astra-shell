@@ -4,7 +4,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(target_os = "linux")]
@@ -33,6 +33,7 @@ const MAX_LOCALE_VALUE_LENGTH: usize = 256;
 const MAX_PROGRAM_TITLE_LENGTH: usize = 512;
 const SAFE_BASE_ENVIRONMENT: &[&str] = &["HOME", "USER", "LOGNAME", "SHELL", "PATH"];
 const MAX_CLIPBOARD_WRITE_BYTES: usize = 256 * 1024;
+pub const INPUT_LEASE_TTL: Duration = Duration::from_secs(15);
 const UTF8_LOCALE_FALLBACKS: &[&str] = &["C.UTF-8", "C.utf8", "UTF-8", "en_US.UTF-8"];
 
 struct PreparedTerminalEnvironment {
@@ -62,6 +63,14 @@ pub enum ClipboardSelection {
 #[derive(Clone, Debug)]
 pub struct LeaseEvent {
     pub revoked_lease_id: String,
+    pub reason: LeaseRevocationReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseRevocationReason {
+    TakenOver,
+    Expired,
+    Released,
 }
 
 #[derive(Debug)]
@@ -69,11 +78,13 @@ struct Lease {
     id: String,
     resume_token: String,
     last_sequence: u64,
+    expires_at: Option<Instant>,
 }
 
 pub struct LeaseGrant {
     pub lease_id: String,
     pub resume_token: String,
+    pub ttl: Option<Duration>,
 }
 
 pub struct Terminal {
@@ -162,11 +173,13 @@ impl Terminal {
         read_only: bool,
         takeover: bool,
         resume_token: &str,
+        ttl: Option<Duration>,
     ) -> Result<LeaseGrant> {
         if read_only {
             return Ok(LeaseGrant {
                 lease_id: String::new(),
                 resume_token: String::new(),
+                ttl: None,
             });
         }
         let mut lease = self.lease.lock().expect("terminal lease poisoned");
@@ -181,13 +194,18 @@ impl Terminal {
                 id: lease_id.clone(),
                 resume_token: resume_token.to_owned(),
                 last_sequence: 0,
+                expires_at: ttl.map(|duration| Instant::now() + duration),
             });
             if let Some(revoked_lease_id) = revoked_lease_id {
-                let _ = self.lease_events.send(LeaseEvent { revoked_lease_id });
+                let _ = self.lease_events.send(LeaseEvent {
+                    revoked_lease_id,
+                    reason: LeaseRevocationReason::TakenOver,
+                });
             }
             return Ok(LeaseGrant {
                 lease_id,
                 resume_token: resume_token.to_owned(),
+                ttl,
             });
         }
         if lease.is_some() && !takeover {
@@ -203,24 +221,76 @@ impl Terminal {
             id: lease_id.clone(),
             resume_token: resume_token.clone(),
             last_sequence: 0,
+            expires_at: ttl.map(|duration| Instant::now() + duration),
         });
         if let Some(revoked_lease_id) = revoked_lease_id {
-            let _ = self.lease_events.send(LeaseEvent { revoked_lease_id });
+            let _ = self.lease_events.send(LeaseEvent {
+                revoked_lease_id,
+                reason: LeaseRevocationReason::TakenOver,
+            });
         }
         Ok(LeaseGrant {
             lease_id,
             resume_token,
+            ttl,
         })
     }
 
     pub fn owns_lease(&self, lease_id: &str) -> bool {
-        !lease_id.is_empty()
-            && self
-                .lease
-                .lock()
-                .expect("terminal lease poisoned")
-                .as_ref()
-                .is_some_and(|lease| lease.id == lease_id)
+        if lease_id.is_empty() {
+            return false;
+        }
+        self.expire_lease_if_due(lease_id);
+        self.lease
+            .lock()
+            .expect("terminal lease poisoned")
+            .as_ref()
+            .is_some_and(|lease| lease.id == lease_id)
+    }
+
+    pub fn lease_deadline(&self, lease_id: &str) -> Option<Instant> {
+        self.lease
+            .lock()
+            .expect("terminal lease poisoned")
+            .as_ref()
+            .filter(|lease| lease.id == lease_id)
+            .and_then(|lease| lease.expires_at)
+    }
+
+    pub fn renew_lease(&self, lease_id: &str, sequence: u64, ttl: Duration) -> Result<()> {
+        let mut lease = self.validate_lease(lease_id, sequence)?;
+        let current = lease.as_mut().expect("validated lease disappeared");
+        current.expires_at = Some(Instant::now() + ttl);
+        current.last_sequence = sequence;
+        Ok(())
+    }
+
+    pub fn release_lease_command(&self, lease_id: &str, sequence: u64) -> Result<()> {
+        let mut lease = self.validate_lease(lease_id, sequence)?;
+        *lease = None;
+        let _ = self.lease_events.send(LeaseEvent {
+            revoked_lease_id: lease_id.to_owned(),
+            reason: LeaseRevocationReason::Released,
+        });
+        Ok(())
+    }
+
+    pub fn expire_lease_if_due(&self, lease_id: &str) -> bool {
+        let mut lease = self.lease.lock().expect("terminal lease poisoned");
+        let expired = lease.as_ref().is_some_and(|current| {
+            current.id == lease_id
+                && current
+                    .expires_at
+                    .is_some_and(|deadline| deadline <= Instant::now())
+        });
+        if expired {
+            *lease = None;
+            let _ = self.lease_events.send(LeaseEvent {
+                revoked_lease_id: lease_id.to_owned(),
+                reason: LeaseRevocationReason::Expired,
+            });
+        }
+        expired
     }
 
     pub fn release_lease(&self, lease_id: &str) {
@@ -296,6 +366,7 @@ impl Terminal {
         lease_id: &str,
         sequence: u64,
     ) -> Result<std::sync::MutexGuard<'_, Option<Lease>>> {
+        self.expire_lease_if_due(lease_id);
         let lease = self.lease.lock().expect("terminal lease poisoned");
         let current = lease
             .as_ref()
@@ -1138,13 +1209,14 @@ mod tests {
             .unwrap();
         assert!(manager.has_active_terminals());
 
-        let first = terminal.acquire_lease(false, false, "").unwrap();
+        let first = terminal.acquire_lease(false, false, "", None).unwrap();
         let mut lease_events = terminal.subscribe_to_leases();
         let resumed = terminal
-            .acquire_lease(false, false, &first.resume_token)
+            .acquire_lease(false, false, &first.resume_token, None)
             .unwrap();
         let revoked = lease_events.recv().await.unwrap();
         assert_eq!(revoked.revoked_lease_id, first.lease_id);
+        assert_eq!(revoked.reason, LeaseRevocationReason::TakenOver);
         assert_ne!(first.lease_id, resumed.lease_id);
         assert_eq!(first.resume_token, resumed.resume_token);
         assert!(!terminal.owns_lease(&first.lease_id));
@@ -1156,12 +1228,66 @@ mod tests {
         );
 
         terminal.release_lease(&first.lease_id);
-        assert!(terminal.acquire_lease(false, false, "").is_err());
+        assert!(terminal.acquire_lease(false, false, "", None).is_err());
         terminal
             .write_input(&resumed.lease_id, 1, b"resume\n")
             .unwrap();
 
         terminal.release_lease(&resumed.lease_id);
+        terminal.kill().unwrap();
+    }
+
+    #[tokio::test]
+    async fn lease_ttl_renew_release_and_expiry_are_fenced() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager::new(directory.path().to_path_buf()).unwrap();
+        let terminal = manager
+            .spawn(SpawnRequest {
+                name: "lease-ttl-test".into(),
+                argv: vec!["/bin/cat".into()],
+                cwd: String::new(),
+                rows: 24,
+                cols: 80,
+                term: "xterm-256color".into(),
+                environment: Vec::new(),
+                workspace_id: String::new(),
+            })
+            .unwrap();
+        let mut events = terminal.subscribe_to_leases();
+
+        let grant = terminal
+            .acquire_lease(false, false, "", Some(Duration::from_secs(1)))
+            .unwrap();
+        let first_deadline = terminal.lease_deadline(&grant.lease_id).unwrap();
+        terminal
+            .renew_lease(&grant.lease_id, 1, Duration::from_secs(2))
+            .unwrap();
+        assert!(terminal.lease_deadline(&grant.lease_id).unwrap() > first_deadline);
+        assert!(
+            terminal
+                .renew_lease("stale", 2, Duration::from_secs(2))
+                .is_err()
+        );
+        terminal.release_lease_command(&grant.lease_id, 2).unwrap();
+        let released = events.recv().await.unwrap();
+        assert_eq!(released.revoked_lease_id, grant.lease_id);
+        assert_eq!(released.reason, LeaseRevocationReason::Released);
+        assert!(!terminal.owns_lease(&grant.lease_id));
+
+        let expiring = terminal
+            .acquire_lease(false, false, "", Some(Duration::from_millis(1)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(terminal.expire_lease_if_due(&expiring.lease_id));
+        let expired = events.recv().await.unwrap();
+        assert_eq!(expired.revoked_lease_id, expiring.lease_id);
+        assert_eq!(expired.reason, LeaseRevocationReason::Expired);
+        assert!(
+            terminal.resize("", 1, 40, 120, 0, 0).is_err(),
+            "viewer must never own the PTY viewport"
+        );
+        terminal.release_lease(&grant.lease_id);
+        assert!(!terminal.owns_lease(&expiring.lease_id));
         terminal.kill().unwrap();
     }
 

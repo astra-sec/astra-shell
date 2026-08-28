@@ -14,6 +14,7 @@ pub const CAPABILITY_HISTORY_PAGING: &str = "terminal.history_paging";
 pub const CAPABILITY_DATAGRAM_STATE: &str = "terminal.datagram_state";
 pub const CAPABILITY_CLIPBOARD_WRITE: &str = "terminal.clipboard_write";
 pub const CAPABILITY_SESSION_OBJECTS: &str = "session.objects";
+pub const CAPABILITY_INPUT_LEASE: &str = "terminal.input_lease";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityRange {
@@ -58,6 +59,11 @@ impl ProtocolSupport {
                 },
                 CapabilityRange {
                     name: CAPABILITY_SESSION_OBJECTS,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_INPUT_LEASE,
                     minimum_version: 1,
                     maximum_version: 1,
                 },
@@ -179,6 +185,11 @@ pub fn negotiate_client_hello(
             .is_some_and(|version| *version >= 2)
     {
         capabilities.remove(CAPABILITY_HISTORY_PAGING);
+    }
+    if capabilities.contains_key(CAPABILITY_INPUT_LEASE)
+        && !capabilities.contains_key(CAPABILITY_SESSION_OBJECTS)
+    {
+        capabilities.remove(CAPABILITY_INPUT_LEASE);
     }
 
     Ok(NegotiatedProtocol {
@@ -391,6 +402,11 @@ fn validate_capability_dependencies(capabilities: &BTreeMap<String, u32>) -> Res
                 .is_some_and(|version| *version >= 2),
         "terminal.history_paging requires terminal.semantic_state v2"
     );
+    ensure!(
+        !capabilities.contains_key(CAPABILITY_INPUT_LEASE)
+            || capabilities.contains_key(CAPABILITY_SESSION_OBJECTS),
+        "terminal.input_lease requires session.objects v1"
+    );
     Ok(())
 }
 
@@ -428,12 +444,35 @@ mod tests {
         let hello = client_hello("astra", &support);
         let negotiated = negotiate_client_hello(&hello, &support).unwrap();
         assert!(negotiated.has(CAPABILITY_SESSION_OBJECTS, 1));
+        assert!(negotiated.has(CAPABILITY_INPUT_LEASE, 1));
         assert!(
             !ProtocolSupport::command_line_client()
                 .capabilities
                 .iter()
                 .any(|capability| capability.name == CAPABILITY_SESSION_OBJECTS)
         );
+    }
+
+    #[test]
+    fn input_lease_is_never_selected_without_session_objects() {
+        let support = ProtocolSupport::runtime();
+        let mut hello = client_hello("client", &support);
+        hello
+            .capabilities
+            .retain(|offer| offer.name == CAPABILITY_INPUT_LEASE);
+        let negotiated = negotiate_client_hello(&hello, &support).unwrap();
+        assert!(!negotiated.has(CAPABILITY_INPUT_LEASE, 1));
+
+        let invalid_server = ServerHello {
+            protocol_version: PROTOCOL_VERSION,
+            challenge: vec![],
+            server_instance: String::new(),
+            capabilities: vec![CapabilitySelection {
+                name: CAPABILITY_INPUT_LEASE.into(),
+                version: 1,
+            }],
+        };
+        assert!(validate_server_hello(&hello, &invalid_server).is_err());
     }
 
     #[test]

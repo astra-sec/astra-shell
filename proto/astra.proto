@@ -299,6 +299,8 @@ message AttachResponse {
   string resume_token = 5;
   TerminalSnapshot snapshot = 6;
   AttachmentInfo attachment = 7;
+  // Non-zero only for a writable attachment that negotiated terminal.input_lease v1.
+  uint32 lease_ttl_ms = 8;
 }
 message AckResponse { string message = 1; }
 message ErrorResponse {
@@ -388,7 +390,16 @@ message TerminalCommand {
     Resize resize = 11;
     bool detach = 12;
     astra.terminal.v2.HistoryPageRequest history_page = 13;
+    LeaseControl lease_control = 14;
   }
+}
+message LeaseControl {
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    RENEW = 1;
+    RELEASE = 2;
+  }
+  Action action = 1;
 }
 message Resize {
   uint32 rows = 1;
@@ -445,4 +456,6 @@ message HistoryPageChunk {
 message LeaseChanged {
   bool read_only = 1;
   string reason = 2;
+  string lease_id = 3;
+  uint32 lease_ttl_ms = 4;
 }
