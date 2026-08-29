@@ -47,10 +47,30 @@ mod astra;
 pub use astra::*;
 
 lazy_static::lazy_static! {
-    static ref DB: Database = {
+    static ref DB: Option<Database> = {
         let data = include_bytes!("../../assets/wezterm.terminfo");
-        Database::from_buffer(&data[..]).unwrap()
+        match Database::from_buffer(&data[..]) {
+            Ok(database) => Some(database),
+            Err(error) => {
+                log::error!("bundled wezterm terminfo is invalid: {error:?}");
+                None
+            }
+        }
     };
+}
+
+#[cfg(test)]
+mod bundled_terminfo_tests {
+    use super::*;
+
+    #[test]
+    fn bundled_terminfo_is_parseable_and_contains_standard_capabilities() {
+        let data = include_bytes!("../../assets/wezterm.terminfo");
+        let database = Database::from_buffer(&data[..])
+            .expect("bundled wezterm terminfo must be a valid compiled database");
+
+        assert!(database.raw("cup").is_some());
+    }
 }
 
 pub(crate) struct TabStop {
@@ -1246,7 +1266,7 @@ impl TerminalState {
                 }
 
                 _ => {
-                    if let Some(value) = DB.raw(name) {
+                    if let Some(value) = DB.as_ref().and_then(|database| database.raw(name)) {
                         res.push_str("1+r");
                         res.push_str(&encoded_name);
                         res.push('=');

@@ -1581,7 +1581,9 @@ mod tests {
         let captured = sink.0.clone();
         let mut engine = TerminalEngine::new(24, 80, 0, Box::new(sink)).unwrap();
         engine.resize(30, 100, 1000, 600).unwrap();
-        engine.advance(b"\x1b[c\x1b[5n\x1b[18t\x1b[16t\x1b[14t\x1b[21t\x1b]52;c;?\x07");
+        engine.advance(
+            b"\x1b[c\x1b[5n\x1b[18t\x1b[16t\x1b[14t\x1b[21t\x1b]52;c;?\x07\x1bP+q637570\x1b\\",
+        );
 
         for _ in 0..100 {
             if captured.lock().unwrap().len() >= 30 {
@@ -1596,6 +1598,10 @@ mod tests {
         assert!(replies.contains("\x1b[8;30;100t"), "{replies:?}");
         assert!(replies.contains("\x1b[6;20;10t"), "{replies:?}");
         assert!(replies.contains("\x1b[4;600;1000t"), "{replies:?}");
+        assert!(
+            replies.contains("\x1bP1+r637570="),
+            "XTGETTCAP must answer the standard cursor-address capability: {replies:?}"
+        );
         assert!(
             !replies.contains("]l"),
             "title reporting must remain disabled"
