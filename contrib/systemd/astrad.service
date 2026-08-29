@@ -18,11 +18,14 @@ KillMode=process
 TimeoutStopSec=10s
 
 UMask=0077
-NoNewPrivileges=yes
+# Authenticated workers provide SSH-like login shells, so their descendants must
+# be able to run setuid tools such as sudo.
+NoNewPrivileges=no
 # The managed gateway must retain these capabilities so its Linux worker
 # launcher can drop each child to the authenticated Unix account.
 AmbientCapabilities=CAP_SETUID CAP_SETGID
-PrivateTmp=yes
+# Keep the host's /tmp visible to those user sessions.
+PrivateTmp=no
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
