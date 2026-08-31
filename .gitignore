@@ -2,3 +2,6 @@
 /.cargo-home/
 /.local-test/
 /state/
+
+# The website source is maintained outside this public repository.
+/support-site/
