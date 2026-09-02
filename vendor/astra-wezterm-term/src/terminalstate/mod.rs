@@ -373,6 +373,9 @@ pub struct TerminalState {
     /// Astra needs to distinguish the engine's built-in default title from a
     /// title explicitly reported by the program running in the PTY.
     astra_title_was_set: bool,
+    /// Astra exposes the OSC 2 window title when one exists. OSC 1 is a short
+    /// tab/icon label and must not overwrite the canonical program title.
+    astra_window_title_was_set: bool,
     progress: Progress,
 
     palette: Option<ColorPalette>,
@@ -597,6 +600,7 @@ impl TerminalState {
             title: "wezterm".to_string(),
             icon_title: None,
             astra_title_was_set: false,
+            astra_window_title_was_set: false,
             palette: None,
             pixel_height: size.pixel_height,
             pixel_width: size.pixel_width,

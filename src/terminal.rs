@@ -1160,6 +1160,22 @@ mod tests {
     }
 
     #[test]
+    fn full_window_title_wins_over_a_later_short_icon_title() {
+        let mut engine = TerminalEngine::new(24, 80, 0, Box::new(std::io::sink())).unwrap();
+        engine.advance(b"\x1b]2;xy@rome:~/Projects/Vulnerabilities\x07");
+        engine.advance(b"\x1b]1;..lnerabilities\x07");
+
+        assert_eq!(
+            engine.program_title(),
+            Some("xy@rome:~/Projects/Vulnerabilities")
+        );
+        assert_eq!(
+            engine.semantic_state().unwrap().title,
+            "xy@rome:~/Projects/Vulnerabilities"
+        );
+    }
+
+    #[test]
     fn osc_52_is_a_bounded_write_only_host_effect() {
         let (events, _) = broadcast::channel(8);
         let mut receiver = events.subscribe();

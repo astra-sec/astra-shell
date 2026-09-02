@@ -300,7 +300,11 @@ impl TerminalState {
                     },
                 },
             },
-            title: self.get_title(),
+            title: if self.astra_window_title_was_set {
+                &self.title
+            } else {
+                self.get_title()
+            },
             title_was_set: self.astra_title_was_set,
             working_directory: self.get_current_dir().map(Url::as_str),
             palette: self.palette(),
