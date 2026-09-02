@@ -180,15 +180,15 @@ astra -p 4433 mimi@HOST files rm artifacts/remote.tar
 Managed 模式使用系统 passwd 数据库和每个用户自己的 SSH 授权文件。真正服务多个 UID 时，gateway 必须由 root 启动：
 
 ```bash
-sudo /home/mimi/astra-shell/target/debug/astrad init \
-  --state-dir /home/mimi/astra-shell/state-managed
-sudo /home/mimi/astra-shell/target/debug/astrad serve \
+sudo install -d -o root -g root -m 0700 /srv/astra
+sudo ./target/debug/astrad init --state-dir /srv/astra
+sudo ./target/debug/astrad serve \
   --managed \
   --listen 0.0.0.0:4433 \
-  --state-dir /home/mimi/astra-shell/state-managed
+  --state-dir /srv/astra
 ```
 
-请为 managed 模式使用单独、由 root 初始化的状态目录；gateway 会拒绝非 daemon UID 所有、group/other 可写的状态目录，以及非 `0600` 的主机私钥。正式部署还应把 `astrad` 放在 root 管理且普通用户不可修改的可执行路径。上面的路径只是保持本项目开发产物都在工作目录内的本机示例。
+managed 系统服务必须使用独立于任何用户 HOME 的 `/srv/astra`。gateway 会拒绝非 daemon UID 所有、group/other 可写的状态目录，以及非 `0600` 的主机私钥；启动 worker 时会仅为目录增加 traverse 权限，并继续把每个 UID 的运行状态隔离在该用户所有的子目录中。正式部署还应把 `astrad` 放在 root 管理且普通用户不可修改的可执行路径。
 
 客户端选择目标账户：
 
@@ -225,6 +225,8 @@ state/users/1002/worker.pid
 ```bash
 cargo build --bin astrad
 sudo install -o root -g root -m 0755 target/debug/astrad /usr/local/sbin/astrad
+sudo install -d -o root -g root -m 0700 /srv/astra
+sudo /usr/local/sbin/astrad init --state-dir /srv/astra
 sudo install -o root -g root -m 0644 \
   contrib/systemd/astrad.service /etc/systemd/system/astrad.service
 sudo systemctl daemon-reload
@@ -239,6 +241,14 @@ journalctl -u astrad.service -f
 ```
 
 unit 的 `KillMode=process` 是 managed 模式的持久会话语义所必需的：停止或重启 gateway 时只终止主进程，不误杀已经降权且持有 PTY 的用户 worker。修改 unit 中的监听地址、状态目录或工作目录后，需要执行 `sudo systemctl daemon-reload && sudo systemctl restart astrad.service`。
+
+已有服务如果曾把 managed state 放在用户 HOME 下，不要只修改 unit 后直接重启：存活 worker 仍持有旧目录中的 Unix socket，并且主机证书也必须原样迁移，否则会形成两套 worker state 并让客户端看到主机身份变化。先等待所有用户 worker 自然退出，或者在明确告知会结束相关用户全部 Terminal 后终止它们，再运行仓库提供的迁移工具：
+
+```bash
+sudo contrib/systemd/migrate-state-to-srv.sh /旧的/state/目录
+```
+
+迁移工具会在发现任何活跃 `astrad worker` 时拒绝执行；成功后服务使用 `/srv/astra`，原目录会被改名为带时间戳的可恢复备份。
 
 `list` 只返回对应 worker 当前实际持有且仍在运行的 Terminal。进程退出后，最终输出会在内存中短暂保留以完成已发起的 attach，随后记录被清理；worker 或 rootless daemon 重启后不会从磁盘恢复历史 Terminal。
 

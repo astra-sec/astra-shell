@@ -2,14 +2,15 @@
 Description=Astra Shell multi-user QUIC gateway
 Documentation=https://github.com/astra-sec/astra-shell
 After=network.target
+ConditionPathIsDirectory=/srv/astra
 
 [Service]
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/home/mimi/astra-shell
+WorkingDirectory=/srv/astra
 Environment=RUST_LOG=astra_shell=info
-ExecStart=/usr/local/sbin/astrad serve --managed --listen 0.0.0.0:4433 --state-dir /home/mimi/astra-shell/state --worker-idle-timeout-seconds 600
+ExecStart=/usr/local/sbin/astrad serve --managed --listen 0.0.0.0:4433 --state-dir /srv/astra --worker-idle-timeout-seconds 600
 Restart=on-failure
 RestartSec=2s
 
