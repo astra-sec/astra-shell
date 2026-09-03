@@ -32,7 +32,10 @@ use crate::{
         WorkerStreamHello, WorkspaceListResponse, read_message, request, response,
         terminal_command, terminal_event, wire_message, write_message,
     },
-    resources::{QuotaExceeded, ResourceClaim, ResourceGovernor, ResourcePolicy},
+    resources::{
+        QuotaExceeded, ResourceAccount, ResourceClaim, ResourceGovernor, ResourcePolicy,
+        ResourceReservation,
+    },
     session::SessionManager,
     terminal::{ClipboardSelection, INPUT_LEASE_TTL, LeaseRevocationReason, PtyEvent, Terminal},
     terminal_state_v2::{
@@ -361,18 +364,19 @@ fn validate_managed_gateway_state(_paths: &ServerPaths) -> Result<()> {
 async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Result<()> {
     let connection = incoming.await.context("QUIC handshake failed")?;
     let remote = connection.remote_address();
-    let (username, fingerprint, backend, negotiated) = match tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        authenticate_connection(&state, &connection),
-    )
-    .await
-    {
-        Ok(result) => result?,
-        Err(_) => {
-            connection.close(0x101_u32.into(), b"authentication timeout");
-            bail!("client authentication timed out")
-        }
-    };
+    let (username, fingerprint, backend, negotiated, connection_resources, _connection_reservation) =
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            authenticate_connection(&state, &connection),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                connection.close(0x101_u32.into(), b"authentication timeout");
+                bail!("client authentication timed out")
+            }
+        };
     info!(
         %remote,
         %username,
@@ -381,14 +385,6 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
         capabilities = negotiated.capabilities.len(),
         "client authenticated"
     );
-    let connection_resources = state.resources.account(&username)?;
-    let _connection_reservation = match connection_resources.reserve(ResourceClaim::connection()) {
-        Ok(reservation) => reservation,
-        Err(error) => {
-            connection.close(0x102_u32.into(), b"connection quota exceeded");
-            return Err(error.into());
-        }
-    };
     let connection_id = uuid::Uuid::new_v4().to_string();
 
     loop {
@@ -459,7 +455,14 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
 async fn authenticate_connection(
     state: &ServerState,
     connection: &quinn::Connection,
-) -> Result<(String, String, ConnectionBackend, NegotiatedProtocol)> {
+) -> Result<(
+    String,
+    String,
+    ConnectionBackend,
+    NegotiatedProtocol,
+    ResourceAccount,
+    ResourceReservation,
+)> {
     let (mut auth_send, mut auth_recv, first_message) =
         accept_authentication_stream(connection).await?;
     let hello = match first_message {
@@ -501,24 +504,14 @@ async fn authenticate_connection(
     );
 
     let (fingerprint, backend) = match authentication {
-        Ok(authenticated) => {
-            write_message(
-                &mut auth_send,
-                &WireMessage::new(wire_message::Body::AuthResult(AuthResult {
-                    ok: true,
-                    message: authenticated.0.clone(),
-                })),
-            )
-            .await?;
-            auth_send.finish()?;
-            authenticated
-        }
+        Ok(authenticated) => authenticated,
         Err(error) => {
             let _ = write_message(
                 &mut auth_send,
                 &WireMessage::new(wire_message::Body::AuthResult(AuthResult {
                     ok: false,
                     message: "public key authentication failed".into(),
+                    error_code: String::new(),
                 })),
             )
             .await;
@@ -529,7 +522,55 @@ async fn authenticate_connection(
             return Err(error.context("client authentication failed"));
         }
     };
-    Ok((username, fingerprint, backend, negotiated))
+
+    // Reserve the connection before acknowledging authentication. A client that receives a
+    // successful AuthResult is allowed to start application streams immediately; rejecting the
+    // quota afterwards turns a permanent condition into an opaque transport reset and causes an
+    // automatic reconnect loop.
+    let connection_resources = state.resources.account(&username)?;
+    let connection_reservation = match connection_resources.reserve(ResourceClaim::connection()) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            write_message(
+                &mut auth_send,
+                &WireMessage::new(wire_message::Body::AuthResult(
+                    connection_quota_auth_result(&error),
+                )),
+            )
+            .await?;
+            auth_send.finish()?;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(1), auth_send.stopped()).await;
+            connection.close(0x102_u32.into(), b"connection quota exceeded");
+            return Err(error.into());
+        }
+    };
+    write_message(
+        &mut auth_send,
+        &WireMessage::new(wire_message::Body::AuthResult(AuthResult {
+            ok: true,
+            message: fingerprint.clone(),
+            error_code: String::new(),
+        })),
+    )
+    .await?;
+    auth_send.finish()?;
+    Ok((
+        username,
+        fingerprint,
+        backend,
+        negotiated,
+        connection_resources,
+        connection_reservation,
+    ))
+}
+
+fn connection_quota_auth_result(error: &QuotaExceeded) -> AuthResult {
+    AuthResult {
+        ok: false,
+        message: error.to_string(),
+        error_code: "connection_quota_exceeded".into(),
+    }
 }
 
 async fn accept_authentication_stream(
@@ -1706,6 +1747,25 @@ mod tests {
         .await;
         assert_eq!(error.code, "quota");
         assert!(error.message.contains("streams"));
+    }
+
+    #[test]
+    fn connection_quota_is_a_structured_authentication_failure() {
+        let mut limits = ResourcePolicy::default().user;
+        limits.connections = 1;
+        let resources = ResourceAccount::standalone("test user", limits).unwrap();
+        let _existing = resources.reserve(ResourceClaim::connection()).unwrap();
+        let error = match resources.reserve(ResourceClaim::connection()) {
+            Ok(_) => panic!("second connection reservation unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        let result = connection_quota_auth_result(&error);
+
+        assert!(!result.ok);
+        assert_eq!(result.error_code, "connection_quota_exceeded");
+        assert!(result.message.contains("connections"));
+        assert!(result.message.contains("limit 1"));
     }
 
     #[tokio::test]

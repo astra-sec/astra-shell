@@ -123,6 +123,8 @@ pub struct AuthResult {
     pub ok: bool,
     #[prost(string, tag = "2")]
     pub message: String,
+    #[prost(string, tag = "3")]
+    pub error_code: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1007,6 +1009,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authentication_error_code_is_additive_for_n_minus_one() {
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyAuthResult {
+            #[prost(bool, tag = "1")]
+            ok: bool,
+            #[prost(string, tag = "2")]
+            message: String,
+        }
+
+        let current = AuthResult {
+            ok: false,
+            message: "connection limit reached".into(),
+            error_code: "connection_quota_exceeded".into(),
+        };
+        let legacy = LegacyAuthResult::decode(current.encode_to_vec().as_slice()).unwrap();
+        assert!(!legacy.ok);
+        assert_eq!(legacy.message, current.message);
+
+        let legacy = LegacyAuthResult {
+            ok: false,
+            message: "legacy failure".into(),
+        };
+        let current = AuthResult::decode(legacy.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(current.error_code, "");
+    }
 
     #[test]
     fn terminal_without_display_id_decodes_as_legacy_zero() {

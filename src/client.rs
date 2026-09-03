@@ -548,6 +548,11 @@ async fn authenticate(
         }) if result.ok => Ok(negotiated),
         Some(WireMessage {
             body: Some(wire_message::Body::AuthResult(result)),
+        }) if !result.error_code.is_empty() => {
+            bail!("{}: {}", result.error_code, result.message)
+        }
+        Some(WireMessage {
+            body: Some(wire_message::Body::AuthResult(result)),
         }) => bail!("authentication failed: {}", result.message),
         _ => bail!("server did not return AuthResult"),
     }
