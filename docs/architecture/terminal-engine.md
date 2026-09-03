@@ -85,7 +85,7 @@ OSC 52 是单向、显式协商的 host effect：服务端最多接受 256 KiB U
 
 旧 Apple/Rust CLI 只协商 `terminal.legacy_ansi_snapshot`。为保持 N-1 客户端可连接，`TerminalEngine::legacy_snapshot` 将已经验证的语义 State 单向渲染为旧 `TerminalSnapshot`；它不是权威状态，也不回灌引擎。这是隔离的 N-1 兼容路径，不能继续扩展字段或行为，并将在 application v4 最早删除。
 
-选择 `terminal.semantic_state` v2 的 attachment 不发送 raw PTY 或 ANSI snapshot，而是发送带整体 SHA-256 的可靠 `TerminalStateChunk`。Apple 客户端验证并原子发布完整 State，通过受控 SwiftTerm fork 的 cell import API 同时替换 primary/alternate buffer；未选择 capability 的客户端才进入上述 N-1 路径。当前每次输出发送完整 State，后续 `SYNC-01/02` 将加入 ACK 和累计 diff，不能改变这条单权威链路。
+选择 `terminal.semantic_state` v2 的 attachment 不发送 raw PTY 或 ANSI snapshot，而是发送带整体 SHA-256 的可靠 `TerminalStateChunk`。Apple 客户端验证并原子发布完整 State，通过受控 SwiftTerm fork 的 cell import API 同时替换 primary/alternate buffer；未选择 capability 的客户端才进入上述 N-1 路径。`SYNC-01/02` 的 `terminal.state_ack` + `terminal.semantic_diff` 在该单权威链路外增加每 attachment 一代在途、16 ms 上限频率、从已确认 generation 到最新 generation 的累计行 diff；epoch/base 变化或 diff 不划算时仍可靠回退完整 State。ACK 只确认已验证并渲染的 Replica，不复用 row version，也不改变权威引擎。
 
 ## Conformance evidence
 

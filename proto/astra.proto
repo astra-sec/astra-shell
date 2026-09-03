@@ -393,7 +393,12 @@ message TerminalCommand {
     bool detach = 12;
     astra.terminal.v2.HistoryPageRequest history_page = 13;
     LeaseControl lease_control = 14;
+    TerminalStateAck state_ack = 15;
   }
+}
+message TerminalStateAck {
+  bytes epoch = 1;
+  uint64 generation = 2;
 }
 message LeaseControl {
   enum Action {
@@ -424,6 +429,7 @@ message TerminalEvent {
     TerminalStateChunk semantic_state_chunk = 16;
     ClipboardWrite clipboard_write = 17;
     HistoryPageChunk history_page_chunk = 18;
+    TerminalStateDiffChunk semantic_state_diff_chunk = 19;
   }
 }
 enum ClipboardSelection {
@@ -439,6 +445,32 @@ message ClipboardWrite {
 // One reliable fragment of an encoded astra.terminal.v2.State. The receiver
 // validates size, ordering, digest and the complete State before publication.
 message TerminalStateChunk {
+  bytes transfer_id = 1;
+  uint32 chunk_index = 2;
+  uint32 chunk_count = 3;
+  uint32 total_size = 4;
+  bytes sha256 = 5;
+  bytes data = 6;
+}
+// A cumulative semantic update from one client-acknowledged State generation
+// to the latest generation. target_metadata carries every State field except
+// Screen.included_rows; the ordered row sources reconstruct those two arrays.
+message TerminalStateDiff {
+  bytes epoch = 1;
+  uint64 base_generation = 2;
+  uint64 target_generation = 3;
+  astra.terminal.v2.State target_metadata = 4;
+  repeated TerminalStateRow primary_rows = 5;
+  repeated TerminalStateRow alternate_rows = 6;
+}
+message TerminalStateRow {
+  oneof source {
+    astra.terminal.v2.Anchor base_anchor = 1;
+    astra.terminal.v2.Row replacement = 2;
+  }
+}
+// One reliable fragment of an encoded TerminalStateDiff.
+message TerminalStateDiffChunk {
   bytes transfer_id = 1;
   uint32 chunk_index = 2;
   uint32 chunk_count = 3;

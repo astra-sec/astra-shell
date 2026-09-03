@@ -20,17 +20,19 @@ use crate::{
     files::{FileResult, FileService},
     negotiation::{
         CAPABILITY_CLIPBOARD_WRITE, CAPABILITY_HISTORY_PAGING, CAPABILITY_INPUT_LEASE,
-        CAPABILITY_SEMANTIC_STATE, CAPABILITY_SESSION_OBJECTS, NegotiatedProtocol, ProtocolSupport,
-        negotiate_client_hello, selections, validate_worker_selection,
+        CAPABILITY_SEMANTIC_DIFF, CAPABILITY_SEMANTIC_STATE, CAPABILITY_SESSION_OBJECTS,
+        CAPABILITY_STATE_ACK, NegotiatedProtocol, ProtocolSupport, negotiate_client_hello,
+        selections, validate_worker_selection,
     },
     process_lock::ProcessLock,
     protocol::{
         AckResponse, AttachResponse, AttachmentListResponse, AttachmentRole, AuthResult,
         ClipboardSelection as WireClipboardSelection, ClipboardWrite, ErrorResponse,
         HistoryPageChunk, LeaseChanged, LeaseControlAction, ListResponse, Response, ServerHello,
-        SpawnResponse, TerminalEvent, TerminalListResponse, TerminalStateChunk, WireMessage,
-        WorkerStreamHello, WorkspaceListResponse, read_message, request, response,
-        terminal_command, terminal_event, wire_message, write_message,
+        SpawnResponse, TerminalEvent, TerminalListResponse, TerminalStateChunk, TerminalStateDiff,
+        TerminalStateDiffChunk, WireMessage, WorkerStreamHello, WorkspaceListResponse,
+        read_message, request, response, terminal_command, terminal_event, wire_message,
+        write_message,
     },
     resources::{
         QuotaExceeded, ResourceAccount, ResourceClaim, ResourceGovernor, ResourcePolicy,
@@ -41,6 +43,7 @@ use crate::{
     terminal_state_v2::{
         HistoryPage, MAX_ENCODED_HISTORY_PAGE_BYTES, MAX_ENCODED_STATE_BYTES, State,
     },
+    terminal_sync::{AckDisposition, PreparedStateUpdate, StateSyncWindow},
     worker::WorkerRouter,
 };
 
@@ -120,6 +123,7 @@ enum ConnectionBackend {
 }
 
 const TERMINAL_STATE_CHUNK_BYTES: usize = 512 * 1024;
+const TERMINAL_STATE_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 pub fn initialize_state(paths: &ServerPaths) -> Result<()> {
     fs::create_dir_all(&paths.state_dir)
@@ -1237,6 +1241,9 @@ where
     let session_objects = negotiated.has(CAPABILITY_SESSION_OBJECTS, 1);
     let history_paging = semantic && negotiated.has(CAPABILITY_HISTORY_PAGING, 1);
     let clipboard_write = semantic && negotiated.has(CAPABILITY_CLIPBOARD_WRITE, 1);
+    let state_ack = semantic && negotiated.has(CAPABILITY_STATE_ACK, 1);
+    let semantic_diff = state_ack && negotiated.has(CAPABILITY_SEMANTIC_DIFF, 1);
+    let mut state_sync = StateSyncWindow::default();
     let (snapshot, initial_state, mut events) = if semantic {
         let (state, events) = terminal.semantic_state_and_subscribe()?;
         (None, Some(state), events)
@@ -1264,7 +1271,11 @@ where
     .await?;
     if let Some(state) = initial_state {
         write_terminal_state(&mut send, &info.id, &attachment_info.id, &state).await?;
+        if state_ack {
+            state_sync.begin_initial(state)?;
+        }
     }
+    let mut last_state_sent = tokio::time::Instant::now();
     attachment.set_state(crate::protocol::AttachmentState::Live)?;
 
     if info.status != "running" {
@@ -1286,6 +1297,15 @@ where
             let wait_for_lease_expiry = async {
                 if let Some(deadline) = lease_deadline {
                     tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let state_deadline = last_state_sent + TERMINAL_STATE_COALESCE_INTERVAL;
+            let should_send_state = state_ack && state_sync.needs_update();
+            let wait_for_state_update = async {
+                if should_send_state {
+                    tokio::time::sleep_until(state_deadline).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
@@ -1313,6 +1333,19 @@ where
                                         size.pixel_width,
                                         size.pixel_height,
                                     )?;
+                                    if semantic {
+                                        if state_ack {
+                                            state_sync.mark_dirty();
+                                        } else {
+                                            let state = terminal.semantic_state()?;
+                                            write_terminal_state(
+                                                &mut send,
+                                                &info.id,
+                                                &attachment_info.id,
+                                                &state,
+                                            ).await?;
+                                        }
+                                    }
                                 }
                                 Some(terminal_command::Command::HistoryPage(request)) => {
                                     if !history_paging {
@@ -1341,6 +1374,14 @@ where
                                         Ok(LeaseControlAction::Unspecified) | Err(_) => {
                                             bail!("invalid lease control action")
                                         }
+                                    }
+                                }
+                                Some(terminal_command::Command::StateAck(ack)) => {
+                                    if !state_ack {
+                                        bail!("terminal state ACK received without negotiated capability")
+                                    }
+                                    match state_sync.acknowledge(&ack)? {
+                                        AckDisposition::Accepted | AckDisposition::Duplicate => {}
                                     }
                                 }
                                 Some(terminal_command::Command::Detach(_)) | None => break,
@@ -1378,17 +1419,33 @@ where
                 _ = wait_for_lease_expiry, if input_lease && !lease.lease_id.is_empty() => {
                     terminal.expire_lease_if_due(&lease.lease_id);
                 }
+                _ = wait_for_state_update, if should_send_state => {
+                    let latest = terminal.semantic_state()?;
+                    if let Some(update) = state_sync.prepare_update(latest, semantic_diff)? {
+                        write_prepared_state_update(
+                            &mut send,
+                            &info.id,
+                            &attachment_info.id,
+                            &update,
+                        ).await?;
+                        last_state_sent = tokio::time::Instant::now();
+                    }
+                }
                 event = events.recv() => {
                     match event {
                         Ok(PtyEvent::Output(bytes)) => {
                             if semantic {
-                                let state = terminal.semantic_state()?;
-                                write_terminal_state(
-                                    &mut send,
-                                    &info.id,
-                                    &attachment_info.id,
-                                    &state,
-                                ).await?;
+                                if state_ack {
+                                    state_sync.mark_dirty();
+                                } else {
+                                    let state = terminal.semantic_state()?;
+                                    write_terminal_state(
+                                        &mut send,
+                                        &info.id,
+                                        &attachment_info.id,
+                                        &state,
+                                    ).await?;
+                                }
                             } else {
                                 write_terminal_event(
                                     &mut send,
@@ -1447,8 +1504,14 @@ where
                             // A tmux-style authoritative grid lets a slow client
                             // recover exactly instead of continuing after a gap
                             // in the byte stream.
-                            attachment.set_state(crate::protocol::AttachmentState::Snapshotting)?;
-                            if semantic {
+                            if semantic && state_ack {
+                                // The acknowledged base plus one cumulative update is sufficient
+                                // to recover from any number of skipped PTY notifications.
+                                state_sync.mark_dirty();
+                            } else {
+                                attachment.set_state(crate::protocol::AttachmentState::Snapshotting)?;
+                            }
+                            if semantic && !state_ack {
                                 let (state, replacement) = terminal.semantic_state_and_subscribe()?;
                                 events = replacement;
                                 write_terminal_state(
@@ -1457,7 +1520,7 @@ where
                                     &attachment_info.id,
                                     &state,
                                 ).await?;
-                            } else {
+                            } else if !semantic {
                                 let (snapshot, replacement) = terminal.snapshot_and_subscribe()?;
                                 events = replacement;
                                 write_terminal_event(
@@ -1467,7 +1530,9 @@ where
                                     terminal_event::Event::Snapshot(snapshot),
                                 ).await?;
                             }
-                            attachment.set_state(crate::protocol::AttachmentState::Live)?;
+                            if !state_ack {
+                                attachment.set_state(crate::protocol::AttachmentState::Live)?;
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
@@ -1608,6 +1673,32 @@ fn terminal_state_chunks(state: &State) -> Result<Vec<TerminalStateChunk>> {
     Ok(chunks)
 }
 
+fn terminal_state_diff_chunks(diff: &TerminalStateDiff) -> Result<Vec<TerminalStateDiffChunk>> {
+    let encoded = diff.encode_to_vec();
+    if encoded.len() > MAX_ENCODED_STATE_BYTES {
+        bail!("terminal state diff exceeds the semantic state transport limit")
+    }
+    let transfer_id = uuid::Uuid::new_v4().as_bytes().to_vec();
+    let digest = Sha256::digest(&encoded).to_vec();
+    let chunk_count = encoded.len().max(1).div_ceil(TERMINAL_STATE_CHUNK_BYTES);
+    let total_size = u32::try_from(encoded.len())?;
+    let chunk_count = u32::try_from(chunk_count)?;
+    let mut chunks = Vec::with_capacity(chunk_count as usize);
+    for chunk_index in 0..chunk_count {
+        let start = chunk_index as usize * TERMINAL_STATE_CHUNK_BYTES;
+        let end = (start + TERMINAL_STATE_CHUNK_BYTES).min(encoded.len());
+        chunks.push(TerminalStateDiffChunk {
+            transfer_id: transfer_id.clone(),
+            chunk_index,
+            chunk_count,
+            total_size,
+            sha256: digest.clone(),
+            data: encoded[start..end].to_vec(),
+        });
+    }
+    Ok(chunks)
+}
+
 fn history_page_chunks(page: &HistoryPage) -> Result<Vec<HistoryPageChunk>> {
     let encoded = page.encode_to_vec();
     if encoded.len() > MAX_ENCODED_HISTORY_PAGE_BYTES {
@@ -1653,6 +1744,46 @@ where
         .await?;
     }
     Ok(())
+}
+
+async fn write_terminal_state_diff<W>(
+    send: &mut W,
+    terminal_id: &str,
+    attachment_id: &str,
+    diff: &TerminalStateDiff,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    for chunk in terminal_state_diff_chunks(diff)? {
+        write_terminal_event(
+            send,
+            terminal_id,
+            attachment_id,
+            terminal_event::Event::SemanticStateDiffChunk(chunk),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn write_prepared_state_update<W>(
+    send: &mut W,
+    terminal_id: &str,
+    attachment_id: &str,
+    update: &PreparedStateUpdate,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match update {
+        PreparedStateUpdate::Snapshot(state) => {
+            write_terminal_state(send, terminal_id, attachment_id, state).await
+        }
+        PreparedStateUpdate::Diff(diff) => {
+            write_terminal_state_diff(send, terminal_id, attachment_id, diff).await
+        }
+    }
 }
 
 async fn write_history_page<W>(
@@ -1879,6 +2010,23 @@ mod tests {
         assert_eq!(chunks.concat_data(), encoded);
     }
 
+    #[test]
+    fn semantic_diff_transport_preserves_cumulative_update_and_digest() {
+        let mut engine = TerminalEngine::new(24, 80, 512, Box::new(std::io::sink())).unwrap();
+        for index in 0..200 {
+            engine.advance(format!("line {index:03}\r\n").as_bytes());
+        }
+        let base = engine.semantic_state().unwrap();
+        engine.advance(b"changed");
+        let target = engine.semantic_state().unwrap();
+        let diff = crate::terminal_sync::terminal_state_diff(&base, &target).unwrap();
+        let encoded = diff.encode_to_vec();
+        let chunks = terminal_state_diff_chunks(&diff).unwrap();
+        assert_eq!(chunks[0].transfer_id.len(), 16);
+        assert_eq!(chunks[0].sha256, Sha256::digest(&encoded).to_vec());
+        assert_eq!(chunks.concat_data(), encoded);
+    }
+
     trait ChunkTestData {
         fn concat_data(&self) -> Vec<u8>;
     }
@@ -1892,6 +2040,14 @@ mod tests {
     }
 
     impl ChunkTestData for [HistoryPageChunk] {
+        fn concat_data(&self) -> Vec<u8> {
+            self.iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect()
+        }
+    }
+
+    impl ChunkTestData for [TerminalStateDiffChunk] {
         fn concat_data(&self) -> Vec<u8> {
             self.iter()
                 .flat_map(|chunk| chunk.data.iter().copied())

@@ -805,6 +805,9 @@ async fn attach_terminal(
                                     Some(terminal_event::Event::SemanticStateChunk(_)) => {
                                         return Err(anyhow!("server sent semantic terminal state to the ANSI command-line client"));
                                     }
+                                    Some(terminal_event::Event::SemanticStateDiffChunk(_)) => {
+                                        return Err(anyhow!("server sent semantic terminal diff to the ANSI command-line client"));
+                                    }
                                     Some(terminal_event::Event::ClipboardWrite(_)) => {
                                         return Err(anyhow!("server sent an unnegotiated clipboard host effect"));
                                     }

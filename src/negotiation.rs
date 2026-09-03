@@ -12,6 +12,8 @@ pub const CAPABILITY_LEGACY_ANSI_SNAPSHOT: &str = "terminal.legacy_ansi_snapshot
 pub const CAPABILITY_SEMANTIC_STATE: &str = "terminal.semantic_state";
 pub const CAPABILITY_HISTORY_PAGING: &str = "terminal.history_paging";
 pub const CAPABILITY_DATAGRAM_STATE: &str = "terminal.datagram_state";
+pub const CAPABILITY_STATE_ACK: &str = "terminal.state_ack";
+pub const CAPABILITY_SEMANTIC_DIFF: &str = "terminal.semantic_diff";
 pub const CAPABILITY_CLIPBOARD_WRITE: &str = "terminal.clipboard_write";
 pub const CAPABILITY_SESSION_OBJECTS: &str = "session.objects";
 pub const CAPABILITY_INPUT_LEASE: &str = "terminal.input_lease";
@@ -49,6 +51,16 @@ impl ProtocolSupport {
                 },
                 CapabilityRange {
                     name: CAPABILITY_HISTORY_PAGING,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_STATE_ACK,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_SEMANTIC_DIFF,
                     minimum_version: 1,
                     maximum_version: 1,
                 },
@@ -185,6 +197,21 @@ pub fn negotiate_client_hello(
             .is_some_and(|version| *version >= 2)
     {
         capabilities.remove(CAPABILITY_HISTORY_PAGING);
+    }
+    if capabilities.contains_key(CAPABILITY_STATE_ACK)
+        && !capabilities
+            .get(CAPABILITY_SEMANTIC_STATE)
+            .is_some_and(|version| *version >= 2)
+    {
+        capabilities.remove(CAPABILITY_STATE_ACK);
+    }
+    if capabilities.contains_key(CAPABILITY_SEMANTIC_DIFF)
+        && (!capabilities.contains_key(CAPABILITY_STATE_ACK)
+            || !capabilities
+                .get(CAPABILITY_SEMANTIC_STATE)
+                .is_some_and(|version| *version >= 2))
+    {
+        capabilities.remove(CAPABILITY_SEMANTIC_DIFF);
     }
     if capabilities.contains_key(CAPABILITY_INPUT_LEASE)
         && !capabilities.contains_key(CAPABILITY_SESSION_OBJECTS)
@@ -403,6 +430,21 @@ fn validate_capability_dependencies(capabilities: &BTreeMap<String, u32>) -> Res
         "terminal.history_paging requires terminal.semantic_state v2"
     );
     ensure!(
+        !capabilities.contains_key(CAPABILITY_STATE_ACK)
+            || capabilities
+                .get(CAPABILITY_SEMANTIC_STATE)
+                .is_some_and(|version| *version >= 2),
+        "terminal.state_ack requires terminal.semantic_state v2"
+    );
+    ensure!(
+        !capabilities.contains_key(CAPABILITY_SEMANTIC_DIFF)
+            || (capabilities.contains_key(CAPABILITY_STATE_ACK)
+                && capabilities
+                    .get(CAPABILITY_SEMANTIC_STATE)
+                    .is_some_and(|version| *version >= 2)),
+        "terminal.semantic_diff requires terminal.state_ack and terminal.semantic_state v2"
+    );
+    ensure!(
         !capabilities.contains_key(CAPABILITY_INPUT_LEASE)
             || capabilities.contains_key(CAPABILITY_SESSION_OBJECTS),
         "terminal.input_lease requires session.objects v1"
@@ -445,6 +487,8 @@ mod tests {
         let negotiated = negotiate_client_hello(&hello, &support).unwrap();
         assert!(negotiated.has(CAPABILITY_SESSION_OBJECTS, 1));
         assert!(negotiated.has(CAPABILITY_INPUT_LEASE, 1));
+        assert!(negotiated.has(CAPABILITY_STATE_ACK, 1));
+        assert!(negotiated.has(CAPABILITY_SEMANTIC_DIFF, 1));
         assert!(
             !ProtocolSupport::command_line_client()
                 .capabilities
@@ -568,6 +612,36 @@ mod tests {
             }],
         };
         assert!(validate_server_hello(&valid_hello, &invalid_server).is_err());
+    }
+
+    #[test]
+    fn semantic_diff_requires_state_ack_and_semantic_state_v2() {
+        let support = ProtocolSupport::runtime();
+        let mut diff_only = client_hello("client", &support);
+        diff_only
+            .capabilities
+            .retain(|offer| offer.name == CAPABILITY_SEMANTIC_DIFF);
+        let negotiated = negotiate_client_hello(&diff_only, &support).unwrap();
+        assert!(!negotiated.has(CAPABILITY_SEMANTIC_DIFF, 1));
+
+        let mut ack_only = client_hello("client", &support);
+        ack_only
+            .capabilities
+            .retain(|offer| offer.name == CAPABILITY_STATE_ACK);
+        let negotiated = negotiate_client_hello(&ack_only, &support).unwrap();
+        assert!(!negotiated.has(CAPABILITY_STATE_ACK, 1));
+
+        let hello = client_hello("client", &support);
+        let invalid_server = ServerHello {
+            protocol_version: PROTOCOL_VERSION,
+            challenge: vec![],
+            server_instance: String::new(),
+            capabilities: vec![CapabilitySelection {
+                name: CAPABILITY_SEMANTIC_DIFF.into(),
+                version: 1,
+            }],
+        };
+        assert!(validate_server_hello(&hello, &invalid_server).is_err());
     }
 
     #[test]

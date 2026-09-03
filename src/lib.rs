@@ -12,6 +12,7 @@ pub mod session;
 pub mod terminal;
 pub mod terminal_engine;
 pub mod terminal_state_v2;
+pub(crate) mod terminal_sync;
 pub mod worker;
 
 pub const ALPN: &[u8] = b"astra/1";

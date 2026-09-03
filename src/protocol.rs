@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::terminal_state_v2::HistoryPageRequest;
+use crate::terminal_state_v2::{Anchor, HistoryPageRequest, Row, State};
 
 pub const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 pub const LOCALE_ENVIRONMENT_VARIABLES: &[&str] = &[
@@ -805,7 +805,7 @@ pub struct TerminalCommand {
     pub sequence: u64,
     #[prost(string, tag = "4")]
     pub attachment_id: String,
-    #[prost(oneof = "terminal_command::Command", tags = "10, 11, 12, 13, 14")]
+    #[prost(oneof = "terminal_command::Command", tags = "10, 11, 12, 13, 14, 15")]
     pub command: Option<terminal_command::Command>,
 }
 
@@ -824,7 +824,17 @@ pub mod terminal_command {
         HistoryPage(HistoryPageRequest),
         #[prost(message, tag = "14")]
         LeaseControl(LeaseControl),
+        #[prost(message, tag = "15")]
+        StateAck(TerminalStateAck),
     }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TerminalStateAck {
+    #[prost(bytes = "vec", tag = "1")]
+    pub epoch: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub generation: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -861,7 +871,7 @@ pub struct TerminalEvent {
     pub attachment_id: String,
     #[prost(
         oneof = "terminal_event::Event",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
     )]
     pub event: Option<terminal_event::Event>,
 }
@@ -869,6 +879,7 @@ pub struct TerminalEvent {
 pub mod terminal_event {
     use super::{
         ClipboardWrite, HistoryPageChunk, LeaseChanged, TerminalSnapshot, TerminalStateChunk,
+        TerminalStateDiffChunk,
     };
 
     #[derive(Clone, PartialEq, prost::Oneof)]
@@ -891,6 +902,8 @@ pub mod terminal_event {
         ClipboardWrite(ClipboardWrite),
         #[prost(message, tag = "18")]
         HistoryPageChunk(HistoryPageChunk),
+        #[prost(message, tag = "19")]
+        SemanticStateDiffChunk(TerminalStateDiffChunk),
     }
 }
 
@@ -914,6 +927,56 @@ pub enum ClipboardSelection {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct TerminalStateChunk {
+    #[prost(bytes = "vec", tag = "1")]
+    pub transfer_id: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    pub chunk_index: u32,
+    #[prost(uint32, tag = "3")]
+    pub chunk_count: u32,
+    #[prost(uint32, tag = "4")]
+    pub total_size: u32,
+    #[prost(bytes = "vec", tag = "5")]
+    pub sha256: Vec<u8>,
+    #[prost(bytes = "vec", tag = "6")]
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TerminalStateDiff {
+    #[prost(bytes = "vec", tag = "1")]
+    pub epoch: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub base_generation: u64,
+    #[prost(uint64, tag = "3")]
+    pub target_generation: u64,
+    #[prost(message, optional, tag = "4")]
+    pub target_metadata: Option<State>,
+    #[prost(message, repeated, tag = "5")]
+    pub primary_rows: Vec<TerminalStateRow>,
+    #[prost(message, repeated, tag = "6")]
+    pub alternate_rows: Vec<TerminalStateRow>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TerminalStateRow {
+    #[prost(oneof = "terminal_state_row::Source", tags = "1, 2")]
+    pub source: Option<terminal_state_row::Source>,
+}
+
+pub mod terminal_state_row {
+    use super::{Anchor, Row};
+
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Source {
+        #[prost(message, tag = "1")]
+        BaseAnchor(Anchor),
+        #[prost(message, tag = "2")]
+        Replacement(Row),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TerminalStateDiffChunk {
     #[prost(bytes = "vec", tag = "1")]
     pub transfer_id: Vec<u8>,
     #[prost(uint32, tag = "2")]
@@ -1206,6 +1269,105 @@ mod tests {
         let legacy = LegacyTerminalCommand::decode(command.encode_to_vec().as_slice()).unwrap();
         assert_eq!(legacy.terminal_id, "terminal");
         assert!(legacy.command.is_none());
+    }
+
+    #[test]
+    fn state_ack_and_diff_oneofs_are_ignored_by_n_minus_one_decoders() {
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyTerminalCommand {
+            #[prost(string, tag = "1")]
+            terminal_id: String,
+            #[prost(oneof = "legacy_sync_command::Command", tags = "10, 11, 12, 13, 14")]
+            command: Option<legacy_sync_command::Command>,
+        }
+        mod legacy_sync_command {
+            use crate::protocol::{LeaseControl, Resize};
+            use crate::terminal_state_v2::HistoryPageRequest;
+
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Command {
+                #[prost(bytes, tag = "10")]
+                Input(Vec<u8>),
+                #[prost(message, tag = "11")]
+                Resize(Resize),
+                #[prost(bool, tag = "12")]
+                Detach(bool),
+                #[prost(message, tag = "13")]
+                HistoryPage(HistoryPageRequest),
+                #[prost(message, tag = "14")]
+                LeaseControl(LeaseControl),
+            }
+        }
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyTerminalEvent {
+            #[prost(string, tag = "1")]
+            terminal_id: String,
+            #[prost(
+                oneof = "legacy_sync_event::Event",
+                tags = "10, 11, 12, 13, 14, 15, 16, 17, 18"
+            )]
+            event: Option<legacy_sync_event::Event>,
+        }
+        mod legacy_sync_event {
+            use crate::protocol::{
+                ClipboardWrite, HistoryPageChunk, LeaseChanged, TerminalSnapshot,
+                TerminalStateChunk,
+            };
+
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Event {
+                #[prost(bytes, tag = "10")]
+                Output(Vec<u8>),
+                #[prost(int32, tag = "11")]
+                Exited(i32),
+                #[prost(string, tag = "12")]
+                Error(String),
+                #[prost(bool, tag = "13")]
+                Interactive(bool),
+                #[prost(message, tag = "14")]
+                Snapshot(TerminalSnapshot),
+                #[prost(message, tag = "15")]
+                LeaseChanged(LeaseChanged),
+                #[prost(message, tag = "16")]
+                SemanticStateChunk(TerminalStateChunk),
+                #[prost(message, tag = "17")]
+                ClipboardWrite(ClipboardWrite),
+                #[prost(message, tag = "18")]
+                HistoryPageChunk(HistoryPageChunk),
+            }
+        }
+
+        let command = TerminalCommand {
+            terminal_id: "terminal".into(),
+            lease_id: String::new(),
+            sequence: 1,
+            attachment_id: "attachment".into(),
+            command: Some(terminal_command::Command::StateAck(TerminalStateAck {
+                epoch: vec![1; 16],
+                generation: 7,
+            })),
+        };
+        let legacy = LegacyTerminalCommand::decode(command.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy.terminal_id, "terminal");
+        assert!(legacy.command.is_none());
+
+        let event = TerminalEvent {
+            terminal_id: "terminal".into(),
+            attachment_id: "attachment".into(),
+            event: Some(terminal_event::Event::SemanticStateDiffChunk(
+                TerminalStateDiffChunk {
+                    transfer_id: vec![2; 16],
+                    chunk_index: 0,
+                    chunk_count: 1,
+                    total_size: 0,
+                    sha256: vec![3; 32],
+                    data: vec![],
+                },
+            )),
+        };
+        let legacy = LegacyTerminalEvent::decode(event.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy.terminal_id, "terminal");
+        assert!(legacy.event.is_none());
     }
 
     #[test]

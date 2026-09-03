@@ -24,6 +24,8 @@
 | `terminal.semantic_state` | 可靠分片传输的 `astra.terminal.v2.State`；禁止混发 raw PTY | 是（Apple client/server v2） | `TERM-03`、`TERM-04` 已完成；CLI 未实现 replica，因此只 offer legacy capability |
 | `terminal.clipboard_write` | semantic attachment 上的 OSC 52 单向、受限剪贴板写事件；不包含读取 | 是（Apple client/server v1） | 必须同时选择 `terminal.semantic_state` v2；CLI 不 offer |
 | `terminal.history_paging` | 使用 v2 `Anchor` 的可靠历史分页、trim 边界和客户端远端 viewport | 是（Apple client/server v1） | 必须同时选择 `terminal.semantic_state` v2；CLI 不 offer |
+| `terminal.state_ack` | 客户端只在验证、应用并渲染完整 generation 后回 ACK；每个 attachment 最多一代在途 | 是（Apple client/server v1） | 必须同时选择 `terminal.semantic_state` v2；CLI 不 offer |
+| `terminal.semantic_diff` | 从已 ACK generation 到最新 generation 的累计行级 diff；中间输出可合并 | 是（Apple client/server v1） | 必须同时选择 `terminal.state_ack` v1 与 `terminal.semantic_state` v2；CLI 不 offer |
 | `session.objects` | Workspace CRUD、Terminal 归属和 Attachment 身份 | 是（Apple client/server v1） | 与 renderer capability 独立；CLI 保留 N-1 默认 Workspace 适配 |
 | `terminal.input_lease` | controller lease TTL、renew/release 与 controller-only resize owner | 是（server v1；Apple 完成 SESS-02 后启用） | 依赖 `session.objects` v1；未协商客户端保留 Stream 生命周期 lease |
 | `terminal.datagram_state` | generation 累计 patch 可走 QUIC DATAGRAM | 否 | `SYNC-01` 至 `SYNC-03` 完成 |
@@ -33,6 +35,8 @@ Capability 名称存在不代表实现完成。runtime support list 只能加入
 managed 模式下，gateway 在认证和协商完成后为每条 Unix worker stream 先发送内部 `WorkerStreamHello`。worker 必须按自己的 runtime support 重新验证 application version、capability 名称、版本、重复项和数量；gateway 同时加入认证连接 UUID，worker 校验其 canonical UUID 形式，网络 client 不能直接提供这份受信元数据。这样 rootless 和 managed attachment 使用同一份已验证 `NegotiatedProtocol` 和连接身份，不会由 `AttachRequest` 回显能力。
 
 semantic attachment 的 `AttachResponse` 不携带 legacy snapshot。服务端紧接着发送一个或多个有序 `TerminalStateChunk`：16-byte transfer ID、chunk index/count、总大小和整份 State 的 SHA-256。当前每片上限 512 KiB、整份 State 仍受 8 MiB schema 上限约束，因此最多 16 片。Apple client 只有在顺序、元数据、总大小、SHA-256、protobuf decode 和 State v2 validator 全部通过后才发布一次状态；任何失败都终止 attachment，不发布半份状态。
+
+同时选择 `terminal.state_ack` 与 `terminal.semantic_diff` 后，初始完整 State 是唯一无 base 的快照。客户端成功渲染后以 `(epoch, generation)` ACK；服务端在 ACK 前不发送下一代，只把任意数量的 PTY/resize 更新合并为一个 dirty 状态。ACK 后最多每 16 ms 从已确认 generation 直接构造到最新 generation 的累计 `TerminalStateDiff`。diff 以目标行顺序引用完全相同的 base row，只有新增或变化行携带完整 `Row`；其他 State/Screen metadata 与目标 style/hyperlink 表保持权威。客户端必须从精确 base 原子重建并再次运行完整 State v2 validator，成功渲染后才 ACK target。epoch 变化、base 不匹配或 diff 编码不小于完整 State 时，服务端使用可靠完整快照。详细不变量见 `terminal-state-sync-v1.md`。
 
 history paging 只在 semantic v2 同时选择时生效。`HistoryPageRequest` 和 `HistoryPageChunk` 是 appended oneof；未选择能力的 N-1 decoder 会忽略它们。每页最多 512 rows/4 MiB，仍以可靠 512 KiB chunks 和整页 SHA-256 原子发布。
 
@@ -64,5 +68,6 @@ session objects 的 Workspace RPC 也是 appended oneof，所有资源身份字�
 
 - capability negotiation 在 TLS 保护的 QUIC stream 内、用户认证前完成；失败不得降级重试为猜测模式。
 - 未选择 semantic capability 时只能走已登记的 legacy compatibility path，不能混发 v2 state。
+- 未选择 `terminal.state_ack`/`terminal.semantic_diff` 时保持 v2 的可靠完整 State 路径；不得发送 ACK 或 diff 后再猜测降级。
 - 未选择 DATAGRAM capability 时状态全部走可靠 stream；不能“试发再 fallback”。
 - server 日志只记录 application version 和 capability 数量/名称，不记录终端内容、challenge、key 或 token。
