@@ -1618,11 +1618,11 @@ mod tests {
         let mut engine = TerminalEngine::new(24, 80, 0, Box::new(sink)).unwrap();
         engine.advance(b"\x1b[6n");
 
-        for _ in 0..100 {
+        for _ in 0..1_000 {
             if !captured.lock().unwrap().is_empty() {
                 break;
             }
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(&*captured.lock().unwrap(), b"\x1b[1;1R");
     }
@@ -1637,11 +1637,19 @@ mod tests {
             b"\x1b[c\x1b[5n\x1b[18t\x1b[16t\x1b[14t\x1b[21t\x1b]52;c;?\x07\x1bP+q637570\x1b\\",
         );
 
-        for _ in 0..100 {
-            if captured.lock().unwrap().len() >= 30 {
+        for _ in 0..1_000 {
+            if captured
+                .lock()
+                .unwrap()
+                .windows(b"\x1bP1+r637570=".len())
+                .any(|window| window == b"\x1bP1+r637570=")
+            {
                 break;
             }
-            std::thread::yield_now();
+            // wezterm deliberately writes PTY query replies on a background
+            // thread. Wait for the final XTGETTCAP reply, not merely an
+            // arbitrary byte-count threshold that earlier replies can satisfy.
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let replies = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
         assert!(replies.contains("\x1b[?65;6;18;22c"), "{replies:?}");
