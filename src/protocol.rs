@@ -419,6 +419,8 @@ pub struct GitStatusRequest {
 pub struct WatchFilesRequest {
     #[prost(bytes = "vec", repeated, tag = "1")]
     pub paths: Vec<Vec<u8>>,
+    #[prost(bool, tag = "2")]
+    pub recursive: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -488,6 +490,8 @@ pub struct FileCapabilitiesResponse {
     pub chunk_sha256: bool,
     #[prost(bool, tag = "6")]
     pub file_watch_events: bool,
+    #[prost(bool, tag = "7")]
+    pub recursive_file_watch_events: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -1072,6 +1076,56 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recursive_file_watch_capability_is_additive_for_n_minus_one() {
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyFileCapabilitiesResponse {
+            #[prost(uint32, tag = "1")]
+            version: u32,
+            #[prost(bool, tag = "6")]
+            file_watch_events: bool,
+        }
+
+        let current = FileCapabilitiesResponse {
+            version: 1,
+            file_watch_events: true,
+            recursive_file_watch_events: true,
+            ..Default::default()
+        };
+        let legacy =
+            LegacyFileCapabilitiesResponse::decode(current.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy.version, 1);
+        assert!(legacy.file_watch_events);
+
+        let legacy = LegacyFileCapabilitiesResponse {
+            version: 1,
+            file_watch_events: true,
+        };
+        let current = FileCapabilitiesResponse::decode(legacy.encode_to_vec().as_slice()).unwrap();
+        assert!(!current.recursive_file_watch_events);
+
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyWatchFilesRequest {
+            #[prost(bytes = "vec", repeated, tag = "1")]
+            paths: Vec<Vec<u8>>,
+        }
+
+        let current_request = WatchFilesRequest {
+            paths: vec![b"project".to_vec()],
+            recursive: true,
+        };
+        let legacy_request =
+            LegacyWatchFilesRequest::decode(current_request.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy_request.paths, current_request.paths);
+
+        let legacy_request = LegacyWatchFilesRequest {
+            paths: vec![b"project/file.txt".to_vec()],
+        };
+        let current_request =
+            WatchFilesRequest::decode(legacy_request.encode_to_vec().as_slice()).unwrap();
+        assert!(!current_request.recursive);
+    }
 
     #[test]
     fn authentication_error_code_is_additive_for_n_minus_one() {

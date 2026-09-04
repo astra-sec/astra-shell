@@ -9,7 +9,10 @@ use std::{
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -36,6 +39,8 @@ const MAX_REMOTE_PATH_SIZE: usize = 16 * 1024;
 const MAX_GIT_STATUS_SIZE: usize = 4 * 1024 * 1024;
 const MAX_GIT_STATUS_ENTRIES: usize = 20_000;
 const MAX_WATCHED_FILES: usize = 128;
+const MAX_RECURSIVE_WATCH_ROOTS: usize = 8;
+const MAX_PENDING_FILE_EVENTS: usize = 4_096;
 const MAX_FILE_CHANGES_PER_EVENT: usize = 1_024;
 const FILE_CHANGE_COALESCE_DELAY: Duration = Duration::from_millis(75);
 
@@ -81,8 +86,15 @@ pub type FileResult<T> = std::result::Result<T, FileServiceError>;
 
 pub struct FileChangeSubscription {
     _watcher: RecommendedWatcher,
-    receiver: mpsc::UnboundedReceiver<notify::Result<Event>>,
+    receiver: mpsc::Receiver<notify::Result<Event>>,
     requested_paths: HashMap<PathBuf, Vec<u8>>,
+    recursive_roots: Vec<RecursiveWatchRoot>,
+    rescan_required: Arc<AtomicBool>,
+}
+
+struct RecursiveWatchRoot {
+    resolved: PathBuf,
+    requested: PathBuf,
 }
 
 impl FileChangeSubscription {
@@ -100,7 +112,10 @@ impl FileChangeSubscription {
                 }
             }
 
-            let response = self.coalesce(events);
+            let mut response = self.coalesce(events);
+            if self.rescan_required.swap(false, Ordering::AcqRel) {
+                response.rescan_required = true;
+            }
             if response.rescan_required || !response.changes.is_empty() {
                 return Ok(response);
             }
@@ -127,6 +142,17 @@ impl FileChangeSubscription {
             for path in event.paths {
                 if let Some(requested_path) = self.requested_paths.get(&path) {
                     changes.insert(requested_path.clone(), kind.into());
+                }
+                for root in &self.recursive_roots {
+                    let Ok(relative) = path.strip_prefix(&root.resolved) else {
+                        continue;
+                    };
+                    let reported = if relative.as_os_str().is_empty() {
+                        root.requested.clone()
+                    } else {
+                        root.requested.join(relative)
+                    };
+                    changes.insert(reported.as_os_str().as_bytes().to_vec(), kind.into());
                 }
             }
         }
@@ -237,6 +263,7 @@ impl FileService {
             atomic_upload_commit: true,
             chunk_sha256: true,
             file_watch_events: true,
+            recursive_file_watch_events: true,
         }
     }
 
@@ -253,37 +280,70 @@ impl FileService {
                 format!("at most {MAX_WATCHED_FILES} files may be watched"),
             ));
         }
+        if request.recursive && request.paths.len() > MAX_RECURSIVE_WATCH_ROOTS {
+            return Err(FileServiceError::new(
+                "quota",
+                format!("at most {MAX_RECURSIVE_WATCH_ROOTS} recursive roots may be watched"),
+            ));
+        }
 
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(MAX_PENDING_FILE_EVENTS);
+        let rescan_required = Arc::new(AtomicBool::new(false));
+        let callback_rescan_required = Arc::clone(&rescan_required);
         let mut watcher = notify::recommended_watcher(move |event| {
-            let _ = sender.send(event);
+            if let Err(error) = sender.try_send(event) {
+                if matches!(error, mpsc::error::TrySendError::Full(_)) {
+                    callback_rescan_required.store(true, Ordering::Release);
+                }
+            }
         })
         .map_err(|error| FileServiceError::new("watch", error.to_string()))?;
         let mut watched_directories = HashSet::new();
         let mut requested_paths = HashMap::new();
+        let mut recursive_roots = Vec::new();
         for raw_path in request.paths {
-            let path = self.resolve_existing(&raw_path, false)?;
+            let path = self.resolve_existing(&raw_path, request.recursive)?;
             let metadata = fs::symlink_metadata(&path).map_err(|error| {
                 FileServiceError::io(format!("cannot inspect {}", path.display()), error)
             })?;
-            if metadata.is_dir() {
-                return Err(FileServiceError::new(
-                    "invalid",
-                    format!("{} is a directory", path.display()),
-                ));
+            if request.recursive {
+                if !metadata.is_dir() {
+                    return Err(FileServiceError::new(
+                        "invalid",
+                        format!("{} is not a directory", path.display()),
+                    ));
+                }
+                if watched_directories.insert(path.clone()) {
+                    watcher
+                        .watch(&path, RecursiveMode::Recursive)
+                        .map_err(|error| FileServiceError::new("watch", error.to_string()))?;
+                }
+                recursive_roots.push(RecursiveWatchRoot {
+                    resolved: path,
+                    requested: PathBuf::from(OsString::from_vec(raw_path)),
+                });
+            } else {
+                if metadata.is_dir() {
+                    return Err(FileServiceError::new(
+                        "invalid",
+                        format!("{} is a directory", path.display()),
+                    ));
+                }
+                let parent = path.parent().unwrap_or(self.root.as_path()).to_path_buf();
+                if watched_directories.insert(parent.clone()) {
+                    watcher
+                        .watch(&parent, RecursiveMode::NonRecursive)
+                        .map_err(|error| FileServiceError::new("watch", error.to_string()))?;
+                }
+                requested_paths.insert(path, raw_path);
             }
-            let parent = path.parent().unwrap_or(self.root.as_path()).to_path_buf();
-            if watched_directories.insert(parent.clone()) {
-                watcher
-                    .watch(&parent, RecursiveMode::NonRecursive)
-                    .map_err(|error| FileServiceError::new("watch", error.to_string()))?;
-            }
-            requested_paths.insert(path, raw_path);
         }
         Ok(FileChangeSubscription {
             _watcher: watcher,
             receiver,
             requested_paths,
+            recursive_roots,
+            rescan_required,
         })
     }
 
@@ -1235,6 +1295,16 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_explicitly_advertise_recursive_file_watch_events() {
+        let root = tempfile::tempdir().unwrap();
+        let service = FileService::new(root.path().to_path_buf()).unwrap();
+
+        let capabilities = service.capabilities();
+        assert!(capabilities.file_watch_events);
+        assert!(capabilities.recursive_file_watch_events);
+    }
+
+    #[test]
     fn upload_chunks_are_idempotent_and_commit_atomically() {
         let root = tempfile::tempdir().unwrap();
         let service = FileService::new(root.path().to_path_buf()).unwrap();
@@ -1449,6 +1519,7 @@ mod tests {
         let mut subscription = service
             .watch_files(WatchFilesRequest {
                 paths: vec![b"Sources/App.swift".to_vec()],
+                recursive: false,
             })
             .unwrap();
 
@@ -1465,6 +1536,47 @@ mod tests {
             changes.changes[0].kind.as_str(),
             "modified" | "created"
         ));
+    }
+
+    #[tokio::test]
+    async fn recursively_watches_directory_entries_and_reports_exact_changed_paths() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("Sources")).unwrap();
+        fs::create_dir(root.path().join("Sources/Nested")).unwrap();
+        let service = FileService::new(root.path().to_path_buf()).unwrap();
+        let mut subscription = service
+            .watch_files(WatchFilesRequest {
+                paths: vec![b"Sources".to_vec()],
+                recursive: true,
+            })
+            .unwrap();
+
+        let changed_path = root.path().join("Sources/Nested/New.swift");
+        fs::write(&changed_path, b"new").unwrap();
+        let changed_path = changed_path.canonicalize().unwrap();
+        let reported_path = b"Sources/Nested/New.swift";
+        let changes = tokio::time::timeout(Duration::from_secs(3), subscription.next())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(changes.changes.len(), 1);
+        assert_eq!(changes.changes[0].path, reported_path);
+        assert!(matches!(
+            changes.changes[0].kind.as_str(),
+            "modified" | "created"
+        ));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        while subscription.receiver.try_recv().is_ok() {}
+        fs::remove_file(&changed_path).unwrap();
+        let changes = tokio::time::timeout(Duration::from_secs(3), subscription.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(changes.changes.iter().any(|change| {
+            change.path == reported_path && matches!(change.kind.as_str(), "removed" | "modified")
+        }));
     }
 
     #[test]

@@ -194,7 +194,12 @@ message RenameFileRequest {
   bool overwrite = 3;
 }
 message GitStatusRequest { bytes path = 1; }
-message WatchFilesRequest { repeated bytes paths = 1; }
+message WatchFilesRequest {
+  repeated bytes paths = 1;
+  // Recursively watch directory roots and report the exact changed paths.
+  // A false value preserves the v1 exact-file watch behavior.
+  bool recursive = 2;
+}
 
 message Response {
   string request_id = 1;
@@ -317,6 +322,9 @@ message FileCapabilitiesResponse {
   bool atomic_upload_commit = 4;
   bool chunk_sha256 = 5;
   bool file_watch_events = 6;
+  // The server accepts recursive directory WatchFilesRequest subscriptions
+  // and reports exact changed paths below each requested root.
+  bool recursive_file_watch_events = 7;
 }
 enum FileKind {
   FILE_KIND_UNSPECIFIED = 0;
