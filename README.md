@@ -275,7 +275,7 @@ cargo clippy --all-targets -- -D warnings
 - 认证兼容 OpenSSH Ed25519/RSA 密钥格式和 `authorized_keys`，客户端会自动选择 `~/.ssh/id_ed25519` 或 `~/.ssh/id_rsa`，但暂不支持 ssh-agent、加密私钥、ECDSA、SSH 用户证书及 authorized_keys options；
 - QUIC 主机身份已经支持独立的 SSH 式 TOFU 文件，但当前 pin 的是完整自签名证书；正式的证书轮换机制尚未实现；
 - 服务端维护唯一权威语义 screen/grid/history 并向新客户端发送 State v2；原始输出/ANSI snapshot 只保留为登记的 N/N-1 兼容路径；
-- 暂无 QUIC DATAGRAM 累计状态同步、预测和端口转发；Astra Files/1 已支持单文件传输和基本目录操作，但尚未提供递归目录同步、稀疏文件、ACL/xattr 和 GUI；
+- Rust server/worker/client library 已实现 QUIC DATAGRAM 累计 viewport 状态同步和可靠修复，Apple 客户端尚未接入；暂无客户端预测和端口转发；Astra Files/1 已支持单文件传输和基本目录操作，但尚未提供递归目录同步、稀疏文件、ACL/xattr 和 GUI；
 - 暂无 SSH stdio fallback；
 - rootless 模式的 PTY 仍由 gateway 进程持有；managed 模式已经使用可跨 gateway 重启存活、空闲时自动回收的独立用户 worker，但尚未提供正式的 worker 升级管理命令。
 

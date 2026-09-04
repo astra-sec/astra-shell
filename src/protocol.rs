@@ -32,6 +32,9 @@ pub struct WireMessage {
 pub mod wire_message {
     use super::*;
 
+    // Keep the handwritten Rust representation source-compatible with the
+    // canonical protobuf schema; callers can choose their own outer boxing.
+    #[allow(clippy::large_enum_variant)]
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Body {
         #[prost(message, tag = "1")]
@@ -107,6 +110,8 @@ pub struct WorkerStreamHello {
     pub capabilities: Vec<CapabilitySelection>,
     #[prost(string, tag = "3")]
     pub connection_id: String,
+    #[prost(uint32, tag = "4")]
+    pub maximum_datagram_size: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -437,6 +442,8 @@ pub struct Response {
 pub mod response {
     use super::*;
 
+    // Prost oneof variants intentionally mirror the public wire messages.
+    #[allow(clippy::large_enum_variant)]
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Result {
         #[prost(message, tag = "10")]
@@ -809,7 +816,10 @@ pub struct TerminalCommand {
     pub sequence: u64,
     #[prost(string, tag = "4")]
     pub attachment_id: String,
-    #[prost(oneof = "terminal_command::Command", tags = "10, 11, 12, 13, 14, 15")]
+    #[prost(
+        oneof = "terminal_command::Command",
+        tags = "10, 11, 12, 13, 14, 15, 16"
+    )]
     pub command: Option<terminal_command::Command>,
 }
 
@@ -830,6 +840,8 @@ pub mod terminal_command {
         LeaseControl(LeaseControl),
         #[prost(message, tag = "15")]
         StateAck(TerminalStateAck),
+        #[prost(message, tag = "16")]
+        StateRepair(TerminalStateRepairRequest),
     }
 }
 
@@ -839,6 +851,16 @@ pub struct TerminalStateAck {
     pub epoch: Vec<u8>,
     #[prost(uint64, tag = "2")]
     pub generation: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TerminalStateRepairRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub epoch: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub missing_base_generation: u64,
+    #[prost(uint64, tag = "3")]
+    pub newest_seen_generation: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -875,7 +897,7 @@ pub struct TerminalEvent {
     pub attachment_id: String,
     #[prost(
         oneof = "terminal_event::Event",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
     )]
     pub event: Option<terminal_event::Event>,
 }
@@ -883,7 +905,7 @@ pub struct TerminalEvent {
 pub mod terminal_event {
     use super::{
         ClipboardWrite, HistoryPageChunk, LeaseChanged, TerminalSnapshot, TerminalStateChunk,
-        TerminalStateDiffChunk,
+        TerminalStateDiffChunk, TerminalViewportDatagram,
     };
 
     #[derive(Clone, PartialEq, prost::Oneof)]
@@ -908,6 +930,8 @@ pub mod terminal_event {
         HistoryPageChunk(HistoryPageChunk),
         #[prost(message, tag = "19")]
         SemanticStateDiffChunk(TerminalStateDiffChunk),
+        #[prost(message, boxed, tag = "20")]
+        ViewportDatagram(Box<TerminalViewportDatagram>),
     }
 }
 
@@ -961,9 +985,9 @@ pub struct TerminalStateDiff {
     pub alternate_rows: Vec<TerminalStateRow>,
 }
 
-/// Experimental connection-scoped QUIC DATAGRAM payload. Bit positions in
+/// Connection-scoped QUIC DATAGRAM payload. Bit positions in
 /// `inherited_fields` select styles, hyperlinks, modes, title,
-/// working_directory, and palette respectively. This is not advertised yet.
+/// working_directory, and palette respectively.
 #[derive(Clone, PartialEq, Message)]
 pub struct TerminalViewportDatagram {
     #[prost(string, tag = "1")]
@@ -1478,5 +1502,92 @@ mod tests {
         let legacy = LegacyRequest::decode(request.encode_to_vec().as_slice()).unwrap();
         assert_eq!(legacy.request_id, "request");
         assert!(legacy.command.is_none());
+    }
+
+    #[test]
+    fn datagram_streaming_fields_are_additive_for_n_minus_one_messages() {
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyWorkerStreamHello {
+            #[prost(uint32, tag = "1")]
+            protocol_version: u32,
+            #[prost(message, repeated, tag = "2")]
+            capabilities: Vec<CapabilitySelection>,
+            #[prost(string, tag = "3")]
+            connection_id: String,
+        }
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyTerminalCommand {
+            #[prost(string, tag = "1")]
+            terminal_id: String,
+            #[prost(
+                oneof = "legacy_streaming_command::Command",
+                tags = "10, 11, 12, 13, 14, 15"
+            )]
+            command: Option<legacy_streaming_command::Command>,
+        }
+        mod legacy_streaming_command {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Command {
+                #[prost(bytes, tag = "10")]
+                Input(Vec<u8>),
+            }
+        }
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyTerminalEvent {
+            #[prost(string, tag = "1")]
+            terminal_id: String,
+            #[prost(
+                oneof = "legacy_streaming_event::Event",
+                tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
+            )]
+            event: Option<legacy_streaming_event::Event>,
+        }
+        mod legacy_streaming_event {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Event {
+                #[prost(bytes, tag = "10")]
+                Output(Vec<u8>),
+            }
+        }
+
+        let worker = WorkerStreamHello {
+            protocol_version: crate::PROTOCOL_VERSION,
+            capabilities: vec![],
+            connection_id: "connection".into(),
+            maximum_datagram_size: 1_200,
+        };
+        let legacy = LegacyWorkerStreamHello::decode(worker.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy.connection_id, "connection");
+
+        let command = TerminalCommand {
+            terminal_id: "terminal".into(),
+            command: Some(terminal_command::Command::StateRepair(
+                TerminalStateRepairRequest {
+                    epoch: vec![1; 16],
+                    missing_base_generation: 4,
+                    newest_seen_generation: 7,
+                },
+            )),
+            ..Default::default()
+        };
+        let legacy = LegacyTerminalCommand::decode(command.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy.terminal_id, "terminal");
+        assert!(legacy.command.is_none());
+
+        let event = TerminalEvent {
+            terminal_id: "terminal".into(),
+            attachment_id: "attachment".into(),
+            event: Some(terminal_event::Event::ViewportDatagram(Box::new(
+                TerminalViewportDatagram {
+                    terminal_id: "terminal".into(),
+                    attachment_id: "attachment".into(),
+                    diff: None,
+                    inherited_fields: 0,
+                },
+            ))),
+        };
+        let legacy = LegacyTerminalEvent::decode(event.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy.terminal_id, "terminal");
+        assert!(legacy.event.is_none());
     }
 }

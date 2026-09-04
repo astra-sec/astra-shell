@@ -291,10 +291,10 @@ impl FileService {
         let rescan_required = Arc::new(AtomicBool::new(false));
         let callback_rescan_required = Arc::clone(&rescan_required);
         let mut watcher = notify::recommended_watcher(move |event| {
-            if let Err(error) = sender.try_send(event) {
-                if matches!(error, mpsc::error::TrySendError::Full(_)) {
-                    callback_rescan_required.store(true, Ordering::Release);
-                }
+            if let Err(error) = sender.try_send(event)
+                && matches!(error, mpsc::error::TrySendError::Full(_))
+            {
+                callback_rescan_required.store(true, Ordering::Release);
             }
         })
         .map_err(|error| FileServiceError::new("watch", error.to_string()))?;
@@ -1072,15 +1072,13 @@ fn parse_git_status(repository_root: Vec<u8>, output: &[u8]) -> FileResult<GitSt
             parse_tracked_git_record(record, 10, original_path)
         } else if record.starts_with(b"u ") {
             parse_tracked_git_record(record, 11, Vec::new())
-        } else if let Some(path) = record.strip_prefix(b"? ") {
-            Some(GitFileStatus {
+        } else {
+            record.strip_prefix(b"? ").map(|path| GitFileStatus {
                 path: path.to_vec(),
                 index_status: "?".into(),
                 worktree_status: "?".into(),
                 original_path: Vec::new(),
             })
-        } else {
-            None
         };
         if let Some(file) = parsed {
             response.files.push(file);

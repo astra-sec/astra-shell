@@ -65,6 +65,11 @@ impl ProtocolSupport {
                     maximum_version: 1,
                 },
                 CapabilityRange {
+                    name: CAPABILITY_DATAGRAM_STATE,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
                     name: CAPABILITY_CLIPBOARD_WRITE,
                     minimum_version: 1,
                     maximum_version: 1,
@@ -97,6 +102,13 @@ impl ProtocolSupport {
         }
     }
 
+    /// Full semantic capabilities implemented by Rust protocol consumers. The
+    /// ANSI CLI intentionally keeps using `command_line_client` until its
+    /// renderer is migrated to the semantic replica.
+    pub fn rust_semantic_client() -> Self {
+        Self::runtime()
+    }
+
     #[cfg(test)]
     fn with_future_capabilities() -> Self {
         Self {
@@ -115,6 +127,16 @@ impl ProtocolSupport {
                 },
                 CapabilityRange {
                     name: CAPABILITY_DATAGRAM_STATE,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_STATE_ACK,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_SESSION_OBJECTS,
                     minimum_version: 1,
                     maximum_version: 1,
                 },
@@ -185,33 +207,42 @@ pub fn negotiate_client_hello(
         }
     }
     if capabilities.contains_key(CAPABILITY_CLIPBOARD_WRITE)
-        && !capabilities
+        && capabilities
             .get(CAPABILITY_SEMANTIC_STATE)
-            .is_some_and(|version| *version >= 2)
+            .is_none_or(|version| *version < 2)
     {
         capabilities.remove(CAPABILITY_CLIPBOARD_WRITE);
     }
     if capabilities.contains_key(CAPABILITY_HISTORY_PAGING)
-        && !capabilities
+        && capabilities
             .get(CAPABILITY_SEMANTIC_STATE)
-            .is_some_and(|version| *version >= 2)
+            .is_none_or(|version| *version < 2)
     {
         capabilities.remove(CAPABILITY_HISTORY_PAGING);
     }
     if capabilities.contains_key(CAPABILITY_STATE_ACK)
-        && !capabilities
+        && capabilities
             .get(CAPABILITY_SEMANTIC_STATE)
-            .is_some_and(|version| *version >= 2)
+            .is_none_or(|version| *version < 2)
     {
         capabilities.remove(CAPABILITY_STATE_ACK);
     }
     if capabilities.contains_key(CAPABILITY_SEMANTIC_DIFF)
         && (!capabilities.contains_key(CAPABILITY_STATE_ACK)
-            || !capabilities
+            || capabilities
                 .get(CAPABILITY_SEMANTIC_STATE)
-                .is_some_and(|version| *version >= 2))
+                .is_none_or(|version| *version < 2))
     {
         capabilities.remove(CAPABILITY_SEMANTIC_DIFF);
+    }
+    if capabilities.contains_key(CAPABILITY_DATAGRAM_STATE)
+        && (!capabilities.contains_key(CAPABILITY_STATE_ACK)
+            || !capabilities.contains_key(CAPABILITY_SESSION_OBJECTS)
+            || capabilities
+                .get(CAPABILITY_SEMANTIC_STATE)
+                .is_none_or(|version| *version < 2))
+    {
+        capabilities.remove(CAPABILITY_DATAGRAM_STATE);
     }
     if capabilities.contains_key(CAPABILITY_INPUT_LEASE)
         && !capabilities.contains_key(CAPABILITY_SESSION_OBJECTS)
@@ -445,6 +476,15 @@ fn validate_capability_dependencies(capabilities: &BTreeMap<String, u32>) -> Res
         "terminal.semantic_diff requires terminal.state_ack and terminal.semantic_state v2"
     );
     ensure!(
+        !capabilities.contains_key(CAPABILITY_DATAGRAM_STATE)
+            || (capabilities.contains_key(CAPABILITY_STATE_ACK)
+                && capabilities.contains_key(CAPABILITY_SESSION_OBJECTS)
+                && capabilities
+                    .get(CAPABILITY_SEMANTIC_STATE)
+                    .is_some_and(|version| *version >= 2)),
+        "terminal.datagram_state requires terminal.state_ack, session.objects, and terminal.semantic_state v2"
+    );
+    ensure!(
         !capabilities.contains_key(CAPABILITY_INPUT_LEASE)
             || capabilities.contains_key(CAPABILITY_SESSION_OBJECTS),
         "terminal.input_lease requires session.objects v1"
@@ -642,6 +682,41 @@ mod tests {
             }],
         };
         assert!(validate_server_hello(&hello, &invalid_server).is_err());
+    }
+
+    #[test]
+    fn datagram_state_requires_semantic_ack_and_session_routing() {
+        let support = ProtocolSupport::runtime();
+        let mut hello = client_hello("client", &support);
+        hello.capabilities.retain(|offer| {
+            matches!(
+                offer.name.as_str(),
+                CAPABILITY_SEMANTIC_STATE | CAPABILITY_STATE_ACK | CAPABILITY_DATAGRAM_STATE
+            )
+        });
+        let negotiated = negotiate_client_hello(&hello, &support).unwrap();
+        assert!(negotiated.has(CAPABILITY_SEMANTIC_STATE, 2));
+        assert!(negotiated.has(CAPABILITY_STATE_ACK, 1));
+        assert!(!negotiated.has(CAPABILITY_DATAGRAM_STATE, 1));
+
+        let invalid_worker_selection = vec![
+            CapabilitySelection {
+                name: CAPABILITY_SEMANTIC_STATE.into(),
+                version: 2,
+            },
+            CapabilitySelection {
+                name: CAPABILITY_STATE_ACK.into(),
+                version: 1,
+            },
+            CapabilitySelection {
+                name: CAPABILITY_DATAGRAM_STATE.into(),
+                version: 1,
+            },
+        ];
+        assert!(
+            validate_worker_selection(PROTOCOL_VERSION, &invalid_worker_selection, &support,)
+                .is_err()
+        );
     }
 
     #[test]

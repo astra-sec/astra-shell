@@ -1,22 +1,28 @@
-//! Experimental latest-state-wins synchronization for the live terminal viewport.
+//! Latest-state-wins synchronization for the live terminal viewport.
 //!
-//! This module deliberately is not wired into capability negotiation yet. It
-//! models the transport-independent part of a future QUIC DATAGRAM path so the
-//! loss, reordering, convergence, and byte-size properties can be tested before
-//! either the Rust or Swift runtime opts into it.
+//! Rust peers negotiate this data plane as `terminal.datagram_state` v1. A
+//! reliable semantic keyframe establishes a committed base; cumulative QUIC
+//! DATAGRAM deltas then update only the live viewport. Reliable history paging
+//! remains independent, and repair/re-key messages guarantee convergence after
+//! loss, reordering, or receiver eviction.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, ensure};
 use prost::Message;
+use sha2::{Digest, Sha256};
 
 use crate::{
-    protocol::{TerminalStateAck, TerminalStateDiff, TerminalViewportDatagram},
-    terminal_state_v2::{self, State},
+    protocol::{
+        HistoryPageChunk, TerminalStateAck, TerminalStateChunk, TerminalStateDiff,
+        TerminalStateRepairRequest, TerminalViewportDatagram,
+    },
+    terminal_state_v2::{self, HistoryPage, State},
     terminal_sync::{AckDisposition, apply_terminal_state_diff, terminal_state_diff},
 };
 
 const DEFAULT_RETAINED_GENERATIONS: usize = 128;
+const MAX_TRANSFER_CHUNKS: usize = 4_096;
 const INHERIT_STYLES: u32 = 1 << 0;
 const INHERIT_HYPERLINKS: u32 = 1 << 1;
 const INHERIT_MODES: u32 = 1 << 2;
@@ -37,6 +43,7 @@ impl TerminalViewportDatagram {
             .context("terminal viewport delta has no semantic diff")
     }
 
+    #[cfg(test)]
     fn target_generation(&self) -> Result<u64> {
         Ok(self.diff()?.target_generation)
     }
@@ -50,20 +57,199 @@ pub(crate) enum StreamingUpdate {
     DatagramDelta(TerminalViewportDatagram),
 }
 
+#[derive(Default)]
+pub struct TerminalStateAssembler {
+    transfer: TransferAssembler,
+}
+
+#[derive(Default)]
+pub struct HistoryPageAssembler {
+    transfer: TransferAssembler,
+}
+
+#[derive(Default)]
+struct TransferAssembler {
+    pending: Option<PendingTransfer>,
+}
+
+struct PendingTransfer {
+    transfer_id: Vec<u8>,
+    total_size: usize,
+    sha256: Vec<u8>,
+    chunks: Vec<Option<Vec<u8>>>,
+    received_size: usize,
+    received_chunks: usize,
+}
+
+impl TerminalStateAssembler {
+    pub fn push(&mut self, chunk: TerminalStateChunk) -> Result<Option<State>> {
+        let encoded = self.transfer.push(
+            TransferChunk::from(chunk),
+            terminal_state_v2::MAX_ENCODED_STATE_BYTES,
+        )?;
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        let state = State::decode(encoded.as_slice())?;
+        terminal_state_v2::validate(&state).context("received terminal state is invalid")?;
+        Ok(Some(state))
+    }
+}
+
+impl HistoryPageAssembler {
+    pub fn push(&mut self, chunk: HistoryPageChunk) -> Result<Option<HistoryPage>> {
+        let encoded = self.transfer.push(
+            TransferChunk::from(chunk),
+            terminal_state_v2::MAX_ENCODED_HISTORY_PAGE_BYTES,
+        )?;
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        let page = HistoryPage::decode(encoded.as_slice())?;
+        terminal_state_v2::validate_history_page(&page)
+            .context("received terminal history page is invalid")?;
+        Ok(Some(page))
+    }
+}
+
+struct TransferChunk {
+    transfer_id: Vec<u8>,
+    chunk_index: u32,
+    chunk_count: u32,
+    total_size: u32,
+    sha256: Vec<u8>,
+    data: Vec<u8>,
+}
+
+impl From<TerminalStateChunk> for TransferChunk {
+    fn from(chunk: TerminalStateChunk) -> Self {
+        Self {
+            transfer_id: chunk.transfer_id,
+            chunk_index: chunk.chunk_index,
+            chunk_count: chunk.chunk_count,
+            total_size: chunk.total_size,
+            sha256: chunk.sha256,
+            data: chunk.data,
+        }
+    }
+}
+
+impl From<HistoryPageChunk> for TransferChunk {
+    fn from(chunk: HistoryPageChunk) -> Self {
+        Self {
+            transfer_id: chunk.transfer_id,
+            chunk_index: chunk.chunk_index,
+            chunk_count: chunk.chunk_count,
+            total_size: chunk.total_size,
+            sha256: chunk.sha256,
+            data: chunk.data,
+        }
+    }
+}
+
+impl TransferAssembler {
+    fn push(&mut self, chunk: TransferChunk, maximum_size: usize) -> Result<Option<Vec<u8>>> {
+        ensure!(
+            chunk.transfer_id.len() == 16,
+            "terminal transfer ID is invalid"
+        );
+        ensure!(
+            chunk.sha256.len() == 32,
+            "terminal transfer digest is invalid"
+        );
+        let chunk_count = usize::try_from(chunk.chunk_count)?;
+        let chunk_index = usize::try_from(chunk.chunk_index)?;
+        let total_size = usize::try_from(chunk.total_size)?;
+        ensure!(
+            (1..=MAX_TRANSFER_CHUNKS).contains(&chunk_count),
+            "terminal transfer chunk count is invalid"
+        );
+        ensure!(
+            chunk_index < chunk_count,
+            "terminal transfer chunk index is invalid"
+        );
+        ensure!(total_size <= maximum_size, "terminal transfer is too large");
+        if let Some(pending) = &self.pending {
+            ensure!(
+                pending.transfer_id == chunk.transfer_id,
+                "terminal transfer changed before completion"
+            );
+        } else {
+            ensure!(
+                chunk_index == 0,
+                "terminal transfer started after its first chunk"
+            );
+            self.pending = Some(PendingTransfer {
+                transfer_id: chunk.transfer_id.clone(),
+                total_size,
+                sha256: chunk.sha256.clone(),
+                chunks: vec![None; chunk_count],
+                received_size: 0,
+                received_chunks: 0,
+            });
+        }
+        let pending = self
+            .pending
+            .as_mut()
+            .context("terminal transfer disappeared")?;
+        ensure!(
+            pending.transfer_id == chunk.transfer_id
+                && pending.total_size == total_size
+                && pending.sha256 == chunk.sha256
+                && pending.chunks.len() == chunk_count,
+            "terminal transfer metadata changed"
+        );
+        if let Some(existing) = &pending.chunks[chunk_index] {
+            ensure!(
+                existing == &chunk.data,
+                "terminal transfer chunk changed on retransmission"
+            );
+            return Ok(None);
+        }
+        pending.received_size = pending
+            .received_size
+            .checked_add(chunk.data.len())
+            .context("terminal transfer size overflowed")?;
+        ensure!(
+            pending.received_size <= pending.total_size,
+            "terminal transfer exceeds declared size"
+        );
+        pending.received_chunks += 1;
+        pending.chunks[chunk_index] = Some(chunk.data);
+        if pending.received_chunks != pending.chunks.len() {
+            return Ok(None);
+        }
+
+        let pending = self
+            .pending
+            .take()
+            .context("terminal transfer disappeared")?;
+        let encoded = pending
+            .chunks
+            .into_iter()
+            .map(|chunk| chunk.context("terminal transfer has a missing chunk"))
+            .collect::<Result<Vec<_>>>()?
+            .concat();
+        ensure!(
+            encoded.len() == pending.total_size,
+            "terminal transfer size does not match"
+        );
+        ensure!(
+            Sha256::digest(&encoded).as_slice() == pending.sha256,
+            "terminal transfer digest does not match"
+        );
+        Ok(Some(encoded))
+    }
+}
+
 impl StreamingUpdate {
+    #[cfg(test)]
     pub(crate) fn target_generation(&self) -> u64 {
         match self {
             Self::ReliableKeyframe(state) => state.generation,
             Self::DatagramDelta(delta) => delta
                 .target_generation()
                 .expect("constructed viewport delta has a semantic diff"),
-        }
-    }
-
-    pub(crate) fn encoded_len(&self) -> usize {
-        match self {
-            Self::ReliableKeyframe(state) => state.encoded_len(),
-            Self::DatagramDelta(delta) => delta.encoded_len(),
         }
     }
 }
@@ -142,6 +328,7 @@ pub(crate) struct StreamingStateWindow {
     terminal_id: String,
     attachment_id: String,
     base: State,
+    base_acknowledged: bool,
     sent: BTreeMap<u64, State>,
     latest_target: Option<State>,
     retained_generations: usize,
@@ -182,6 +369,7 @@ impl StreamingStateWindow {
             terminal_id,
             attachment_id,
             base: initial_keyframe,
+            base_acknowledged: false,
             sent,
             latest_target: None,
             retained_generations,
@@ -204,6 +392,10 @@ impl StreamingStateWindow {
         }
         if latest.epoch != self.base.epoch {
             return self.install_keyframe(latest).map(Some);
+        }
+        if !self.base_acknowledged {
+            self.latest_target = Some(latest);
+            return Ok(None);
         }
 
         let update = self.update_from_base(&latest, datagram_payload_budget)?;
@@ -232,6 +424,9 @@ impl StreamingStateWindow {
         if latest.epoch != self.base.epoch {
             return self.install_keyframe(latest).map(Some);
         }
+        if !self.base_acknowledged {
+            return Ok(None);
+        }
         let update = self.update_from_base(&latest, datagram_payload_budget)?;
         if matches!(update, StreamingUpdate::ReliableKeyframe(_)) {
             return self.install_keyframe(latest).map(Some);
@@ -253,6 +448,49 @@ impl StreamingStateWindow {
         self.install_keyframe(latest).map(Some)
     }
 
+    pub(crate) fn repair(
+        &mut self,
+        request: &TerminalStateRepairRequest,
+    ) -> Result<Option<StreamingUpdate>> {
+        ensure!(
+            request.epoch.len() == terminal_state_v2::EPOCH_BYTES,
+            "terminal state repair epoch is invalid"
+        );
+        ensure!(
+            request.missing_base_generation > 0,
+            "terminal state repair base generation is zero"
+        );
+        ensure!(
+            request.newest_seen_generation >= request.missing_base_generation,
+            "terminal state repair generation range is reversed"
+        );
+        ensure!(
+            request.epoch == self.base.epoch,
+            "terminal state repair epoch changed"
+        );
+        ensure!(
+            request.missing_base_generation <= self.latest_generation(),
+            "terminal state repair names a future base"
+        );
+        match self.rekey_latest()? {
+            Some(update) => Ok(Some(update)),
+            None => {
+                self.base_acknowledged = false;
+                Ok(Some(StreamingUpdate::ReliableKeyframe(self.base.clone())))
+            }
+        }
+    }
+
+    pub(crate) fn has_pending_update(&self) -> bool {
+        self.latest_target.as_ref().is_some_and(|state| {
+            state.epoch != self.base.epoch || state.generation > self.base.generation
+        })
+    }
+
+    pub(crate) fn base_is_acknowledged(&self) -> bool {
+        self.base_acknowledged
+    }
+
     /// Accepts an ACK for any retained generation, not just a single in-flight
     /// frame. Advancing the base makes following cumulative deltas smaller.
     pub(crate) fn acknowledge(&mut self, ack: &TerminalStateAck) -> Result<AckDisposition> {
@@ -262,6 +500,9 @@ impl StreamingStateWindow {
         );
         ensure!(ack.generation > 0, "terminal state ACK generation is zero");
         if ack.epoch == self.base.epoch && ack.generation <= self.base.generation {
+            if ack.generation == self.base.generation {
+                self.base_acknowledged = true;
+            }
             if self
                 .latest_target
                 .as_ref()
@@ -275,12 +516,20 @@ impl StreamingStateWindow {
             ack.epoch == self.base.epoch,
             "terminal state ACK epoch changed"
         );
-        let acknowledged = self
-            .sent
-            .get(&ack.generation)
-            .cloned()
-            .context("terminal state ACK generation is no longer retained")?;
+        let Some(acknowledged) = self.sent.get(&ack.generation).cloned() else {
+            // A delayed ACK may name a generation evicted from the bounded
+            // sender window. It cannot advance the base, but it is still a
+            // valid stale observation rather than a reason to kill the
+            // attachment. Generations beyond anything prepared remain a
+            // protocol error.
+            ensure!(
+                ack.generation <= self.latest_generation(),
+                "terminal state ACK names a future generation"
+            );
+            return Ok(AckDisposition::Duplicate);
+        };
         self.base = acknowledged;
+        self.base_acknowledged = true;
         self.sent
             .retain(|generation, _| *generation >= ack.generation);
         if self
@@ -312,6 +561,7 @@ impl StreamingStateWindow {
     fn install_keyframe(&mut self, state: State) -> Result<StreamingUpdate> {
         validate_viewport_state(&state)?;
         self.base = state.clone();
+        self.base_acknowledged = false;
         self.sent.clear();
         self.remember(state.clone());
         Ok(StreamingUpdate::ReliableKeyframe(state))
@@ -348,7 +598,7 @@ impl StreamingStateWindow {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ApplyDisposition {
+pub enum ApplyDisposition {
     Applied,
     Stale,
     MissingBase,
@@ -357,7 +607,7 @@ pub(crate) enum ApplyDisposition {
 /// Client-side atomic replica used by the experiment. It retains recent bases
 /// so a newer cumulative datagram can be applied even when earlier datagrams
 /// were lost or arrive later.
-pub(crate) struct StreamingReplica {
+pub struct StreamingReplica {
     terminal_id: String,
     attachment_id: String,
     current: Option<State>,
@@ -380,7 +630,7 @@ impl Default for StreamingReplica {
 }
 
 impl StreamingReplica {
-    pub(crate) fn for_route(terminal_id: String, attachment_id: String) -> Result<Self> {
+    pub fn for_route(terminal_id: String, attachment_id: String) -> Result<Self> {
         ensure!(
             !terminal_id.is_empty() && !attachment_id.is_empty(),
             "terminal viewport datagram route is empty"
@@ -392,18 +642,50 @@ impl StreamingReplica {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn apply(&mut self, update: &StreamingUpdate) -> Result<ApplyDisposition> {
         match update {
             StreamingUpdate::ReliableKeyframe(state) => self.apply_keyframe(state.clone()),
-            StreamingUpdate::DatagramDelta(delta) => self.apply_delta(delta),
+            StreamingUpdate::DatagramDelta(delta) => self.apply_datagram(delta),
         }
     }
 
-    pub(crate) fn current(&self) -> Option<&State> {
+    pub fn current(&self) -> Option<&State> {
         self.current.as_ref()
     }
 
-    fn apply_keyframe(&mut self, state: State) -> Result<ApplyDisposition> {
+    pub fn state_ack(&self) -> Option<TerminalStateAck> {
+        self.current.as_ref().map(|state| TerminalStateAck {
+            epoch: state.epoch.clone(),
+            generation: state.generation,
+        })
+    }
+
+    pub fn repair_request(
+        &self,
+        datagram: &TerminalViewportDatagram,
+    ) -> Result<TerminalStateRepairRequest> {
+        ensure!(
+            datagram.terminal_id == self.terminal_id
+                && datagram.attachment_id == self.attachment_id,
+            "terminal viewport datagram targets the wrong attachment"
+        );
+        let diff = datagram.diff()?;
+        let newest_seen_generation = self
+            .current
+            .as_ref()
+            .filter(|state| state.epoch == diff.epoch)
+            .map_or(diff.target_generation, |state| {
+                state.generation.max(diff.target_generation)
+            });
+        Ok(TerminalStateRepairRequest {
+            epoch: diff.epoch.clone(),
+            missing_base_generation: diff.base_generation,
+            newest_seen_generation,
+        })
+    }
+
+    pub fn apply_keyframe(&mut self, state: State) -> Result<ApplyDisposition> {
         validate_viewport_state(&state)?;
         if self.current.as_ref().is_some_and(|current| {
             current.epoch == state.epoch && current.generation >= state.generation
@@ -423,7 +705,7 @@ impl StreamingReplica {
         Ok(ApplyDisposition::Applied)
     }
 
-    fn apply_delta(&mut self, delta: &TerminalViewportDatagram) -> Result<ApplyDisposition> {
+    pub fn apply_datagram(&mut self, delta: &TerminalViewportDatagram) -> Result<ApplyDisposition> {
         ensure!(
             delta.terminal_id == self.terminal_id && delta.attachment_id == self.attachment_id,
             "terminal viewport datagram targets the wrong attachment"
@@ -584,12 +866,130 @@ mod tests {
     }
 
     fn sender(initial: State) -> StreamingStateWindow {
-        StreamingStateWindow::with_route(initial, TERMINAL_ID.to_owned(), ATTACHMENT_ID.to_owned())
-            .unwrap()
+        let ack = TerminalStateAck {
+            epoch: initial.epoch.clone(),
+            generation: initial.generation,
+        };
+        let mut sender = StreamingStateWindow::with_route(
+            initial,
+            TERMINAL_ID.to_owned(),
+            ATTACHMENT_ID.to_owned(),
+        )
+        .unwrap();
+        sender.acknowledge(&ack).unwrap();
+        sender
     }
 
     fn receiver() -> StreamingReplica {
         StreamingReplica::for_route(TERMINAL_ID.to_owned(), ATTACHMENT_ID.to_owned()).unwrap()
+    }
+
+    fn state_chunks(state: &State, chunk_bytes: usize) -> Vec<TerminalStateChunk> {
+        let encoded = state.encode_to_vec();
+        let digest = Sha256::digest(&encoded).to_vec();
+        let transfer_id = vec![9; 16];
+        let chunk_count = encoded.len().div_ceil(chunk_bytes) as u32;
+        encoded
+            .chunks(chunk_bytes)
+            .enumerate()
+            .map(|(index, data)| TerminalStateChunk {
+                transfer_id: transfer_id.clone(),
+                chunk_index: index as u32,
+                chunk_count,
+                total_size: encoded.len() as u32,
+                sha256: digest.clone(),
+                data: data.to_vec(),
+            })
+            .collect()
+    }
+
+    fn history_chunks(page: &HistoryPage, chunk_bytes: usize) -> Vec<HistoryPageChunk> {
+        let encoded = page.encode_to_vec();
+        let digest = Sha256::digest(&encoded).to_vec();
+        let transfer_id = vec![7; 16];
+        let chunk_count = encoded.len().div_ceil(chunk_bytes) as u32;
+        encoded
+            .chunks(chunk_bytes)
+            .enumerate()
+            .map(|(index, data)| HistoryPageChunk {
+                transfer_id: transfer_id.clone(),
+                chunk_index: index as u32,
+                chunk_count,
+                total_size: encoded.len() as u32,
+                sha256: digest.clone(),
+                data: data.to_vec(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reliable_keyframe_assembler_is_atomic_and_order_tolerant() {
+        let mut engine = TerminalEngine::new(6, 40, 128, Box::new(std::io::sink())).unwrap();
+        engine.advance(b"assembled state");
+        let state = viewport(&mut engine);
+        let chunks = state_chunks(&state, state.encoded_len().div_ceil(3));
+        assert!(chunks.len() >= 3);
+
+        let mut assembler = TerminalStateAssembler::default();
+        assert!(assembler.push(chunks[0].clone()).unwrap().is_none());
+        assert!(assembler.push(chunks[2].clone()).unwrap().is_none());
+        let mut completed = None;
+        for chunk in chunks.iter().skip(1).filter(|chunk| chunk.chunk_index != 2) {
+            completed = assembler.push(chunk.clone()).unwrap().or(completed);
+        }
+        assert_eq!(completed.as_ref(), Some(&state));
+    }
+
+    #[test]
+    fn reliable_keyframe_assembler_rejects_corruption_and_metadata_changes() {
+        let mut engine = TerminalEngine::new(6, 40, 128, Box::new(std::io::sink())).unwrap();
+        engine.advance(b"validated state");
+        let state = viewport(&mut engine);
+        let chunks = state_chunks(&state, state.encoded_len().div_ceil(2));
+
+        let mut changed = chunks[0].clone();
+        let mut assembler = TerminalStateAssembler::default();
+        assembler.push(changed.clone()).unwrap();
+        changed.data.push(0);
+        assert!(assembler.push(changed).is_err());
+
+        let mut assembler = TerminalStateAssembler::default();
+        assembler.push(chunks[0].clone()).unwrap();
+        let mut replacement = chunks[0].clone();
+        replacement.transfer_id = vec![8; 16];
+        assert!(assembler.push(replacement).is_err());
+
+        let mut corrupted = state_chunks(&state, state.encoded_len());
+        corrupted[0].sha256[0] ^= 0xff;
+        assert!(
+            TerminalStateAssembler::default()
+                .push(corrupted.remove(0))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reliable_history_assembler_validates_and_publishes_one_complete_page() {
+        let mut engine = TerminalEngine::new(2, 20, 32, Box::new(std::io::sink())).unwrap();
+        engine.advance(b"zero\r\none\r\ntwo\r\nthree\r\nfour");
+        let state = engine.semantic_state().unwrap();
+        let page = engine
+            .history_page(
+                11,
+                &terminal_state_v2::HistoryPageRequest {
+                    epoch: state.epoch,
+                    before: state.primary.unwrap().included_start,
+                    maximum_rows: 3,
+                },
+            )
+            .unwrap();
+        let chunks = history_chunks(&page, page.encoded_len().div_ceil(2));
+        let mut assembler = HistoryPageAssembler::default();
+        let mut completed = None;
+        for chunk in chunks {
+            completed = assembler.push(chunk).unwrap().or(completed);
+        }
+        assert_eq!(completed.as_ref(), Some(&page));
     }
 
     #[test]
@@ -606,7 +1006,7 @@ mod tests {
             live.rows as usize
         );
         assert_eq!(live.primary.as_ref().unwrap().viewport_start, 0);
-        assert!(live.encoded_len() < full.encoded_len());
+        assert!(live.encoded_len() * 4 < full.encoded_len());
         println!(
             "terminal-streaming keyframe: full={}B viewport={}B reduction={:.1}%",
             full.encoded_len(),
@@ -660,7 +1060,7 @@ mod tests {
         let restored = apply_compact_viewport_delta(&base, &compact).unwrap();
         assert_eq!(restored, target);
         assert!(compact.encoded_len() <= DATAGRAM_BUDGET);
-        assert!(compact.encoded_len() < original.encoded_len());
+        assert!(compact.encoded_len() * 2 < original.encoded_len());
         println!(
             "terminal-streaming delta: original={}B compact-with-route={}B reduction={:.1}%",
             original.encoded_len(),
@@ -691,6 +1091,39 @@ mod tests {
         }
         assert!(generations.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(bases.iter().all(|base| *base == initial.generation));
+    }
+
+    #[test]
+    fn deltas_wait_only_for_the_reliable_keyframe_commit() {
+        let mut engine = TerminalEngine::new(6, 40, 128, Box::new(std::io::sink())).unwrap();
+        let initial = viewport(&mut engine);
+        let mut sender = StreamingStateWindow::with_route(
+            initial.clone(),
+            TERMINAL_ID.to_owned(),
+            ATTACHMENT_ID.to_owned(),
+        )
+        .unwrap();
+        engine.advance(b"arrived before keyframe commit");
+        assert!(
+            sender
+                .prepare_update(viewport(&mut engine), DATAGRAM_BUDGET)
+                .unwrap()
+                .is_none()
+        );
+        assert!(sender.has_pending_update());
+        sender
+            .acknowledge(&TerminalStateAck {
+                epoch: initial.epoch,
+                generation: initial.generation,
+            })
+            .unwrap();
+        assert!(sender.base_is_acknowledged());
+        assert!(
+            sender
+                .retry_latest(DATAGRAM_BUDGET)
+                .unwrap()
+                .is_some_and(|update| matches!(update, StreamingUpdate::DatagramDelta(_)))
+        );
     }
 
     #[test]
@@ -729,6 +1162,43 @@ mod tests {
             ApplyDisposition::Stale
         );
         assert_eq!(receiver.current(), Some(&expected));
+    }
+
+    #[test]
+    fn every_bounded_loss_subset_converges_when_the_latest_delta_arrives() {
+        let mut engine = TerminalEngine::new(6, 40, 128, Box::new(std::io::sink())).unwrap();
+        let initial = viewport(&mut engine);
+        let mut sender = sender(initial.clone());
+        let mut updates = Vec::new();
+        for text in ["a", "b", "c", "d", "e", "f", "g", "latest"] {
+            engine.advance(text.as_bytes());
+            updates.push(
+                sender
+                    .prepare_update(viewport(&mut engine), DATAGRAM_BUDGET)
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let expected = viewport(&mut engine);
+        let latest = updates.last().unwrap();
+
+        // Exhaust all 2^7 subsets of the intermediate generations. Deliver
+        // each selected subset newest-first and duplicate it, then deliver the
+        // latest cumulative delta. No pattern may corrupt or block convergence.
+        for mask in 0_u16..(1 << (updates.len() - 1)) {
+            let mut receiver = receiver();
+            receiver
+                .apply(&StreamingUpdate::ReliableKeyframe(initial.clone()))
+                .unwrap();
+            for (index, update) in updates[..updates.len() - 1].iter().enumerate().rev() {
+                if mask & (1 << index) != 0 {
+                    receiver.apply(update).unwrap();
+                    receiver.apply(update).unwrap();
+                }
+            }
+            receiver.apply(latest).unwrap();
+            assert_eq!(receiver.current(), Some(&expected), "loss mask {mask:#09b}");
+        }
     }
 
     #[test]
@@ -779,6 +1249,53 @@ mod tests {
         );
         assert_eq!(receiver.apply(&newest).unwrap(), ApplyDisposition::Applied);
         assert_eq!(receiver.current(), Some(&expected));
+    }
+
+    #[test]
+    fn delayed_ack_for_an_evicted_generation_is_harmless() {
+        let mut engine = TerminalEngine::new(6, 40, 128, Box::new(std::io::sink())).unwrap();
+        let initial = viewport(&mut engine);
+        let epoch = initial.epoch.clone();
+        let mut sender = StreamingStateWindow::with_retained_generations(
+            initial.clone(),
+            TERMINAL_ID.to_owned(),
+            ATTACHMENT_ID.to_owned(),
+            2,
+        )
+        .unwrap();
+        sender
+            .acknowledge(&TerminalStateAck {
+                epoch: epoch.clone(),
+                generation: initial.generation,
+            })
+            .unwrap();
+
+        engine.advance(b"one");
+        let first = viewport(&mut engine);
+        let evicted_generation = first.generation;
+        sender.prepare_update(first, DATAGRAM_BUDGET).unwrap();
+        engine.advance(b"two");
+        let second = viewport(&mut engine);
+        sender.prepare_update(second, DATAGRAM_BUDGET).unwrap();
+
+        assert_eq!(
+            sender
+                .acknowledge(&TerminalStateAck {
+                    epoch: epoch.clone(),
+                    generation: evicted_generation,
+                })
+                .unwrap(),
+            AckDisposition::Duplicate
+        );
+        let future_generation = sender.latest_generation() + 1;
+        assert!(
+            sender
+                .acknowledge(&TerminalStateAck {
+                    epoch,
+                    generation: future_generation,
+                })
+                .is_err()
+        );
     }
 
     #[test]
@@ -834,6 +1351,31 @@ mod tests {
             ApplyDisposition::Applied
         );
         assert_eq!(receiver.current(), Some(&expected));
+    }
+
+    #[test]
+    fn explicit_missing_base_repair_immediately_returns_a_reliable_keyframe() {
+        let mut engine = TerminalEngine::new(6, 40, 128, Box::new(std::io::sink())).unwrap();
+        let initial = viewport(&mut engine);
+        let mut sender = sender(initial);
+        engine.advance(b"repair target");
+        let expected = viewport(&mut engine);
+        let delta = sender
+            .prepare_update(expected.clone(), DATAGRAM_BUDGET)
+            .unwrap()
+            .unwrap();
+        let StreamingUpdate::DatagramDelta(datagram) = delta else {
+            panic!("small update should remain a datagram")
+        };
+
+        let receiver = receiver();
+        let request = receiver.repair_request(&datagram).unwrap();
+        let repaired = sender.repair(&request).unwrap().unwrap();
+        let StreamingUpdate::ReliableKeyframe(state) = repaired else {
+            panic!("repair did not produce a reliable keyframe")
+        };
+        assert_eq!(state, expected);
+        assert!(!sender.base_is_acknowledged());
     }
 
     #[test]
@@ -912,6 +1454,10 @@ mod tests {
             TERMINAL_ID.to_owned(),
             ATTACHMENT_ID.to_owned(),
         )?;
+        sender.acknowledge(&TerminalStateAck {
+            epoch: initial.epoch.clone(),
+            generation: initial.generation,
+        })?;
         let mut receiver =
             StreamingReplica::for_route(TERMINAL_ID.to_owned(), ATTACHMENT_ID.to_owned())?;
         receiver.apply(&StreamingUpdate::ReliableKeyframe(initial))?;

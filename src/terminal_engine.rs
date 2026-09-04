@@ -369,9 +369,11 @@ impl TerminalEngine {
                 if alternate_screen { alternate } else { primary },
             ),
             alternate_screen,
-            normal_contents: alternate_screen
-                .then(|| render_legacy_screen(&state, primary))
-                .unwrap_or_default(),
+            normal_contents: if alternate_screen {
+                render_legacy_screen(&state, primary)
+            } else {
+                Vec::new()
+            },
         })
     }
 }
@@ -1190,8 +1192,7 @@ mod tests {
         let following_hard_line = primary
             .included_rows
             .iter()
-            .skip_while(|row| row.start.as_ref().unwrap().logical_line_id == first.logical_line_id)
-            .next()
+            .find(|row| row.start.as_ref().unwrap().logical_line_id != first.logical_line_id)
             .unwrap();
         assert!(
             following_hard_line.start.as_ref().unwrap().logical_line_id > first.logical_line_id

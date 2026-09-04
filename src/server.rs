@@ -19,10 +19,10 @@ use crate::{
     auth::{authentication_payload, verify_authorized_key, verify_authorized_keys},
     files::{FileResult, FileService},
     negotiation::{
-        CAPABILITY_CLIPBOARD_WRITE, CAPABILITY_HISTORY_PAGING, CAPABILITY_INPUT_LEASE,
-        CAPABILITY_SEMANTIC_DIFF, CAPABILITY_SEMANTIC_STATE, CAPABILITY_SESSION_OBJECTS,
-        CAPABILITY_STATE_ACK, NegotiatedProtocol, ProtocolSupport, negotiate_client_hello,
-        selections, validate_worker_selection,
+        CAPABILITY_CLIPBOARD_WRITE, CAPABILITY_DATAGRAM_STATE, CAPABILITY_HISTORY_PAGING,
+        CAPABILITY_INPUT_LEASE, CAPABILITY_SEMANTIC_DIFF, CAPABILITY_SEMANTIC_STATE,
+        CAPABILITY_SESSION_OBJECTS, CAPABILITY_STATE_ACK, NegotiatedProtocol, ProtocolSupport,
+        negotiate_client_hello, selections, validate_worker_selection,
     },
     process_lock::ProcessLock,
     protocol::{
@@ -43,8 +43,9 @@ use crate::{
     terminal_state_v2::{
         HistoryPage, MAX_ENCODED_HISTORY_PAGE_BYTES, MAX_ENCODED_STATE_BYTES, State,
     },
+    terminal_streaming::{StreamingStateWindow, StreamingUpdate, viewport_state},
     terminal_sync::{AckDisposition, PreparedStateUpdate, StateSyncWindow},
-    worker::WorkerRouter,
+    worker::{WorkerProxyStream, WorkerRouter},
 };
 
 #[derive(Clone, Debug)]
@@ -97,6 +98,7 @@ struct ServerState {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum ModeState {
     Rootless {
         account: SystemAccount,
@@ -111,6 +113,7 @@ enum ModeState {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum ConnectionBackend {
     Local {
         manager: SessionManager,
@@ -124,6 +127,25 @@ enum ConnectionBackend {
 
 const TERMINAL_STATE_CHUNK_BYTES: usize = 512 * 1024;
 const TERMINAL_STATE_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+const TERMINAL_DATAGRAM_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const TERMINAL_DATAGRAM_REKEY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(Clone)]
+enum TerminalDatagramTransport {
+    Direct(quinn::Connection),
+    WorkerBridge { maximum_datagram_size: usize },
+}
+
+impl TerminalDatagramTransport {
+    fn maximum_datagram_size(&self) -> Option<usize> {
+        match self {
+            Self::Direct(connection) => connection.max_datagram_size(),
+            Self::WorkerBridge {
+                maximum_datagram_size,
+            } => Some(*maximum_datagram_size),
+        }
+    }
+}
 
 pub fn initialize_state(paths: &ServerPaths) -> Result<()> {
     fs::create_dir_all(&paths.state_dir)
@@ -401,6 +423,7 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
         let negotiated = negotiated.clone();
         let connection_id = connection_id.clone();
         let connection_resources = connection_resources.clone();
+        let request_connection = connection.clone();
         tokio::spawn(async move {
             let result: Result<()> = async {
                 let first_message = read_message(&mut recv)
@@ -429,8 +452,13 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
                             send,
                             recv,
                             first_message,
-                            negotiated,
-                            connection_id,
+                            WorkerMessageContext {
+                                negotiated,
+                                connection_id,
+                                datagram_transport: Some(TerminalDatagramTransport::Direct(
+                                    request_connection,
+                                )),
+                            },
                         )
                         .await
                     }
@@ -440,9 +468,12 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
                                 &account,
                                 send,
                                 recv,
-                                first_message,
-                                negotiated,
-                                connection_id,
+                                WorkerProxyStream {
+                                    first_message,
+                                    negotiated,
+                                    connection_id,
+                                    connection: request_connection,
+                                },
                             )
                             .await
                     }
@@ -478,7 +509,13 @@ async fn authenticate_connection(
     if hello.username.is_empty() {
         bail!("ClientHello has no target Unix username")
     }
-    let negotiated = negotiate_client_hello(&hello, &ProtocolSupport::runtime())?;
+    let mut support = ProtocolSupport::runtime();
+    if connection.max_datagram_size().is_none() {
+        support
+            .capabilities
+            .retain(|capability| capability.name != CAPABILITY_DATAGRAM_STATE);
+    }
+    let negotiated = negotiate_client_hello(&hello, &support)?;
     let username = hello.username;
 
     let challenge: [u8; 32] = rand::random();
@@ -683,13 +720,14 @@ where
     let hello = read_message(&mut recv)
         .await?
         .context("request stream ended before its first message")?;
-    let (negotiated, connection_id) = match hello {
+    let (negotiated, connection_id, maximum_datagram_size) = match hello {
         WireMessage {
             body:
                 Some(wire_message::Body::WorkerStreamHello(WorkerStreamHello {
                     protocol_version,
                     capabilities,
                     connection_id,
+                    maximum_datagram_size,
                 })),
         } => (
             validate_worker_selection(
@@ -698,6 +736,7 @@ where
                 &ProtocolSupport::runtime(),
             )?,
             connection_id,
+            maximum_datagram_size,
         ),
         _ => bail!("expected WorkerStreamHello as first worker stream message"),
     };
@@ -707,6 +746,22 @@ where
         parsed_connection_id.to_string() == connection_id,
         "worker connection ID is not canonical"
     );
+    let datagram_transport = if negotiated.has(CAPABILITY_DATAGRAM_STATE, 1) {
+        let maximum_datagram_size = usize::try_from(maximum_datagram_size)?;
+        ensure!(
+            maximum_datagram_size > 0,
+            "worker stream negotiated datagrams without a payload limit"
+        );
+        Some(TerminalDatagramTransport::WorkerBridge {
+            maximum_datagram_size,
+        })
+    } else {
+        ensure!(
+            maximum_datagram_size == 0,
+            "worker stream supplied a datagram limit without negotiating datagrams"
+        );
+        None
+    };
     let request = read_message(&mut recv)
         .await?
         .context("worker stream ended before its request")?;
@@ -716,10 +771,19 @@ where
         send,
         recv,
         request,
-        negotiated,
-        connection_id,
+        WorkerMessageContext {
+            negotiated,
+            connection_id,
+            datagram_transport,
+        },
     )
     .await
+}
+
+struct WorkerMessageContext {
+    negotiated: NegotiatedProtocol,
+    connection_id: String,
+    datagram_transport: Option<TerminalDatagramTransport>,
 }
 
 async fn handle_worker_message<W, R>(
@@ -728,8 +792,7 @@ async fn handle_worker_message<W, R>(
     mut send: W,
     recv: R,
     first_message: WireMessage,
-    negotiated: NegotiatedProtocol,
-    connection_id: String,
+    context: WorkerMessageContext,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -764,7 +827,7 @@ where
     } else {
         None
     };
-    let session_objects = negotiated.has(CAPABILITY_SESSION_OBJECTS, 1);
+    let session_objects = context.negotiated.has(CAPABILITY_SESSION_OBJECTS, 1);
     match request.command {
         Some(request::Command::List(_)) => {
             let terminals = manager.list_legacy_terminals();
@@ -864,19 +927,7 @@ where
                     return Ok(());
                 }
             };
-            handle_attach(
-                manager,
-                terminal,
-                request_id,
-                attach.read_only,
-                attach.takeover,
-                attach.resume_token,
-                send,
-                recv,
-                negotiated,
-                connection_id,
-            )
-            .await?;
+            handle_attach(manager, terminal, request_id, attach, send, recv, context).await?;
             return Ok(());
         }
         Some(request::Command::FileCapabilities(_)) => {
@@ -1198,24 +1249,26 @@ async fn handle_attach<W, R>(
     manager: SessionManager,
     terminal: Arc<Terminal>,
     request_id: String,
-    read_only: bool,
-    takeover: bool,
-    resume_token: String,
+    request: crate::protocol::AttachRequest,
     mut send: W,
     mut recv: R,
-    negotiated: NegotiatedProtocol,
-    connection_id: String,
+    context: WorkerMessageContext,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    let WorkerMessageContext {
+        negotiated,
+        connection_id,
+        datagram_transport,
+    } = context;
     let mut lease_events = terminal.subscribe_to_leases();
     let input_lease = negotiated.has(CAPABILITY_INPUT_LEASE, 1);
     let lease = match terminal.acquire_lease(
-        read_only,
-        takeover,
-        &resume_token,
+        request.read_only,
+        request.takeover,
+        &request.resume_token,
         input_lease.then_some(INPUT_LEASE_TTL),
     ) {
         Ok(lease) => lease,
@@ -1226,7 +1279,8 @@ where
         }
     };
     let info = terminal.info();
-    let mut attachment = match manager.register_attachment(&connection_id, &info, read_only) {
+    let mut attachment = match manager.register_attachment(&connection_id, &info, request.read_only)
+    {
         Ok(attachment) => attachment,
         Err(error) => {
             terminal.release_lease(&lease.lease_id);
@@ -1243,9 +1297,28 @@ where
     let clipboard_write = semantic && negotiated.has(CAPABILITY_CLIPBOARD_WRITE, 1);
     let state_ack = semantic && negotiated.has(CAPABILITY_STATE_ACK, 1);
     let semantic_diff = state_ack && negotiated.has(CAPABILITY_SEMANTIC_DIFF, 1);
+    let datagram_state =
+        state_ack && session_objects && negotiated.has(CAPABILITY_DATAGRAM_STATE, 1);
+    let datagram_payload_budget = datagram_transport
+        .as_ref()
+        .and_then(TerminalDatagramTransport::maximum_datagram_size)
+        .unwrap_or(0);
+    if datagram_state {
+        ensure!(
+            datagram_transport.is_some() && datagram_payload_budget > 0,
+            "terminal datagram capability has no payload budget"
+        );
+    }
     let mut state_sync = StateSyncWindow::default();
+    let mut streaming_sync = None;
+    let mut streaming_dirty = false;
     let (snapshot, initial_state, mut events) = if semantic {
         let (state, events) = terminal.semantic_state_and_subscribe()?;
+        let state = if datagram_state {
+            viewport_state(state)?
+        } else {
+            state
+        };
         (None, Some(state), events)
     } else {
         let (snapshot, events) = terminal.snapshot_and_subscribe()?;
@@ -1257,7 +1330,7 @@ where
         response::Result::Attach(AttachResponse {
             terminal: Some(info.clone()),
             lease_id: lease.lease_id.clone(),
-            read_only,
+            read_only: request.read_only,
             history: Vec::new(),
             resume_token: lease.resume_token.clone(),
             snapshot,
@@ -1271,11 +1344,18 @@ where
     .await?;
     if let Some(state) = initial_state {
         write_terminal_state(&mut send, &info.id, &attachment_info.id, &state).await?;
-        if state_ack {
+        if datagram_state {
+            streaming_sync = Some(StreamingStateWindow::with_route(
+                state,
+                info.id.clone(),
+                attachment_info.id.clone(),
+            )?);
+        } else if state_ack {
             state_sync.begin_initial(state)?;
         }
     }
     let mut last_state_sent = tokio::time::Instant::now();
+    let mut last_streaming_rekey = last_state_sent;
     attachment.set_state(crate::protocol::AttachmentState::Live)?;
 
     if info.status != "running" {
@@ -1302,10 +1382,40 @@ where
                 }
             };
             let state_deadline = last_state_sent + TERMINAL_STATE_COALESCE_INTERVAL;
-            let should_send_state = state_ack && state_sync.needs_update();
+            let should_send_state = if datagram_state {
+                streaming_dirty
+            } else {
+                state_ack && state_sync.needs_update()
+            };
             let wait_for_state_update = async {
                 if should_send_state {
                     tokio::time::sleep_until(state_deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let streaming_pending = streaming_sync
+                .as_ref()
+                .is_some_and(StreamingStateWindow::has_pending_update);
+            let streaming_base_acknowledged = streaming_sync
+                .as_ref()
+                .is_some_and(StreamingStateWindow::base_is_acknowledged);
+            let should_retry_streaming = datagram_state
+                && streaming_pending
+                && streaming_base_acknowledged
+                && !streaming_dirty;
+            let retry_deadline = last_state_sent + TERMINAL_DATAGRAM_RETRY_INTERVAL;
+            let wait_for_streaming_retry = async {
+                if should_retry_streaming {
+                    tokio::time::sleep_until(retry_deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let rekey_deadline = last_streaming_rekey + TERMINAL_DATAGRAM_REKEY_INTERVAL;
+            let wait_for_streaming_rekey = async {
+                if datagram_state && streaming_pending {
+                    tokio::time::sleep_until(rekey_deadline).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
@@ -1334,7 +1444,9 @@ where
                                         size.pixel_height,
                                     )?;
                                     if semantic {
-                                        if state_ack {
+                                        if datagram_state {
+                                            streaming_dirty = true;
+                                        } else if state_ack {
                                             state_sync.mark_dirty();
                                         } else {
                                             let state = terminal.semantic_state()?;
@@ -1380,9 +1492,60 @@ where
                                     if !state_ack {
                                         bail!("terminal state ACK received without negotiated capability")
                                     }
-                                    match state_sync.acknowledge(&ack)? {
+                                    let streaming_base_was_acknowledged = datagram_state
+                                        && streaming_sync
+                                            .as_ref()
+                                            .is_some_and(StreamingStateWindow::base_is_acknowledged);
+                                    let disposition = if datagram_state {
+                                        streaming_sync
+                                            .as_mut()
+                                            .context("terminal streaming state is missing")?
+                                            .acknowledge(&ack)?
+                                    } else {
+                                        state_sync.acknowledge(&ack)?
+                                    };
+                                    match disposition {
                                         AckDisposition::Accepted | AckDisposition::Duplicate => {}
                                     }
+                                    if datagram_state {
+                                        let streaming = streaming_sync
+                                            .as_ref()
+                                            .context("terminal streaming state is missing")?;
+                                        if disposition == AckDisposition::Accepted
+                                            || (!streaming_base_was_acknowledged
+                                                && streaming.base_is_acknowledged())
+                                        {
+                                            // A healthy stream that keeps making ACK progress
+                                            // does not need periodic reliable keyframes. This
+                                            // deadline is for a pending viewport that has made
+                                            // no receiver progress for the bounded interval.
+                                            last_streaming_rekey = tokio::time::Instant::now();
+                                        }
+                                        if streaming.base_is_acknowledged()
+                                            && streaming.has_pending_update()
+                                        {
+                                            streaming_dirty = true;
+                                        }
+                                    }
+                                }
+                                Some(terminal_command::Command::StateRepair(repair)) => {
+                                    if !datagram_state {
+                                        bail!("terminal state repair requested without negotiated datagram capability")
+                                    }
+                                    let update = streaming_sync
+                                        .as_mut()
+                                        .context("terminal streaming state is missing")?
+                                        .repair(&repair)?
+                                        .context("terminal streaming repair produced no keyframe")?;
+                                    write_streaming_update(
+                                        &mut send,
+                                        datagram_transport.as_ref().context("terminal datagram transport is missing")?,
+                                        &info.id,
+                                        &attachment_info.id,
+                                        &update,
+                                    ).await?;
+                                    last_state_sent = tokio::time::Instant::now();
+                                    last_streaming_rekey = last_state_sent;
                                 }
                                 Some(terminal_command::Command::Detach(_)) | None => break,
                             }
@@ -1420,22 +1583,82 @@ where
                     terminal.expire_lease_if_due(&lease.lease_id);
                 }
                 _ = wait_for_state_update, if should_send_state => {
-                    let latest = terminal.semantic_state()?;
-                    if let Some(update) = state_sync.prepare_update(latest, semantic_diff)? {
-                        write_prepared_state_update(
+                    if datagram_state {
+                        streaming_dirty = false;
+                        let latest = viewport_state(terminal.semantic_state()?)?;
+                        if let Some(update) = streaming_sync
+                            .as_mut()
+                            .context("terminal streaming state is missing")?
+                            .prepare_update(latest, datagram_payload_budget)?
+                        {
+                            write_streaming_update(
+                                &mut send,
+                                datagram_transport.as_ref().context("terminal datagram transport is missing")?,
+                                &info.id,
+                                &attachment_info.id,
+                                &update,
+                            ).await?;
+                            last_state_sent = tokio::time::Instant::now();
+                            if matches!(update, StreamingUpdate::ReliableKeyframe(_)) {
+                                last_streaming_rekey = last_state_sent;
+                            }
+                        }
+                    } else {
+                        let latest = terminal.semantic_state()?;
+                        if let Some(update) = state_sync.prepare_update(latest, semantic_diff)? {
+                            write_prepared_state_update(
+                                &mut send,
+                                &info.id,
+                                &attachment_info.id,
+                                &update,
+                            ).await?;
+                            last_state_sent = tokio::time::Instant::now();
+                        }
+                    }
+                }
+                _ = wait_for_streaming_retry, if should_retry_streaming => {
+                    if let Some(update) = streaming_sync
+                        .as_mut()
+                        .context("terminal streaming state is missing")?
+                        .retry_latest(datagram_payload_budget)?
+                    {
+                        write_streaming_update(
                             &mut send,
+                            datagram_transport.as_ref().context("terminal datagram transport is missing")?,
                             &info.id,
                             &attachment_info.id,
                             &update,
                         ).await?;
                         last_state_sent = tokio::time::Instant::now();
+                        if matches!(update, StreamingUpdate::ReliableKeyframe(_)) {
+                            last_streaming_rekey = last_state_sent;
+                        }
+                    }
+                }
+                _ = wait_for_streaming_rekey, if datagram_state && streaming_pending => {
+                    if let Some(update) = streaming_sync
+                        .as_mut()
+                        .context("terminal streaming state is missing")?
+                        .rekey_latest()?
+                    {
+                        write_streaming_update(
+                            &mut send,
+                            datagram_transport.as_ref().context("terminal datagram transport is missing")?,
+                            &info.id,
+                            &attachment_info.id,
+                            &update,
+                        ).await?;
+                        last_state_sent = tokio::time::Instant::now();
+                        last_streaming_rekey = last_state_sent;
                     }
                 }
                 event = events.recv() => {
                     match event {
                         Ok(PtyEvent::Output(bytes)) => {
                             if semantic {
-                                if state_ack {
+                                if datagram_state {
+                                    streaming_dirty = true;
+                                } else if state_ack {
                                     state_sync.mark_dirty();
                                 } else {
                                     let state = terminal.semantic_state()?;
@@ -1456,6 +1679,24 @@ where
                             }
                         }
                         Ok(PtyEvent::Exited(code)) => {
+                            if semantic {
+                                let state = terminal.semantic_state()?;
+                                let state = if datagram_state {
+                                    viewport_state(state)?
+                                } else {
+                                    state
+                                };
+                                // The attachment stream is about to close, so
+                                // flush the authoritative final frame reliably;
+                                // a pending lossy viewport must not hide the
+                                // process's last output behind Exited.
+                                write_terminal_state(
+                                    &mut send,
+                                    &info.id,
+                                    &attachment_info.id,
+                                    &state,
+                                ).await?;
+                            }
                             write_terminal_event(
                                 &mut send,
                                 &info.id,
@@ -1504,7 +1745,9 @@ where
                             // A tmux-style authoritative grid lets a slow client
                             // recover exactly instead of continuing after a gap
                             // in the byte stream.
-                            if semantic && state_ack {
+                            if semantic && datagram_state {
+                                streaming_dirty = true;
+                            } else if semantic && state_ack {
                                 // The acknowledged base plus one cumulative update is sufficient
                                 // to recover from any number of skipped PTY notifications.
                                 state_sync.mark_dirty();
@@ -1786,6 +2029,66 @@ where
     }
 }
 
+async fn write_streaming_update<W>(
+    send: &mut W,
+    transport: &TerminalDatagramTransport,
+    terminal_id: &str,
+    attachment_id: &str,
+    update: &StreamingUpdate,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match update {
+        StreamingUpdate::ReliableKeyframe(state) => {
+            write_terminal_state(send, terminal_id, attachment_id, state).await
+        }
+        StreamingUpdate::DatagramDelta(datagram) => match transport {
+            TerminalDatagramTransport::Direct(connection) => {
+                ensure!(
+                    datagram.terminal_id == terminal_id
+                        && datagram.attachment_id == attachment_id
+                        && datagram.diff.is_some(),
+                    "terminal viewport datagram route is inconsistent"
+                );
+                let encoded = datagram.encode_to_vec();
+                let Some(maximum) = connection.max_datagram_size() else {
+                    // The reliable re-key timer will converge without ending
+                    // the attachment if DATAGRAM support disappears mid-path.
+                    return Ok(());
+                };
+                if encoded.len() > maximum {
+                    // PMTU can shrink after attach. Treat this generation as
+                    // locally lost; retry/re-key provides bounded recovery.
+                    return Ok(());
+                }
+                match connection.send_datagram(encoded.into()) {
+                    Ok(())
+                    | Err(quinn::SendDatagramError::TooLarge)
+                    | Err(quinn::SendDatagramError::UnsupportedByPeer)
+                    | Err(quinn::SendDatagramError::Disabled) => Ok(()),
+                    Err(quinn::SendDatagramError::ConnectionLost(error)) => Err(error.into()),
+                }
+            }
+            TerminalDatagramTransport::WorkerBridge { .. } => {
+                ensure!(
+                    datagram.terminal_id == terminal_id
+                        && datagram.attachment_id == attachment_id
+                        && datagram.diff.is_some(),
+                    "terminal viewport datagram route is inconsistent"
+                );
+                write_terminal_event(
+                    send,
+                    terminal_id,
+                    attachment_id,
+                    terminal_event::Event::ViewportDatagram(Box::new(datagram.clone())),
+                )
+                .await
+            }
+        },
+    }
+}
+
 async fn write_history_page<W>(
     send: &mut W,
     terminal_id: &str,
@@ -1945,11 +2248,14 @@ mod tests {
             server_write,
             server_read,
             first_message,
-            NegotiatedProtocol {
-                version: crate::PROTOCOL_VERSION,
-                capabilities: BTreeMap::new(),
+            WorkerMessageContext {
+                negotiated: NegotiatedProtocol {
+                    version: crate::PROTOCOL_VERSION,
+                    capabilities: BTreeMap::new(),
+                },
+                connection_id: uuid::Uuid::new_v4().to_string(),
+                datagram_transport: None,
             },
-            uuid::Uuid::new_v4().to_string(),
         )
         .await
         .unwrap();

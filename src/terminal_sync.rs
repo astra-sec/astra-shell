@@ -57,10 +57,11 @@ impl StateSyncWindow {
             "terminal state ACK is still pending"
         );
         self.dirty = false;
-        if let Some(base) = &self.acknowledged {
-            if base.epoch == latest.epoch && latest.generation <= base.generation {
-                return Ok(None);
-            }
+        if let Some(base) = &self.acknowledged
+            && base.epoch == latest.epoch
+            && latest.generation <= base.generation
+        {
+            return Ok(None);
         }
 
         let update = if allow_diff {

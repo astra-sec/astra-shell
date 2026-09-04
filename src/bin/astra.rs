@@ -808,6 +808,9 @@ async fn attach_terminal(
                                     Some(terminal_event::Event::SemanticStateDiffChunk(_)) => {
                                         return Err(anyhow!("server sent semantic terminal diff to the ANSI command-line client"));
                                     }
+                                    Some(terminal_event::Event::ViewportDatagram(_)) => {
+                                        return Err(anyhow!("server forwarded an internal terminal datagram on the reliable stream"));
+                                    }
                                     Some(terminal_event::Event::ClipboardWrite(_)) => {
                                         return Err(anyhow!("server sent an unnegotiated clipboard host effect"));
                                     }

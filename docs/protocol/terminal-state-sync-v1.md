@@ -34,5 +34,5 @@
 - epoch 变化、没有已 ACK base 或 diff 编码大小不小于完整 State：发送完整 State。
 - broadcast lag：只标记 dirty；已 ACK base 到最新 State 的累计更新覆盖所有跳过事件。
 - diff 不会跨 attachment、epoch 或 generation base 重用。
-- `terminal.datagram_state` 仍未启用；`SYNC-03` 才能在保留可靠 fallback、MTU 和队列上限的前提下增加 DATAGRAM。
+- 选择 `terminal.datagram_state` 后改用独立的 latest-state-wins 窗口；可靠同步路径本身保持不变。见 `terminal-datagram-state-v1.md`。
 - N-1 decoder 会忽略新增 command/event oneof；capability 未选择时新消息不可达。

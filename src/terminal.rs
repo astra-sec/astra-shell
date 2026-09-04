@@ -590,8 +590,9 @@ impl TerminalManager {
             .write()
             .expect("terminal registry poisoned")
             .insert(id, terminal.clone());
-        start_reader(terminal.clone(), reader);
-        start_child_monitor(terminal.clone(), self.terminals.clone());
+        let (reader_done_send, reader_done_recv) = tokio::sync::oneshot::channel();
+        start_reader(terminal.clone(), reader, reader_done_send);
+        start_child_monitor(terminal.clone(), self.terminals.clone(), reader_done_recv);
         start_foreground_monitor(terminal.clone());
         Ok(terminal)
     }
@@ -963,7 +964,11 @@ fn enable_iutf8(_master: &dyn MasterPty) -> Result<()> {
     Ok(())
 }
 
-fn start_reader(terminal: Arc<Terminal>, mut reader: Box<dyn Read + Send>) {
+fn start_reader(
+    terminal: Arc<Terminal>,
+    mut reader: Box<dyn Read + Send>,
+    reader_done: tokio::sync::oneshot::Sender<()>,
+) {
     std::thread::Builder::new()
         .name(format!("astra-pty-{}", &terminal.info().id[..8]))
         .spawn(move || {
@@ -983,6 +988,7 @@ fn start_reader(terminal: Arc<Terminal>, mut reader: Box<dyn Read + Send>) {
                     }
                 }
             }
+            let _ = reader_done.send(());
         })
         .expect("failed to start PTY reader thread");
 }
@@ -990,10 +996,11 @@ fn start_reader(terminal: Arc<Terminal>, mut reader: Box<dyn Read + Send>) {
 fn start_child_monitor(
     terminal: Arc<Terminal>,
     terminals: Arc<RwLock<HashMap<String, Arc<Terminal>>>>,
+    reader_done: tokio::sync::oneshot::Receiver<()>,
 ) {
     tokio::spawn(async move {
         let terminal_id = terminal.info().id;
-        loop {
+        let exit_status = loop {
             let result = terminal
                 .child
                 .lock()
@@ -1002,25 +1009,34 @@ fn start_child_monitor(
             match result {
                 Ok(Some(status)) => {
                     let code = status.exit_code() as i32;
-                    {
-                        let mut info = terminal.info.write().expect("terminal info poisoned");
-                        info.status = "exited".into();
-                        info.exit_code = Some(code);
-                        info.lifecycle = TerminalLifecycle::Exited as i32;
-                    }
-                    let _ = terminal.events.send(PtyEvent::Exited(code));
-                    break;
+                    break Ok(code);
                 }
                 Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
                 Err(error) => {
-                    let mut info = terminal.info.write().expect("terminal info poisoned");
-                    info.status = "lost".into();
-                    info.lifecycle = TerminalLifecycle::Exited as i32;
-                    drop(info);
-                    let message = format!("failed to wait for terminal: {error}");
-                    let _ = terminal.events.send(PtyEvent::Error(message));
-                    break;
+                    break Err(format!("failed to wait for terminal: {error}"));
                 }
+            }
+        };
+        // The child status can become visible slightly before the blocking PTY
+        // reader drains its final bytes. Give it a bounded drain window so the
+        // terminal engine reaches its final authoritative state before Exited.
+        let _ = tokio::time::timeout(Duration::from_millis(250), reader_done).await;
+        match exit_status {
+            Ok(code) => {
+                {
+                    let mut info = terminal.info.write().expect("terminal info poisoned");
+                    info.status = "exited".into();
+                    info.exit_code = Some(code);
+                    info.lifecycle = TerminalLifecycle::Exited as i32;
+                }
+                let _ = terminal.events.send(PtyEvent::Exited(code));
+            }
+            Err(message) => {
+                let mut info = terminal.info.write().expect("terminal info poisoned");
+                info.status = "lost".into();
+                info.lifecycle = TerminalLifecycle::Exited as i32;
+                drop(info);
+                let _ = terminal.events.send(PtyEvent::Error(message));
             }
         }
         tokio::time::sleep(EXITED_TERMINAL_RETENTION).await;

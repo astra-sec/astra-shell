@@ -8,8 +8,9 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use nix::unistd::{Gid, Uid, chown};
+use prost::Message;
 use tokio::{
     io::{AsyncWriteExt, copy},
     net::{UnixListener, UnixStream},
@@ -22,9 +23,11 @@ use tracing::{info, warn};
 use crate::{
     accounts::{SystemAccount, effective_uid},
     files::FileService,
-    negotiation::{NegotiatedProtocol, selections},
+    negotiation::{CAPABILITY_DATAGRAM_STATE, NegotiatedProtocol, selections},
     process_lock::ProcessLock,
-    protocol::{WireMessage, WorkerStreamHello, wire_message, write_message},
+    protocol::{
+        WireMessage, WorkerStreamHello, read_message, terminal_event, wire_message, write_message,
+    },
     resources::{ResourceAccount, ResourceGovernor, ResourcePolicy, ResourceReservation},
     server::handle_worker_request,
 };
@@ -37,6 +40,13 @@ pub struct WorkerRouter {
     resources: ResourceGovernor,
     resource_policy: ResourcePolicy,
     worker_capacities: Arc<Mutex<HashMap<u32, ResourceReservation>>>,
+}
+
+pub(crate) struct WorkerProxyStream {
+    pub(crate) first_message: WireMessage,
+    pub(crate) negotiated: NegotiatedProtocol,
+    pub(crate) connection_id: String,
+    pub(crate) connection: quinn::Connection,
 }
 
 pub const DEFAULT_WORKER_IDLE_TIMEOUT_SECONDS: u64 = 10 * 60;
@@ -66,15 +76,19 @@ impl WorkerRouter {
         }))
     }
 
-    pub async fn proxy_stream(
+    pub(crate) async fn proxy_stream(
         &self,
         account: &SystemAccount,
         mut quic_send: quinn::SendStream,
         mut quic_recv: quinn::RecvStream,
-        first_message: WireMessage,
-        negotiated: NegotiatedProtocol,
-        connection_id: String,
+        request: WorkerProxyStream,
     ) -> Result<()> {
+        let WorkerProxyStream {
+            first_message,
+            negotiated,
+            connection_id,
+            connection,
+        } = request;
         let worker = self.connect(account).await?;
         let (mut worker_recv, mut worker_send) = worker.into_split();
         write_message(
@@ -83,18 +97,18 @@ impl WorkerRouter {
                 protocol_version: negotiated.version,
                 capabilities: selections(&negotiated),
                 connection_id,
+                maximum_datagram_size: worker_datagram_payload_limit(&negotiated, &connection)?,
             })),
         )
         .await?;
         write_message(&mut worker_send, &first_message).await?;
         let client_to_worker = async {
             copy(&mut quic_recv, &mut worker_send).await?;
-            worker_send.shutdown().await
+            worker_send.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
         };
-        let worker_to_client = async {
-            copy(&mut worker_recv, &mut quic_send).await?;
-            quic_send.shutdown().await
-        };
+        let worker_to_client =
+            forward_worker_messages(&mut worker_recv, &mut quic_send, &connection);
         tokio::try_join!(client_to_worker, worker_to_client)?;
         Ok(())
     }
@@ -272,6 +286,72 @@ impl WorkerRouter {
         });
         Ok(())
     }
+}
+
+fn worker_datagram_payload_limit(
+    negotiated: &NegotiatedProtocol,
+    connection: &quinn::Connection,
+) -> Result<u32> {
+    if !negotiated.has(CAPABILITY_DATAGRAM_STATE, 1) {
+        return Ok(0);
+    }
+    connection
+        .max_datagram_size()
+        .map(u32::try_from)
+        .transpose()?
+        .context("terminal datagrams were negotiated without QUIC transport support")
+}
+
+async fn forward_worker_messages<R, W>(
+    worker_recv: &mut R,
+    client_send: &mut W,
+    connection: &quinn::Connection,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    while let Some(message) = read_message(worker_recv).await? {
+        let datagram = match &message.body {
+            Some(wire_message::Body::TerminalEvent(event)) => match &event.event {
+                Some(terminal_event::Event::ViewportDatagram(datagram)) => {
+                    ensure!(
+                        !event.terminal_id.is_empty()
+                            && !event.attachment_id.is_empty()
+                            && event.terminal_id == datagram.terminal_id
+                            && event.attachment_id == datagram.attachment_id
+                            && datagram.diff.is_some(),
+                        "worker emitted an inconsistent terminal datagram route"
+                    );
+                    Some(datagram.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(datagram) = datagram {
+            let encoded = datagram.encode_to_vec();
+            let Some(maximum) = connection.max_datagram_size() else {
+                // A worker emits a bounded reliable re-key independently, so
+                // a path capability change is handled as local datagram loss.
+                continue;
+            };
+            if encoded.len() > maximum {
+                continue;
+            }
+            match connection.send_datagram(encoded.into()) {
+                Ok(())
+                | Err(quinn::SendDatagramError::TooLarge)
+                | Err(quinn::SendDatagramError::UnsupportedByPeer)
+                | Err(quinn::SendDatagramError::Disabled) => {}
+                Err(quinn::SendDatagramError::ConnectionLost(error)) => return Err(error.into()),
+            }
+        } else {
+            write_message(client_send, &message).await?;
+        }
+    }
+    client_send.shutdown().await?;
+    Ok(())
 }
 
 fn append_worker_resource_policy(command: &mut Command, policy: &ResourcePolicy) {
@@ -472,7 +552,13 @@ fn remove_runtime_file(path: &Path, description: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
+    use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
     use super::*;
+    use crate::protocol::{AuthResult, TerminalEvent, TerminalStateDiff, TerminalViewportDatagram};
 
     #[test]
     fn worker_exits_only_after_continuous_empty_timeout() {
@@ -528,14 +614,144 @@ mod tests {
         let error = router
             .ensure_worker_capacity(&second)
             .await
-            .err()
-            .expect("second user worker should exceed global capacity");
+            .expect_err("second user worker should exceed global capacity");
         assert!(
             error
                 .downcast_ref::<crate::resources::QuotaExceeded>()
                 .is_some()
         );
         assert_eq!(router.worker_capacities.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_bridge_keeps_control_reliable_and_lifts_viewports_to_datagrams() -> Result<()> {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+        let certificate = cert.der().clone();
+        let private_key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+        let server_tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], private_key)?;
+        let server_config =
+            quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_tls)?));
+        let server_endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse::<SocketAddr>()?)?;
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(certificate.to_vec()))?;
+        let client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client_config =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_tls)?));
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse::<SocketAddr>()?)?;
+        client_endpoint.set_default_client_config(client_config);
+        let client_connecting =
+            client_endpoint.connect(server_endpoint.local_addr()?, "localhost")?;
+        let server_incoming = server_endpoint
+            .accept()
+            .await
+            .context("server endpoint closed before accepting")?;
+        let (client_connection, server_connection) =
+            tokio::try_join!(client_connecting, server_incoming)?;
+
+        let legacy = NegotiatedProtocol {
+            version: crate::PROTOCOL_VERSION,
+            capabilities: std::collections::BTreeMap::new(),
+        };
+        assert_eq!(
+            worker_datagram_payload_limit(&legacy, &server_connection)?,
+            0,
+            "an unnegotiated transport MTU must not leak into a legacy worker stream"
+        );
+        let semantic = NegotiatedProtocol {
+            version: crate::PROTOCOL_VERSION,
+            capabilities: std::collections::BTreeMap::from([(
+                CAPABILITY_DATAGRAM_STATE.to_owned(),
+                1,
+            )]),
+        };
+        assert!(worker_datagram_payload_limit(&semantic, &server_connection)? > 0);
+
+        let reliable = WireMessage::new(wire_message::Body::AuthResult(AuthResult {
+            ok: true,
+            message: "control".into(),
+            error_code: String::new(),
+        }));
+        let viewport = TerminalViewportDatagram {
+            terminal_id: "terminal".into(),
+            attachment_id: "attachment".into(),
+            diff: Some(TerminalStateDiff {
+                epoch: vec![1; 16],
+                base_generation: 1,
+                target_generation: 2,
+                ..Default::default()
+            }),
+            inherited_fields: 0,
+        };
+        let bridged = WireMessage::new(wire_message::Body::TerminalEvent(TerminalEvent {
+            terminal_id: "terminal".into(),
+            attachment_id: "attachment".into(),
+            event: Some(terminal_event::Event::ViewportDatagram(Box::new(
+                viewport.clone(),
+            ))),
+        }));
+        let mut oversized_viewport = viewport.clone();
+        oversized_viewport
+            .diff
+            .as_mut()
+            .expect("test viewport has a diff")
+            .epoch = vec![1; server_connection.max_datagram_size().unwrap() + 1];
+        let oversized = WireMessage::new(wire_message::Body::TerminalEvent(TerminalEvent {
+            terminal_id: "terminal".into(),
+            attachment_id: "attachment".into(),
+            event: Some(terminal_event::Event::ViewportDatagram(Box::new(
+                oversized_viewport,
+            ))),
+        }));
+        let reliable_tail = WireMessage::new(wire_message::Body::AuthResult(AuthResult {
+            ok: true,
+            message: "after-pmtu-shrink".into(),
+            error_code: String::new(),
+        }));
+        let (mut worker_writer, mut worker_reader) = tokio::io::duplex(16 * 1024);
+        let (mut reliable_reader, mut reliable_writer) = tokio::io::duplex(16 * 1024);
+        let producer = async {
+            write_message(&mut worker_writer, &reliable).await?;
+            write_message(&mut worker_writer, &bridged).await?;
+            write_message(&mut worker_writer, &oversized).await?;
+            write_message(&mut worker_writer, &reliable_tail).await?;
+            worker_writer.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        let forwarding =
+            forward_worker_messages(&mut worker_reader, &mut reliable_writer, &server_connection);
+        let (producer_result, forwarding_result) = tokio::join!(producer, forwarding);
+        producer_result?;
+        forwarding_result?;
+
+        assert_eq!(read_message(&mut reliable_reader).await?, Some(reliable));
+        assert_eq!(
+            read_message(&mut reliable_reader).await?,
+            Some(reliable_tail)
+        );
+        assert!(read_message(&mut reliable_reader).await?.is_none());
+        let datagram =
+            tokio::time::timeout(Duration::from_secs(1), client_connection.read_datagram())
+                .await
+                .context("worker viewport was not forwarded as a QUIC datagram")??;
+        assert_eq!(TerminalViewportDatagram::decode(datagram)?, viewport);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), client_connection.read_datagram())
+                .await
+                .is_err(),
+            "oversized worker viewport unexpectedly reached QUIC"
+        );
+
+        client_connection.close(0_u32.into(), b"test complete");
+        server_connection.close(0_u32.into(), b"test complete");
+        Ok(())
     }
 
     #[tokio::test]
