@@ -961,6 +961,21 @@ pub struct TerminalStateDiff {
     pub alternate_rows: Vec<TerminalStateRow>,
 }
 
+/// Experimental connection-scoped QUIC DATAGRAM payload. Bit positions in
+/// `inherited_fields` select styles, hyperlinks, modes, title,
+/// working_directory, and palette respectively. This is not advertised yet.
+#[derive(Clone, PartialEq, Message)]
+pub struct TerminalViewportDatagram {
+    #[prost(string, tag = "1")]
+    pub terminal_id: String,
+    #[prost(string, tag = "2")]
+    pub attachment_id: String,
+    #[prost(message, optional, tag = "3")]
+    pub diff: Option<TerminalStateDiff>,
+    #[prost(uint32, tag = "4")]
+    pub inherited_fields: u32,
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct TerminalStateRow {
     #[prost(oneof = "terminal_state_row::Source", tags = "1, 2")]

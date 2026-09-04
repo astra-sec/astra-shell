@@ -12,6 +12,8 @@ pub mod session;
 pub mod terminal;
 pub mod terminal_engine;
 pub mod terminal_state_v2;
+#[allow(dead_code)]
+pub(crate) mod terminal_streaming;
 pub(crate) mod terminal_sync;
 pub mod worker;
 

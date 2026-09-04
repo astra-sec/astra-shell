@@ -471,6 +471,17 @@ message TerminalStateDiff {
   repeated TerminalStateRow primary_rows = 5;
   repeated TerminalStateRow alternate_rows = 6;
 }
+// Experimental connection-scoped QUIC DATAGRAM payload. The terminal and
+// attachment IDs are required because one QUIC connection can carry multiple
+// attached shells. inherited_fields is a bit mask over unchanged State fields:
+// 0=styles, 1=hyperlinks, 2=modes, 3=title, 4=working_directory, 5=palette.
+// This message is not sent unless terminal.datagram_state is negotiated.
+message TerminalViewportDatagram {
+  string terminal_id = 1;
+  string attachment_id = 2;
+  TerminalStateDiff diff = 3;
+  uint32 inherited_fields = 4;
+}
 message TerminalStateRow {
   oneof source {
     astra.terminal.v2.Anchor base_anchor = 1;

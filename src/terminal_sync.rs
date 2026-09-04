@@ -1,7 +1,4 @@
-use std::collections::BTreeMap;
-
-#[cfg(test)]
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, ensure};
 use prost::Message;
@@ -165,7 +162,7 @@ pub(crate) fn terminal_state_diff(base: &State, target: &State) -> Result<Termin
     })
 }
 
-#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn apply_terminal_state_diff(base: &State, diff: &TerminalStateDiff) -> Result<State> {
     terminal_state_v2::validate(base).context("base terminal state is invalid")?;
     ensure!(
@@ -254,7 +251,7 @@ fn diff_rows(base: &Screen, target: &Screen) -> Result<Vec<TerminalStateRow>> {
         .collect()
 }
 
-#[cfg(test)]
+#[allow(dead_code)]
 fn apply_rows(base: &Screen, rows: &[TerminalStateRow]) -> Result<Vec<Row>> {
     ensure!(
         rows.len() <= terminal_state_v2::MAX_INCLUDED_ROWS,
