@@ -17,6 +17,7 @@ use astra_shell::{
         TerminalCommand, TerminalSnapshot, WireMessage, WriteFileChunkRequest, read_message,
         terminal_command, terminal_event, wire_message, write_message,
     },
+    transport::{FramedRecvStream, FramedSendStream},
 };
 use clap::{Args, Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -962,8 +963,8 @@ async fn reconnect_terminal(
     resume_token: &str,
 ) -> Result<(
     AstraClient,
-    quinn::SendStream,
-    quinn::RecvStream,
+    FramedSendStream,
+    FramedRecvStream,
     AttachResponse,
 )> {
     let mut delay = Duration::from_millis(250);
@@ -1005,7 +1006,7 @@ async fn reconnect_terminal(
 }
 
 async fn send_terminal_command(
-    send: &mut quinn::SendStream,
+    send: &mut FramedSendStream,
     command: TerminalCommand,
 ) -> Result<()> {
     write_message(

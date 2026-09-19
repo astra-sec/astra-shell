@@ -17,6 +17,7 @@ pub(crate) enum AckDisposition {
     Duplicate,
 }
 
+#[derive(Clone)]
 pub(crate) enum PreparedStateUpdate {
     Snapshot(State),
     Diff(TerminalStateDiff),

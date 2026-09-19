@@ -19,20 +19,21 @@ use crate::{
     auth::{authentication_payload, verify_authorized_key, verify_authorized_keys},
     files::{FileResult, FileService},
     negotiation::{
-        CAPABILITY_CLIPBOARD_WRITE, CAPABILITY_HISTORY_PAGING, CAPABILITY_INPUT_LEASE,
-        CAPABILITY_SEMANTIC_DIFF, CAPABILITY_SEMANTIC_STATE, CAPABILITY_SESSION_OBJECTS,
-        CAPABILITY_STATE_ACK, NegotiatedProtocol, ProtocolSupport, negotiate_client_hello,
-        selections, validate_worker_selection,
+        CAPABILITY_CLIPBOARD_WRITE, CAPABILITY_DATAGRAM_STATE, CAPABILITY_HISTORY_PAGING,
+        CAPABILITY_INPUT_LEASE, CAPABILITY_SEMANTIC_DIFF, CAPABILITY_SEMANTIC_STATE,
+        CAPABILITY_SESSION_OBJECTS, CAPABILITY_STATE_ACK, CAPABILITY_STREAM_HELLO,
+        NegotiatedProtocol, ProtocolSupport, negotiate_client_hello, selections,
+        validate_worker_selection,
     },
     process_lock::ProcessLock,
     protocol::{
         AckResponse, AttachResponse, AttachmentListResponse, AttachmentRole, AuthResult,
         ClipboardSelection as WireClipboardSelection, ClipboardWrite, ErrorResponse,
         HistoryPageChunk, LeaseChanged, LeaseControlAction, ListResponse, Response, ServerHello,
-        SpawnResponse, TerminalEvent, TerminalListResponse, TerminalStateChunk, TerminalStateDiff,
-        TerminalStateDiffChunk, WireMessage, WorkerStreamHello, WorkspaceListResponse,
-        read_message, request, response, terminal_command, terminal_event, wire_message,
-        write_message,
+        SpawnResponse, StreamHello, StreamKind, TerminalEvent, TerminalListResponse,
+        TerminalStateChunk, TerminalStateDatagram, TerminalStateDiff, TerminalStateDiffChunk,
+        WireMessage, WorkerDatagram, WorkerStreamHello, WorkspaceListResponse, read_message,
+        request, response, terminal_command, terminal_event, wire_message, write_message,
     },
     resources::{
         QuotaExceeded, ResourceAccount, ResourceClaim, ResourceGovernor, ResourcePolicy,
@@ -124,6 +125,8 @@ enum ConnectionBackend {
 
 const TERMINAL_STATE_CHUNK_BYTES: usize = 512 * 1024;
 const TERMINAL_STATE_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+const TERMINAL_DATAGRAM_MAX_BYTES: usize = 1_200;
+const TERMINAL_DATAGRAM_FALLBACK_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub fn initialize_state(paths: &ServerPaths) -> Result<()> {
     fs::create_dir_all(&paths.state_dir)
@@ -273,6 +276,9 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     transport.max_concurrent_bidi_streams(128_u32.into());
     transport.max_concurrent_uni_streams(0_u8.into());
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    transport.send_fairness(true);
+    transport.datagram_receive_buffer_size(Some(64 * 1024));
+    transport.datagram_send_buffer_size(64 * 1024);
     transport.max_idle_timeout(Some(
         std::time::Duration::from_secs(15)
             .try_into()
@@ -401,11 +407,14 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
         let negotiated = negotiated.clone();
         let connection_id = connection_id.clone();
         let connection_resources = connection_resources.clone();
+        let datagram_connection = connection.clone();
         tokio::spawn(async move {
             let result: Result<()> = async {
-                let first_message = read_message(&mut recv)
+                let first_frame = read_message(&mut recv)
                     .await?
                     .context("request stream ended before its first message")?;
+                let (stream_metadata, first_message) =
+                    read_application_stream_hello(&mut recv, first_frame, &negotiated).await?;
                 let _gateway_stream_reservation =
                     if matches!(&backend, ConnectionBackend::Worker { .. }) {
                         match connection_resources.reserve(ResourceClaim::stream()) {
@@ -418,9 +427,7 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
                     } else {
                         None
                     };
-                if is_file_request(&first_message) {
-                    send.set_priority(-10)?;
-                }
+                send.set_priority(stream_priority(stream_metadata.kind))?;
                 match backend {
                     ConnectionBackend::Local { manager, files } => {
                         handle_worker_message(
@@ -431,6 +438,7 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
                             first_message,
                             negotiated,
                             connection_id,
+                            StateDatagramDelivery::Direct(datagram_connection),
                         )
                         .await
                     }
@@ -441,8 +449,10 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
                                 send,
                                 recv,
                                 first_message,
+                                stream_metadata,
                                 negotiated,
                                 connection_id,
+                                datagram_connection,
                             )
                             .await
                     }
@@ -453,6 +463,117 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
                 warn!(error = %format!("{error:#}"), "request stream failed");
             }
         });
+    }
+}
+
+#[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum StateDatagramDelivery {
+    Disabled,
+    Direct(quinn::Connection),
+    WorkerTunnel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ApplicationStreamMetadata {
+    pub kind: StreamKind,
+    pub handle: String,
+    pub epoch: Vec<u8>,
+    pub request_id: String,
+}
+
+async fn read_application_stream_hello<R>(
+    recv: &mut R,
+    first_frame: WireMessage,
+    negotiated: &NegotiatedProtocol,
+) -> Result<(ApplicationStreamMetadata, WireMessage)>
+where
+    R: AsyncRead + Unpin,
+{
+    if !negotiated.has(CAPABILITY_STREAM_HELLO, 1) {
+        let metadata = infer_legacy_stream_metadata(&first_frame)?;
+        return Ok((metadata, first_frame));
+    }
+    let hello = match first_frame {
+        WireMessage {
+            body: Some(wire_message::Body::StreamHello(hello)),
+        } => hello,
+        _ => bail!("negotiated application stream did not start with StreamHello"),
+    };
+    let message = read_message(recv)
+        .await?
+        .context("application stream ended after StreamHello")?;
+    let metadata = validate_stream_hello(hello, &message)?;
+    Ok((metadata, message))
+}
+
+fn validate_stream_hello(
+    hello: StreamHello,
+    message: &WireMessage,
+) -> Result<ApplicationStreamMetadata> {
+    let kind = StreamKind::try_from(hello.kind).context("invalid application stream kind")?;
+    ensure!(
+        kind != StreamKind::Unspecified,
+        "application stream kind is unspecified"
+    );
+    ensure!(
+        hello.epoch.is_empty() || hello.epoch.len() == crate::terminal_state_v2::EPOCH_BYTES,
+        "application stream epoch is invalid"
+    );
+    ensure!(
+        !hello.request_id.is_empty(),
+        "application stream request ID is empty"
+    );
+    let inferred = infer_legacy_stream_metadata(message)?;
+    ensure!(
+        kind == inferred.kind,
+        "application stream kind does not match its request"
+    );
+    ensure!(
+        hello.request_id == inferred.request_id,
+        "StreamHello request ID does not match Request"
+    );
+    ensure!(
+        hello.handle == inferred.handle,
+        "StreamHello handle does not match its terminal request"
+    );
+    Ok(ApplicationStreamMetadata {
+        kind,
+        handle: hello.handle,
+        epoch: hello.epoch,
+        request_id: hello.request_id,
+    })
+}
+
+fn infer_legacy_stream_metadata(message: &WireMessage) -> Result<ApplicationStreamMetadata> {
+    let request = match message {
+        WireMessage {
+            body: Some(wire_message::Body::Request(request)),
+        } => request,
+        _ => bail!("expected Request as first application stream message"),
+    };
+    let (kind, handle) = match &request.command {
+        Some(request::Command::Attach(attach)) => {
+            (StreamKind::Terminal, attach.terminal_id.clone())
+        }
+        Some(_) if is_file_request(message) => (StreamKind::File, String::new()),
+        Some(_) => (StreamKind::Control, String::new()),
+        None => bail!("request has no command"),
+    };
+    Ok(ApplicationStreamMetadata {
+        kind,
+        handle,
+        epoch: Vec::new(),
+        request_id: request.request_id.clone(),
+    })
+}
+
+fn stream_priority(kind: StreamKind) -> i32 {
+    match kind {
+        StreamKind::Terminal => 10,
+        StreamKind::Control => 0,
+        StreamKind::File => -10,
+        StreamKind::Unspecified => -20,
     }
 }
 
@@ -683,13 +804,17 @@ where
     let hello = read_message(&mut recv)
         .await?
         .context("request stream ended before its first message")?;
-    let (negotiated, connection_id) = match hello {
+    let (negotiated, connection_id, stream_metadata) = match hello {
         WireMessage {
             body:
                 Some(wire_message::Body::WorkerStreamHello(WorkerStreamHello {
                     protocol_version,
                     capabilities,
                     connection_id,
+                    stream_kind,
+                    handle,
+                    epoch,
+                    request_id,
                 })),
         } => (
             validate_worker_selection(
@@ -698,6 +823,12 @@ where
                 &ProtocolSupport::runtime(),
             )?,
             connection_id,
+            ApplicationStreamMetadata {
+                kind: StreamKind::try_from(stream_kind).context("invalid worker stream kind")?,
+                handle,
+                epoch,
+                request_id,
+            },
         ),
         _ => bail!("expected WorkerStreamHello as first worker stream message"),
     };
@@ -710,6 +841,18 @@ where
     let request = read_message(&mut recv)
         .await?
         .context("worker stream ended before its request")?;
+    let validated = infer_legacy_stream_metadata(&request)?;
+    ensure!(
+        validated.kind == stream_metadata.kind
+            && validated.handle == stream_metadata.handle
+            && validated.request_id == stream_metadata.request_id,
+        "worker stream metadata does not match request"
+    );
+    ensure!(
+        stream_metadata.epoch.is_empty()
+            || stream_metadata.epoch.len() == crate::terminal_state_v2::EPOCH_BYTES,
+        "worker stream epoch is invalid"
+    );
     handle_worker_message(
         manager,
         files,
@@ -718,6 +861,7 @@ where
         request,
         negotiated,
         connection_id,
+        StateDatagramDelivery::WorkerTunnel,
     )
     .await
 }
@@ -730,6 +874,7 @@ async fn handle_worker_message<W, R>(
     first_message: WireMessage,
     negotiated: NegotiatedProtocol,
     connection_id: String,
+    datagram_delivery: StateDatagramDelivery,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -875,6 +1020,7 @@ where
                 recv,
                 negotiated,
                 connection_id,
+                datagram_delivery,
             )
             .await?;
             return Ok(());
@@ -1205,6 +1351,7 @@ async fn handle_attach<W, R>(
     mut recv: R,
     negotiated: NegotiatedProtocol,
     connection_id: String,
+    datagram_delivery: StateDatagramDelivery,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -1243,6 +1390,9 @@ where
     let clipboard_write = semantic && negotiated.has(CAPABILITY_CLIPBOARD_WRITE, 1);
     let state_ack = semantic && negotiated.has(CAPABILITY_STATE_ACK, 1);
     let semantic_diff = state_ack && negotiated.has(CAPABILITY_SEMANTIC_DIFF, 1);
+    let datagram_state = semantic_diff
+        && negotiated.has(CAPABILITY_DATAGRAM_STATE, 1)
+        && !matches!(datagram_delivery, StateDatagramDelivery::Disabled);
     let mut state_sync = StateSyncWindow::default();
     let (snapshot, initial_state, mut events) = if semantic {
         let (state, events) = terminal.semantic_state_and_subscribe()?;
@@ -1276,6 +1426,7 @@ where
         }
     }
     let mut last_state_sent = tokio::time::Instant::now();
+    let mut datagram_fallback: Option<(tokio::time::Instant, PreparedStateUpdate)> = None;
     attachment.set_state(crate::protocol::AttachmentState::Live)?;
 
     if info.status != "running" {
@@ -1306,6 +1457,13 @@ where
             let wait_for_state_update = async {
                 if should_send_state {
                     tokio::time::sleep_until(state_deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let wait_for_datagram_fallback = async {
+                if let Some((deadline, _)) = &datagram_fallback {
+                    tokio::time::sleep_until(*deadline).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
@@ -1381,7 +1539,10 @@ where
                                         bail!("terminal state ACK received without negotiated capability")
                                     }
                                     match state_sync.acknowledge(&ack)? {
-                                        AckDisposition::Accepted | AckDisposition::Duplicate => {}
+                                        AckDisposition::Accepted => {
+                                            datagram_fallback = None;
+                                        }
+                                        AckDisposition::Duplicate => {}
                                     }
                                 }
                                 Some(terminal_command::Command::Detach(_)) | None => break,
@@ -1422,13 +1583,31 @@ where
                 _ = wait_for_state_update, if should_send_state => {
                     let latest = terminal.semantic_state()?;
                     if let Some(update) = state_sync.prepare_update(latest, semantic_diff)? {
+                        let sent_as_datagram = write_prepared_state_update_with_datagram(
+                            &mut send,
+                            &info.id,
+                            &attachment_info.id,
+                            &update,
+                            datagram_state,
+                            &datagram_delivery,
+                        ).await?;
+                        if sent_as_datagram {
+                            datagram_fallback = Some((
+                                tokio::time::Instant::now() + TERMINAL_DATAGRAM_FALLBACK_DELAY,
+                                update,
+                            ));
+                        }
+                        last_state_sent = tokio::time::Instant::now();
+                    }
+                }
+                _ = wait_for_datagram_fallback, if datagram_fallback.is_some() => {
+                    if let Some((_, update)) = datagram_fallback.take() {
                         write_prepared_state_update(
                             &mut send,
                             &info.id,
                             &attachment_info.id,
                             &update,
                         ).await?;
-                        last_state_sent = tokio::time::Instant::now();
                     }
                 }
                 event = events.recv() => {
@@ -1786,6 +1965,97 @@ where
     }
 }
 
+async fn write_prepared_state_update_with_datagram<W>(
+    send: &mut W,
+    terminal_id: &str,
+    attachment_id: &str,
+    update: &PreparedStateUpdate,
+    datagram_enabled: bool,
+    delivery: &StateDatagramDelivery,
+) -> Result<bool>
+where
+    W: AsyncWrite + Unpin,
+{
+    let PreparedStateUpdate::Diff(diff) = update else {
+        write_prepared_state_update(send, terminal_id, attachment_id, update).await?;
+        return Ok(false);
+    };
+    if !datagram_enabled
+        || !try_write_terminal_state_datagram(send, terminal_id, attachment_id, diff, delivery)
+            .await?
+    {
+        write_terminal_state_diff(send, terminal_id, attachment_id, diff).await?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+async fn try_write_terminal_state_datagram<W>(
+    send: &mut W,
+    terminal_id: &str,
+    attachment_id: &str,
+    diff: &TerminalStateDiff,
+    delivery: &StateDatagramDelivery,
+) -> Result<bool>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(payload) = terminal_state_datagram_payload(attachment_id, diff) else {
+        return Ok(false);
+    };
+    match delivery {
+        StateDatagramDelivery::Disabled => Ok(false),
+        StateDatagramDelivery::Direct(connection) => {
+            if connection
+                .max_datagram_size()
+                .is_none_or(|maximum| payload.len() > maximum)
+            {
+                return Ok(false);
+            }
+            Ok(connection.send_datagram(payload.into()).is_ok())
+        }
+        StateDatagramDelivery::WorkerTunnel => {
+            let chunks = terminal_state_diff_chunks(diff)?;
+            ensure!(
+                chunks.len() == 1,
+                "DATAGRAM diff unexpectedly requires fragmentation"
+            );
+            let fallback = WireMessage::new(wire_message::Body::TerminalEvent(TerminalEvent {
+                terminal_id: terminal_id.into(),
+                attachment_id: attachment_id.into(),
+                event: Some(terminal_event::Event::SemanticStateDiffChunk(
+                    chunks.into_iter().next().unwrap(),
+                )),
+            }));
+            write_message(
+                send,
+                &WireMessage::new(wire_message::Body::WorkerDatagram(WorkerDatagram {
+                    payload,
+                    reliable_message: fallback.encode_to_vec(),
+                })),
+            )
+            .await?;
+            Ok(true)
+        }
+    }
+}
+
+fn terminal_state_datagram_payload(
+    attachment_id: &str,
+    diff: &TerminalStateDiff,
+) -> Option<Vec<u8>> {
+    let payload = TerminalStateDatagram {
+        attachment_id: attachment_id.into(),
+        diff: Some(diff.clone()),
+    }
+    .encode_to_vec();
+    if payload.len() > TERMINAL_DATAGRAM_MAX_BYTES {
+        None
+    } else {
+        Some(payload)
+    }
+}
+
 async fn write_history_page<W>(
     send: &mut W,
     terminal_id: &str,
@@ -1836,6 +2106,89 @@ mod tests {
         assert!(
             validate_terminal_command_target(&command, "terminal", "attachment", false).is_err()
         );
+    }
+
+    #[test]
+    fn stream_hello_classifies_and_fences_application_streams() {
+        let request = WireMessage::new(wire_message::Body::Request(Request {
+            request_id: "request-id".into(),
+            command: Some(request::Command::Attach(crate::protocol::AttachRequest {
+                terminal_id: "terminal-id".into(),
+                ..Default::default()
+            })),
+        }));
+        let hello = StreamHello {
+            kind: StreamKind::Terminal as i32,
+            handle: "terminal-id".into(),
+            epoch: vec![7; crate::terminal_state_v2::EPOCH_BYTES],
+            request_id: "request-id".into(),
+        };
+        let metadata = validate_stream_hello(hello.clone(), &request).unwrap();
+        assert_eq!(metadata.kind, StreamKind::Terminal);
+        assert_eq!(metadata.handle, "terminal-id");
+        assert_eq!(stream_priority(metadata.kind), 10);
+        assert_eq!(stream_priority(StreamKind::Control), 0);
+        assert_eq!(stream_priority(StreamKind::File), -10);
+
+        let mut mismatched = hello;
+        mismatched.request_id = "wrong".into();
+        assert!(validate_stream_hello(mismatched, &request).is_err());
+    }
+
+    #[test]
+    fn terminal_datagrams_are_bounded_and_oversized_diffs_fall_back() {
+        let small = TerminalStateDiff {
+            epoch: vec![1; crate::terminal_state_v2::EPOCH_BYTES],
+            base_generation: 1,
+            target_generation: 2,
+            ..Default::default()
+        };
+        let payload = terminal_state_datagram_payload("attachment", &small).unwrap();
+        assert!(payload.len() <= TERMINAL_DATAGRAM_MAX_BYTES);
+
+        let mut oversized = small;
+        oversized.target_metadata = Some(crate::terminal_state_v2::State {
+            title: "x".repeat(TERMINAL_DATAGRAM_MAX_BYTES),
+            ..Default::default()
+        });
+        assert!(terminal_state_datagram_payload("attachment", &oversized).is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_datagram_tunnel_keeps_an_exact_reliable_fallback() {
+        let diff = TerminalStateDiff {
+            epoch: vec![1; crate::terminal_state_v2::EPOCH_BYTES],
+            base_generation: 1,
+            target_generation: 2,
+            ..Default::default()
+        };
+        let update = PreparedStateUpdate::Diff(diff.clone());
+        let (mut reader, mut writer) = tokio::io::duplex(16 * 1024);
+        assert!(
+            write_prepared_state_update_with_datagram(
+                &mut writer,
+                "terminal",
+                "attachment",
+                &update,
+                true,
+                &StateDatagramDelivery::WorkerTunnel,
+            )
+            .await
+            .unwrap()
+        );
+        let envelope = read_message(&mut reader).await.unwrap().unwrap();
+        let wire_message::Body::WorkerDatagram(envelope) = envelope.body.unwrap() else {
+            panic!("expected WorkerDatagram")
+        };
+        let datagram = TerminalStateDatagram::decode(envelope.payload.as_slice()).unwrap();
+        assert_eq!(datagram.attachment_id, "attachment");
+        assert_eq!(datagram.diff.unwrap(), diff);
+        let fallback = WireMessage::decode(envelope.reliable_message.as_slice()).unwrap();
+        let wire_message::Body::TerminalEvent(event) = fallback.body.unwrap() else {
+            panic!("expected reliable TerminalEvent fallback")
+        };
+        assert_eq!(event.terminal_id, "terminal");
+        assert_eq!(event.attachment_id, "attachment");
     }
 
     #[test]
@@ -1950,6 +2303,7 @@ mod tests {
                 capabilities: BTreeMap::new(),
             },
             uuid::Uuid::new_v4().to_string(),
+            StateDatagramDelivery::Disabled,
         )
         .await
         .unwrap();

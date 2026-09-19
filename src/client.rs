@@ -13,7 +13,10 @@ use crate::{
     ALPN,
     auth::{authentication_payload, sign_challenge},
     known_hosts::{StrictHostKeyChecking, verify_server_certificate},
-    negotiation::{NegotiatedProtocol, ProtocolSupport, client_hello, validate_server_hello},
+    negotiation::{
+        CAPABILITY_STREAM_HELLO, NegotiatedProtocol, ProtocolSupport, client_hello,
+        validate_server_hello,
+    },
     protocol::{
         AbortUploadRequest, AttachRequest, AttachResponse, BeginDownloadRequest,
         BeginDownloadResponse, BeginUploadRequest, CloseRequest, CommitUploadRequest,
@@ -22,6 +25,9 @@ use crate::{
         QueryUploadRequest, ReadFileChunkRequest, RemoveFileRequest, RenameFileRequest, Request,
         Response, SpawnRequest, UploadStatusResponse, WireMessage, WriteFileChunkRequest,
         read_message, request, response, wire_message, write_message,
+    },
+    transport::{
+        FramedRecvStream, FramedSendStream, FramedTransport, StreamDescriptor, TransportStreamKind,
     },
 };
 
@@ -111,7 +117,7 @@ impl rustls::client::danger::ServerCertVerifier for DeferredServerVerification {
 
 pub struct AstraClient {
     _endpoint: quinn::Endpoint,
-    connection: quinn::Connection,
+    transport: FramedTransport,
     reconnect: ReconnectConfig,
     negotiated: NegotiatedProtocol,
 }
@@ -123,12 +129,6 @@ struct ReconnectConfig {
     trust: ServerTrust,
     identity: PathBuf,
     username: String,
-}
-
-impl Drop for AstraClient {
-    fn drop(&mut self) {
-        self.connection.close(0_u32.into(), b"client done");
-    }
 }
 
 impl AstraClient {
@@ -177,6 +177,7 @@ impl AstraClient {
             QuicClientConfig::try_from(tls).context("invalid QUIC client TLS configuration")?,
         ));
         let mut transport = quinn::TransportConfig::default();
+        transport.send_fairness(true);
         transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
         transport.max_idle_timeout(Some(
             std::time::Duration::from_secs(15)
@@ -207,11 +208,11 @@ impl AstraClient {
             connection.close(1_u32.into(), b"host certificate rejected");
             return Err(error);
         }
-        let negotiated =
-            authenticate(&connection, &reconnect.identity, &reconnect.username).await?;
+        let transport = FramedTransport::new(connection);
+        let negotiated = authenticate(&transport, &reconnect.identity, &reconnect.username).await?;
         Ok(Self {
             _endpoint: endpoint,
-            connection,
+            transport,
             reconnect,
             negotiated,
         })
@@ -265,9 +266,18 @@ impl AstraClient {
         read_only: bool,
         takeover: bool,
         resume_token: String,
-    ) -> Result<(quinn::SendStream, quinn::RecvStream, AttachResponse)> {
-        let (mut send, mut recv) = self.connection.open_bi().await?;
+    ) -> Result<(FramedSendStream, FramedRecvStream, AttachResponse)> {
         let request_id = uuid::Uuid::new_v4().to_string();
+        let descriptor = StreamDescriptor::application(
+            TransportStreamKind::Terminal,
+            terminal_id.clone(),
+            vec![],
+            request_id.clone(),
+        )?;
+        let (mut send, mut recv) = self
+            .transport
+            .open_stream(&descriptor, self.negotiated.has(CAPABILITY_STREAM_HELLO, 1))
+            .await?;
         write_message(
             &mut send,
             &WireMessage::new(wire_message::Body::Request(Request {
@@ -452,23 +462,26 @@ impl AstraClient {
     }
 
     async fn unary(&self, command: request::Command) -> Result<Response> {
-        self.unary_with_priority(command, 0).await
+        self.unary_with_kind(command, TransportStreamKind::Control)
+            .await
     }
 
     async fn file_unary(&self, command: request::Command) -> Result<Response> {
-        // Quinn schedules higher numeric priorities first. File traffic stays below terminal
-        // streams so a large upload cannot make interactive input feel sluggish.
-        self.unary_with_priority(command, -10).await
+        self.unary_with_kind(command, TransportStreamKind::File)
+            .await
     }
 
-    async fn unary_with_priority(
+    async fn unary_with_kind(
         &self,
         command: request::Command,
-        priority: i32,
+        kind: TransportStreamKind,
     ) -> Result<Response> {
-        let (mut send, mut recv) = self.connection.open_bi().await?;
-        send.set_priority(priority)?;
         let request_id = uuid::Uuid::new_v4().to_string();
+        let descriptor = StreamDescriptor::application(kind, "", vec![], request_id.clone())?;
+        let (mut send, mut recv) = self
+            .transport
+            .open_stream(&descriptor, self.negotiated.has(CAPABILITY_STREAM_HELLO, 1))
+            .await?;
         write_message(
             &mut send,
             &WireMessage::new(wire_message::Body::Request(Request {
@@ -511,11 +524,13 @@ fn verify_connection_certificate(
 }
 
 async fn authenticate(
-    connection: &quinn::Connection,
+    transport: &FramedTransport,
     identity: &Path,
     username: &str,
 ) -> Result<NegotiatedProtocol> {
-    let (mut send, mut recv) = connection.open_bi().await?;
+    let (mut send, mut recv) = transport
+        .open_stream(&StreamDescriptor::authentication(), false)
+        .await?;
     let client_hello = client_hello(username, &ProtocolSupport::command_line_client());
     write_message(
         &mut send,
@@ -558,7 +573,7 @@ async fn authenticate(
     }
 }
 
-async fn require_response(recv: &mut quinn::RecvStream, request_id: &str) -> Result<Response> {
+async fn require_response(recv: &mut FramedRecvStream, request_id: &str) -> Result<Response> {
     match read_message(recv).await? {
         Some(WireMessage {
             body: Some(wire_message::Body::Response(response)),

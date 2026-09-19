@@ -8,8 +8,9 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use nix::unistd::{Gid, Uid, chown};
+use prost::Message;
 use tokio::{
     io::{AsyncWriteExt, copy},
     net::{UnixListener, UnixStream},
@@ -24,9 +25,11 @@ use crate::{
     files::FileService,
     negotiation::{NegotiatedProtocol, selections},
     process_lock::ProcessLock,
-    protocol::{WireMessage, WorkerStreamHello, wire_message, write_message},
+    protocol::{
+        MAX_FRAME_SIZE, WireMessage, WorkerStreamHello, read_message, wire_message, write_message,
+    },
     resources::{ResourceAccount, ResourceGovernor, ResourcePolicy, ResourceReservation},
-    server::handle_worker_request,
+    server::{ApplicationStreamMetadata, handle_worker_request},
 };
 
 pub struct WorkerRouter {
@@ -66,14 +69,16 @@ impl WorkerRouter {
         }))
     }
 
-    pub async fn proxy_stream(
+    pub(crate) async fn proxy_stream(
         &self,
         account: &SystemAccount,
         mut quic_send: quinn::SendStream,
         mut quic_recv: quinn::RecvStream,
         first_message: WireMessage,
+        stream_metadata: ApplicationStreamMetadata,
         negotiated: NegotiatedProtocol,
         connection_id: String,
+        quic_connection: quinn::Connection,
     ) -> Result<()> {
         let worker = self.connect(account).await?;
         let (mut worker_recv, mut worker_send) = worker.into_split();
@@ -83,17 +88,52 @@ impl WorkerRouter {
                 protocol_version: negotiated.version,
                 capabilities: selections(&negotiated),
                 connection_id,
+                stream_kind: stream_metadata.kind as i32,
+                handle: stream_metadata.handle,
+                epoch: stream_metadata.epoch,
+                request_id: stream_metadata.request_id,
             })),
         )
         .await?;
         write_message(&mut worker_send, &first_message).await?;
         let client_to_worker = async {
             copy(&mut quic_recv, &mut worker_send).await?;
-            worker_send.shutdown().await
+            worker_send.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
         };
         let worker_to_client = async {
-            copy(&mut worker_recv, &mut quic_send).await?;
-            quic_send.shutdown().await
+            while let Some(message) = read_message(&mut worker_recv).await? {
+                match &message.body {
+                    Some(wire_message::Body::WorkerDatagram(candidate)) => {
+                        ensure!(
+                            candidate.payload.len() <= 1_200,
+                            "worker DATAGRAM candidate exceeds transport MTU"
+                        );
+                        ensure!(
+                            candidate.reliable_message.len() <= MAX_FRAME_SIZE,
+                            "worker DATAGRAM fallback exceeds frame limit"
+                        );
+                        if quic_connection
+                            .send_datagram(candidate.payload.clone().into())
+                            .is_err()
+                        {
+                            let fallback =
+                                WireMessage::decode(candidate.reliable_message.as_slice())?;
+                            ensure!(
+                                !matches!(
+                                    fallback.body,
+                                    Some(wire_message::Body::WorkerDatagram(_))
+                                ),
+                                "nested worker DATAGRAM fallback is invalid"
+                            );
+                            write_message(&mut quic_send, &fallback).await?;
+                        }
+                    }
+                    _ => write_message(&mut quic_send, &message).await?,
+                }
+            }
+            quic_send.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
         };
         tokio::try_join!(client_to_worker, worker_to_client)?;
         Ok(())

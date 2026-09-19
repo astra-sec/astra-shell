@@ -17,6 +17,7 @@ pub const CAPABILITY_SEMANTIC_DIFF: &str = "terminal.semantic_diff";
 pub const CAPABILITY_CLIPBOARD_WRITE: &str = "terminal.clipboard_write";
 pub const CAPABILITY_SESSION_OBJECTS: &str = "session.objects";
 pub const CAPABILITY_INPUT_LEASE: &str = "terminal.input_lease";
+pub const CAPABILITY_STREAM_HELLO: &str = "transport.stream_hello";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityRange {
@@ -79,6 +80,16 @@ impl ProtocolSupport {
                     minimum_version: 1,
                     maximum_version: 1,
                 },
+                CapabilityRange {
+                    name: CAPABILITY_STREAM_HELLO,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_DATAGRAM_STATE,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
             ],
         }
     }
@@ -89,11 +100,18 @@ impl ProtocolSupport {
         Self {
             minimum_version: MINIMUM_PROTOCOL_VERSION,
             maximum_version: PROTOCOL_VERSION,
-            capabilities: vec![CapabilityRange {
-                name: CAPABILITY_LEGACY_ANSI_SNAPSHOT,
-                minimum_version: 1,
-                maximum_version: 1,
-            }],
+            capabilities: vec![
+                CapabilityRange {
+                    name: CAPABILITY_LEGACY_ANSI_SNAPSHOT,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_STREAM_HELLO,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+            ],
         }
     }
 
@@ -115,6 +133,26 @@ impl ProtocolSupport {
                 },
                 CapabilityRange {
                     name: CAPABILITY_DATAGRAM_STATE,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_STATE_ACK,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_SEMANTIC_DIFF,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_STREAM_HELLO,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_SESSION_OBJECTS,
                     minimum_version: 1,
                     maximum_version: 1,
                 },
@@ -217,6 +255,13 @@ pub fn negotiate_client_hello(
         && !capabilities.contains_key(CAPABILITY_SESSION_OBJECTS)
     {
         capabilities.remove(CAPABILITY_INPUT_LEASE);
+    }
+    if capabilities.contains_key(CAPABILITY_DATAGRAM_STATE)
+        && (!capabilities.contains_key(CAPABILITY_STREAM_HELLO)
+            || !capabilities.contains_key(CAPABILITY_SEMANTIC_DIFF)
+            || !capabilities.contains_key(CAPABILITY_SESSION_OBJECTS))
+    {
+        capabilities.remove(CAPABILITY_DATAGRAM_STATE);
     }
 
     Ok(NegotiatedProtocol {
@@ -449,6 +494,13 @@ fn validate_capability_dependencies(capabilities: &BTreeMap<String, u32>) -> Res
             || capabilities.contains_key(CAPABILITY_SESSION_OBJECTS),
         "terminal.input_lease requires session.objects v1"
     );
+    ensure!(
+        !capabilities.contains_key(CAPABILITY_DATAGRAM_STATE)
+            || (capabilities.contains_key(CAPABILITY_STREAM_HELLO)
+                && capabilities.contains_key(CAPABILITY_SEMANTIC_DIFF)
+                && capabilities.contains_key(CAPABILITY_SESSION_OBJECTS)),
+        "terminal.datagram_state requires transport.stream_hello, terminal.semantic_diff, and session.objects"
+    );
     Ok(())
 }
 
@@ -489,6 +541,12 @@ mod tests {
         assert!(negotiated.has(CAPABILITY_INPUT_LEASE, 1));
         assert!(negotiated.has(CAPABILITY_STATE_ACK, 1));
         assert!(negotiated.has(CAPABILITY_SEMANTIC_DIFF, 1));
+        assert!(
+            ProtocolSupport::command_line_client()
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == CAPABILITY_STREAM_HELLO)
+        );
         assert!(
             !ProtocolSupport::command_line_client()
                 .capabilities

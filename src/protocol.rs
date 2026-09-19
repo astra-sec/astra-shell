@@ -25,7 +25,10 @@ pub const LOCALE_ENVIRONMENT_VARIABLES: &[&str] = &[
 
 #[derive(Clone, PartialEq, Message)]
 pub struct WireMessage {
-    #[prost(oneof = "wire_message::Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(
+        oneof = "wire_message::Body",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    )]
     pub body: Option<wire_message::Body>,
 }
 
@@ -52,6 +55,10 @@ pub mod wire_message {
         ClientHello(ClientHello),
         #[prost(message, tag = "9")]
         WorkerStreamHello(WorkerStreamHello),
+        #[prost(message, tag = "10")]
+        StreamHello(StreamHello),
+        #[prost(message, tag = "11")]
+        WorkerDatagram(WorkerDatagram),
     }
 }
 
@@ -107,6 +114,51 @@ pub struct WorkerStreamHello {
     pub capabilities: Vec<CapabilitySelection>,
     #[prost(string, tag = "3")]
     pub connection_id: String,
+    #[prost(enumeration = "StreamKind", tag = "4")]
+    pub stream_kind: i32,
+    #[prost(string, tag = "5")]
+    pub handle: String,
+    #[prost(bytes = "vec", tag = "6")]
+    pub epoch: Vec<u8>,
+    #[prost(string, tag = "7")]
+    pub request_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum StreamKind {
+    Unspecified = 0,
+    Control = 1,
+    Terminal = 2,
+    File = 3,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct StreamHello {
+    #[prost(enumeration = "StreamKind", tag = "1")]
+    pub kind: i32,
+    #[prost(string, tag = "2")]
+    pub handle: String,
+    #[prost(bytes = "vec", tag = "3")]
+    pub epoch: Vec<u8>,
+    #[prost(string, tag = "4")]
+    pub request_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TerminalStateDatagram {
+    #[prost(string, tag = "1")]
+    pub attachment_id: String,
+    #[prost(message, optional, tag = "2")]
+    pub diff: Option<TerminalStateDiff>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct WorkerDatagram {
+    #[prost(bytes = "vec", tag = "1")]
+    pub payload: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub reliable_message: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1076,6 +1128,63 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_classification_and_datagram_envelopes_are_additive_for_n_minus_one() {
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyWireMessage {
+            #[prost(message, optional, tag = "4")]
+            request: Option<Request>,
+        }
+
+        let current = WireMessage::new(wire_message::Body::StreamHello(StreamHello {
+            kind: StreamKind::Terminal as i32,
+            handle: "terminal".into(),
+            epoch: vec![7; 16],
+            request_id: "request".into(),
+        }));
+        let legacy = LegacyWireMessage::decode(current.encode_to_vec().as_slice()).unwrap();
+        assert!(legacy.request.is_none());
+
+        let current = WireMessage::new(wire_message::Body::WorkerDatagram(WorkerDatagram {
+            payload: vec![1, 2, 3],
+            reliable_message: vec![4, 5, 6],
+        }));
+        let legacy = LegacyWireMessage::decode(current.encode_to_vec().as_slice()).unwrap();
+        assert!(legacy.request.is_none());
+
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyWorkerStreamHello {
+            #[prost(uint32, tag = "1")]
+            protocol_version: u32,
+            #[prost(message, repeated, tag = "2")]
+            capabilities: Vec<CapabilitySelection>,
+            #[prost(string, tag = "3")]
+            connection_id: String,
+        }
+
+        let current = WorkerStreamHello {
+            protocol_version: 2,
+            capabilities: vec![],
+            connection_id: "connection".into(),
+            stream_kind: StreamKind::File as i32,
+            handle: String::new(),
+            epoch: vec![],
+            request_id: "request".into(),
+        };
+        let legacy = LegacyWorkerStreamHello::decode(current.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy.protocol_version, 2);
+        assert_eq!(legacy.connection_id, "connection");
+
+        let legacy = LegacyWorkerStreamHello {
+            protocol_version: 1,
+            capabilities: vec![],
+            connection_id: "legacy".into(),
+        };
+        let current = WorkerStreamHello::decode(legacy.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(current.stream_kind, StreamKind::Unspecified as i32);
+        assert!(current.request_id.is_empty());
+    }
 
     #[test]
     fn recursive_file_watch_capability_is_additive_for_n_minus_one() {
