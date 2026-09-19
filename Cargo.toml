@@ -23,7 +23,7 @@ astra-wezterm-term = { path = "vendor/astra-wezterm-term" }
 base64ct = { version = "1.8", features = ["alloc"] }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
-nix = { version = "0.31", features = ["fs", "user"] }
+nix = { version = "0.31", features = ["fs", "user", "term"] }
 notify = "8.2"
 prost = "0.14"
 portable-pty = "0.9"

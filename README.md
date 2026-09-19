@@ -36,6 +36,17 @@ export CARGO_TARGET_DIR="$PWD/target"
 cargo build --bins
 ```
 
+## Rust 实验：latest-state 终端数据面
+
+本分支可用 `cargo build --bins` 构建匹配的服务端/客户端，显式运行：
+
+```bash
+./target/debug/astra --streaming user@host
+./target/debug/astra --streaming user@host attach 1
+```
+
+Ctrl-] 分离。该入口使用 QUIC DATAGRAM 稀疏增量、ACK-gated keyframe 和后台自动重连；默认 CLI 仍兼容原可靠协议，Swift 不受影响。服务端需支持实验能力 `terminal.datagram_state` v2。细节、边界与测试见 [协议说明](docs/protocol/terminal-datagram-state-v2.md) 和 [ADR 0007](docs/adr/0007-terminal-streaming-experiment.md)。
+
 ## 初始化凭据
 
 ```bash

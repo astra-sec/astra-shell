@@ -331,6 +331,9 @@ impl Drop for AstraClient {
 }
 
 impl AstraClient {
+    pub(crate) fn connection_lost(&self) -> bool {
+        self.connection.close_reason().is_some()
+    }
     pub async fn connect(
         remote: SocketAddr,
         server_name: &str,
@@ -1199,12 +1202,18 @@ async fn authenticate(
         }) if result.ok => Ok(negotiated),
         Some(WireMessage {
             body: Some(wire_message::Body::AuthResult(result)),
-        }) if !result.error_code.is_empty() => {
-            bail!("{}: {}", result.error_code, result.message)
+        }) if !result.error_code.is_empty() => Err(ServerResponseError {
+            code: result.error_code,
+            message: result.message,
         }
+        .into()),
         Some(WireMessage {
             body: Some(wire_message::Body::AuthResult(result)),
-        }) => bail!("authentication failed: {}", result.message),
+        }) => Err(ServerResponseError {
+            code: "authentication_failed".into(),
+            message: result.message,
+        }
+        .into()),
         _ => bail!("server did not return AuthResult"),
     }
 }
@@ -1523,6 +1532,177 @@ mod tests {
         drop(resumed_attachment);
         drop(reconnected);
         server.abort();
+        let _ = server.await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supervised_terminals_recover_together_through_loss_and_renew_while_hidden()
+    -> Result<()> {
+        use crate::streaming_client::{ConnectionState, LiveTerminal, StreamingConnection};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        async fn wait_live(
+            terminal: &LiveTerminal,
+            minimum_incarnation: u64,
+            text: &str,
+        ) -> Result<()> {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if matches!(terminal.connection_state(), ConnectionState::Live { incarnation } if incarnation >= minimum_incarnation)
+                        && terminal.current_state().is_some_and(|state| visible_text(&state).contains(text)) { return; }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.context("supervised terminal did not converge")
+        }
+
+        let temporary = tempfile::tempdir()?;
+        let paths = ServerPaths::new(temporary.path().join("state"));
+        initialize_state(&paths)?;
+        let identity = PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ed25519)?;
+        let identity_path = temporary.path().join("id_ed25519");
+        fs::write(&identity_path, identity.to_openssh(LineEnding::LF)?)?;
+        fs::set_permissions(&identity_path, fs::Permissions::from_mode(0o600))?;
+        fs::write(
+            &paths.authorized_keys,
+            format!("{}\n", identity.public_key().to_openssh()?),
+        )?;
+        let session_root = temporary.path().join("home");
+        fs::create_dir(&session_root)?;
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let listen = reservation.local_addr()?;
+        drop(reservation);
+        let server = tokio::spawn(serve(ServerOptions {
+            listen,
+            paths: paths.clone(),
+            mode: ServerMode::Rootless { session_root },
+            resource_policy: ResourcePolicy::default(),
+        }));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A real UDP relay drops every 11th packet and delays alternating packets
+        // by 30ms/5ms (reordering). An outage drops both directions completely.
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let address = relay.local_addr()?;
+        let offline = Arc::new(AtomicBool::new(false));
+        let relay_offline = offline.clone();
+        let proxy = tokio::spawn(async move {
+            let mut client_address = None;
+            let mut bytes = vec![0u8; 65536];
+            let mut pending = Vec::<(tokio::time::Instant, SocketAddr, Vec<u8>)>::new();
+            let mut tick = tokio::time::interval(Duration::from_millis(2));
+            let mut count = 0;
+            loop {
+                tokio::select! {
+                    received = relay.recv_from(&mut bytes) => {
+                        let (length, source) = received?;
+                        count += 1;
+                        let target = if source == listen { client_address } else { client_address = Some(source); Some(listen) };
+                        if relay_offline.load(Ordering::Acquire) || count % 11 == 0 { continue; }
+                        if let Some(target) = target
+                            && pending.len() < 256 {
+                                pending.push((tokio::time::Instant::now() + Duration::from_millis(if count % 2 == 0 { 30 } else { 5 }), target, bytes[..length].to_vec()));
+                        }
+                    }
+                    _ = tick.tick() => {
+                        if relay_offline.load(Ordering::Acquire) { pending.clear(); }
+                        let now = tokio::time::Instant::now();
+                        let mut index = 0;
+                        while index < pending.len() {
+                            if pending[index].0 <= now {
+                                let (_, target, bytes) = pending.swap_remove(index);
+                                relay.send_to(&bytes, target).await?;
+                            } else { index += 1; }
+                        }
+                    }
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<_, std::io::Error>(())
+        });
+        let client = AstraClient::connect_with_support(
+            address,
+            "localhost",
+            &ServerTrust::PinnedCertificate(paths.cert.clone()),
+            &identity_path,
+            &SystemAccount::current()?.username,
+            ProtocolSupport::rust_semantic_client(),
+        )
+        .await?;
+        let workspace = client
+            .list_workspaces()
+            .await?
+            .into_iter()
+            .find(|workspace| workspace.is_default)
+            .unwrap();
+        let spawn = |name: &str| SpawnRequest {
+            name: name.into(),
+            argv: vec!["/bin/cat".into()],
+            cwd: String::new(),
+            rows: 24,
+            cols: 80,
+            term: "xterm-256color".into(),
+            environment: vec![],
+            workspace_id: workspace.id.clone(),
+        };
+        let first = client.spawn(spawn("supervised-first")).await?;
+        let second = client.spawn(spawn("supervised-second")).await?;
+        let old_transport = client.connection.clone();
+        let connection = StreamingConnection::new(client);
+        let attach = |id: String| AttachRequest {
+            terminal_id: id,
+            workspace_id: workspace.id.clone(),
+            ..Default::default()
+        };
+        let (first, _) = connection.attach(attach(first.id)).await?;
+        let (second, _) = connection.attach(attach(second.id)).await?;
+        // Never call next_event: hidden renderers must not own transport progress.
+        wait_live(&first, 1, "").await?;
+        wait_live(&second, 1, "").await?;
+        first.send_input(b"before-loss-one\n".to_vec()).await?;
+        second.send_input(b"before-loss-two\n".to_vec()).await?;
+        wait_live(&first, 1, "before-loss-one").await?;
+        wait_live(&second, 1, "before-loss-two").await?;
+        offline.store(true, Ordering::Release);
+        old_transport.close(0u32.into(), b"fault injection");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(first.connection_state(), ConnectionState::Recovering { .. }) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(
+            first
+                .send_input(b"MUST-NOT-REPLAY\n".to_vec())
+                .await
+                .is_err()
+        );
+        first
+            .resize(Resize {
+                rows: 30,
+                cols: 100,
+                ..Default::default()
+            })
+            .await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        offline.store(false, Ordering::Release);
+        wait_live(&first, 2, "before-loss-one").await?;
+        wait_live(&second, 2, "before-loss-two").await?;
+        assert!(!visible_text(&first.current_state().unwrap()).contains("MUST-NOT-REPLAY"));
+        // Wait longer than the input lease TTL while neither UI consumes frames.
+        tokio::time::sleep(crate::terminal::INPUT_LEASE_TTL + Duration::from_secs(1)).await;
+        first.send_input(b"after-loss-one\n".to_vec()).await?;
+        second.send_input(b"after-loss-two\n".to_vec()).await?;
+        wait_live(&first, 2, "after-loss-one").await?;
+        wait_live(&second, 2, "after-loss-two").await?;
+        assert_eq!(first.current_state().unwrap().rows, 30);
+        assert!(!visible_text(&first.current_state().unwrap()).contains("after-loss-two"));
+        first.detach().await?;
+        second.detach().await?;
+        drop(connection);
+        proxy.abort();
+        server.abort();
+        let _ = proxy.await;
         let _ = server.await;
         Ok(())
     }

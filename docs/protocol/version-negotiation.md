@@ -28,7 +28,7 @@
 | `terminal.semantic_diff` | 从已 ACK generation 到最新 generation 的累计行级 diff；中间输出可合并 | 是（Apple client/server v1） | 必须同时选择 `terminal.state_ack` v1 与 `terminal.semantic_state` v2；CLI 不 offer |
 | `session.objects` | Workspace CRUD、Terminal 归属和 Attachment 身份 | 是（Apple client/server v1） | 与 renderer capability 独立；CLI 保留 N-1 默认 Workspace 适配 |
 | `terminal.input_lease` | controller lease TTL、renew/release 与 controller-only resize owner | 是（server v1；Apple 完成 SESS-02 后启用） | 依赖 `session.objects` v1；未协商客户端保留 Stream 生命周期 lease |
-| `terminal.datagram_state` | live viewport 的 cumulative patch 走 QUIC DATAGRAM，可靠 keyframe/repair 保证最终收敛 | 是（Rust server/worker/client library v1；Apple 尚未 offer） | 依赖 `terminal.semantic_state` v2、`terminal.state_ack` v1、`session.objects` v1 以及连接可用 DATAGRAM |
+| `terminal.datagram_state` | live viewport 的 sparse cell patch 走 QUIC DATAGRAM，可靠 keyframe/repair 保证最终收敛 | 是（Rust 实验分支 v2；CLI 通过 `--streaming` offer；Apple 尚未 offer） | 依赖 `terminal.semantic_state` v2、`terminal.state_ack` v1、`session.objects` v1 以及连接可用 DATAGRAM；不与已撤回的实验 v1 互通 |
 
 Capability 名称存在不代表实现完成。runtime support list 只能加入已经通过对应架构任务验收的能力；禁止为了让 UI 走新分支而提前 offer。
 
@@ -38,7 +38,7 @@ semantic attachment 的 `AttachResponse` 不携带 legacy snapshot。服务端�
 
 同时选择 `terminal.state_ack` 与 `terminal.semantic_diff` 后，初始完整 State 是唯一无 base 的快照。客户端成功渲染后以 `(epoch, generation)` ACK；服务端在 ACK 前不发送下一代，只把任意数量的 PTY/resize 更新合并为一个 dirty 状态。ACK 后最多每 16 ms 从已确认 generation 直接构造到最新 generation 的累计 `TerminalStateDiff`。diff 以目标行顺序引用完全相同的 base row，只有新增或变化行携带完整 `Row`；其他 State/Screen metadata 与目标 style/hyperlink 表保持权威。客户端必须从精确 base 原子重建并再次运行完整 State v2 validator，成功渲染后才 ACK target。epoch 变化、base 不匹配或 diff 编码不小于完整 State 时，服务端使用可靠完整快照。详细不变量见 `terminal-state-sync-v1.md`。
 
-同时选择 `terminal.datagram_state` 后改用 latest-state-wins live data plane：初始 viewport keyframe 仍可靠分片；客户端验证并原子提交后 ACK，此后服务端无需等待逐代 ACK，可每 16 ms 生成一份从已确认 retained base 到最新 viewport 的 cumulative datagram。中间 datagram 丢失、乱序或重复不会损坏 replica；100 ms quiet-tail retry 覆盖最后一包丢失，1 s re-key 以及可靠 `TerminalStateRepairRequest` 覆盖缺失 base 和超 MTU 更新。每包携带 Terminal/Attachment ID，在同一 QUIC 连接上独立路由多个 shell。详细定义见 `terminal-datagram-state-v1.md`。
+同时选择 `terminal.datagram_state` v2 后改用 latest-state-wins live data plane：初始 viewport keyframe 仍可靠分片；验证并原子提交后 ACK，此后无需等待逐代 ACK，可每 16 ms 从 retained base 生成最新 cumulative datagram。稀疏行与 cell splice 减少 MTU 压力；100 ms quiet-tail retry 覆盖尾包丢失，1 s re-key 和显式 repair 覆盖缺失 base。超 MTU 或 epoch/尺寸变化可立即发 keyframe，但最多一份未 ACK keyframe，期间只保留最新 pending。每包携带 Terminal/Attachment ID，多个 shell 复用一条 QUIC 连接。详细定义见 `terminal-datagram-state-v2.md`。
 
 history paging 只在 semantic v2 同时选择时生效。`HistoryPageRequest` 和 `HistoryPageChunk` 是 appended oneof；未选择能力的 N-1 decoder 会忽略它们。每页最多 512 rows/4 MiB，仍以可靠 512 KiB chunks 和整页 SHA-256 原子发布。
 

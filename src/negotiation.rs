@@ -102,9 +102,8 @@ impl ProtocolSupport {
         }
     }
 
-    /// Full semantic capabilities implemented by Rust protocol consumers. The
-    /// ANSI CLI intentionally keeps using `command_line_client` until its
-    /// renderer is migrated to the semantic replica.
+    /// Semantic capabilities used by the Rust streaming library and the
+    /// opt-in `astra --streaming` viewport renderer. The CLI default is legacy.
     pub fn rust_semantic_client() -> Self {
         Self::runtime()
     }

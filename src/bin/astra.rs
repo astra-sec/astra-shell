@@ -27,6 +27,9 @@ use uuid::Uuid;
 #[derive(Debug, Parser)]
 #[command(name = "astra", version, about = "Astra persistent terminal client")]
 struct Cli {
+    /// Use the experimental latest-state QUIC DATAGRAM renderer (Rust v2 peers).
+    #[arg(long)]
+    streaming: bool,
     /// Server UDP port, equivalent to ssh -p.
     #[arg(short = 'p', long, default_value_t = 4433)]
     port: u16,
@@ -190,7 +193,38 @@ async fn run() -> Result<()> {
             }
         }
     };
-    let client = AstraClient::connect(address, &server_name, &trust, &identity, &username).await?;
+    let client = if cli.streaming {
+        AstraClient::connect_with_support(
+            address,
+            &server_name,
+            &trust,
+            &identity,
+            &username,
+            astra_shell::negotiation::ProtocolSupport::rust_semantic_client(),
+        )
+        .await?
+    } else {
+        AstraClient::connect(address, &server_name, &trust, &identity, &username).await?
+    };
+    let workspace_id = if cli.streaming {
+        if !client
+            .negotiated_protocol()
+            .has(astra_shell::negotiation::CAPABILITY_DATAGRAM_STATE, 2)
+        {
+            bail!(
+                "server does not support terminal.datagram_state v2; update the experimental server or omit --streaming"
+            );
+        }
+        client
+            .list_workspaces()
+            .await?
+            .into_iter()
+            .find(|workspace| workspace.is_default)
+            .context("server has no default workspace")?
+            .id
+    } else {
+        String::new()
+    };
     match cli.command {
         None => {
             let terminal = client
@@ -202,10 +236,14 @@ async fn run() -> Result<()> {
                     cols: 80,
                     term: client_term()?,
                     environment: client_locale_environment()?,
-                    workspace_id: String::new(),
+                    workspace_id: workspace_id.clone(),
                 })
                 .await?;
-            attach_terminal(client, terminal.id, false, false).await?;
+            if cli.streaming {
+                attach_streaming_terminal(client, workspace_id, terminal.id, false, false).await?;
+            } else {
+                attach_terminal(client, terminal.id, false, false).await?;
+            }
         }
         Some(Command::List { long }) => {
             let terminals = client.list().await?;
@@ -250,15 +288,31 @@ async fn run() -> Result<()> {
                     cols: arguments.cols,
                     term: client_term()?,
                     environment: client_locale_environment()?,
-                    workspace_id: String::new(),
+                    workspace_id: workspace_id.clone(),
                 })
                 .await?;
             println!("{}", terminal_reference(&terminal));
             if attach {
-                attach_terminal(client, terminal.id, false, false).await?;
+                if cli.streaming {
+                    attach_streaming_terminal(client, workspace_id, terminal.id, false, false)
+                        .await?;
+                } else {
+                    attach_terminal(client, terminal.id, false, false).await?;
+                }
             }
         }
         Some(Command::Attach(arguments)) => {
+            if cli.streaming {
+                attach_streaming_terminal(
+                    client,
+                    workspace_id,
+                    arguments.terminal_id,
+                    arguments.read_only,
+                    arguments.takeover,
+                )
+                .await?;
+                return Ok(());
+            }
             attach_terminal(
                 client,
                 arguments.terminal_id,
@@ -703,6 +757,134 @@ async fn prepare_download_temporary(
     }
     tokio::fs::write(snapshot_file, snapshot).await?;
     Ok(())
+}
+
+async fn attach_streaming_terminal(
+    client: AstraClient,
+    workspace_id: String,
+    terminal_id: String,
+    read_only: bool,
+    takeover: bool,
+) -> Result<()> {
+    use astra_shell::{
+        client::StreamingAttachmentEvent,
+        streaming_client::{ConnectionState, LiveTerminalEvent, StreamingConnection},
+        terminal_engine::ViewportRenderer,
+    };
+    // A cancelled tokio::io::stdin read leaves an uninterruptible blocking
+    // task, preventing runtime shutdown when the remote process exits. Read a
+    // separately opened controlling TTY through readiness notifications instead.
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    if !std::io::stdin().is_terminal() {
+        bail!("--streaming requires an interactive TTY; use the default CLI for piped input");
+    }
+    let tty_input = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(nix::unistd::ttyname(std::io::stdin())?)
+        .context("opening controlling TTY")?;
+    let stdin = tokio::io::unix::AsyncFd::with_interest(tty_input, tokio::io::Interest::READABLE)
+        .context("registering controlling TTY for asynchronous input")?;
+    async fn read_input(
+        stdin: &tokio::io::unix::AsyncFd<std::fs::File>,
+        buffer: &mut [u8],
+    ) -> Result<usize> {
+        loop {
+            let mut ready = stdin.readable().await?;
+            if let Ok(result) = ready.try_io(|fd| fd.get_ref().read(buffer)) {
+                return Ok(result?);
+            }
+        }
+    }
+    let connection = StreamingConnection::new(client);
+    let (mut terminal, _) = connection
+        .attach(astra_shell::protocol::AttachRequest {
+            workspace_id,
+            terminal_id,
+            read_only,
+            takeover,
+            resume_token: String::new(),
+        })
+        .await?;
+    let interactive = std::io::stdin().is_terminal();
+    let _raw_guard = if interactive {
+        enable_raw_mode()?;
+        Some(StreamingScreenGuard)
+    } else {
+        None
+    };
+    if interactive {
+        std::io::stdout().write_all(b"\x1b[?1049h")?;
+    }
+    let mut input = [0u8; 16 * 1024];
+    let mut window_changes = window_change_source()?;
+    let mut renderer = ViewportRenderer::default();
+    let mut writable = !read_only;
+    let size = || {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        Resize {
+            rows: rows as u32,
+            cols: cols as u32,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    };
+    if writable {
+        terminal.resize(size()).await?;
+    }
+    loop {
+        tokio::select! {
+            event = terminal.next_event() => match event? {
+                LiveTerminalEvent::Terminal(StreamingAttachmentEvent::State { state, .. }) => {
+                    std::io::stdout().write_all(&renderer.render(&state)?)?;
+                    std::io::stdout().flush()?;
+                }
+                LiveTerminalEvent::Terminal(StreamingAttachmentEvent::Exited(code)) => {
+                    eprintln!("\r\n[astra: terminal exited with status {code}]");
+                    return Ok(());
+                }
+                LiveTerminalEvent::Terminal(StreamingAttachmentEvent::Error(error)) => {
+                    eprintln!("\r\n[astra: {error}]"); renderer.invalidate();
+                }
+                LiveTerminalEvent::Terminal(StreamingAttachmentEvent::LeaseChanged(change)) => {
+                    writable = !change.read_only;
+                    eprintln!("\r\n[astra: input lease {}]", change.reason); renderer.invalidate();
+                }
+                LiveTerminalEvent::Connection(ConnectionState::Recovering { attempt, retry_after, reason }) => {
+                    eprintln!("\r\n[astra: reconnect attempt {attempt}, retry in {}ms: {reason}; offline input is discarded]", retry_after.as_millis());
+                    renderer.invalidate();
+                }
+                LiveTerminalEvent::Connection(_) => { renderer.invalidate(); }
+                // Clipboard writes need explicit local policy; the experimental
+                // CLI does not execute remote clipboard host effects.
+                LiveTerminalEvent::Terminal(_) => {}
+            },
+            read = read_input(&stdin, &mut input) => {
+                let count = read?;
+                if count == 0 || (interactive && input[..count].contains(&0x1d)) {
+                    return terminal.detach().await;
+                }
+                if writable
+                    && let Err(error) = terminal.send_input(input[..count].to_vec()).await {
+                        eprintln!("\r\n[astra: {error}]"); renderer.invalidate();
+                }
+            }
+            _ = wait_for_window_change(&mut window_changes), if interactive => {
+                if writable { terminal.resize(size()).await?; }
+                renderer.invalidate();
+            }
+        }
+    }
+}
+
+struct StreamingScreenGuard;
+impl Drop for StreamingScreenGuard {
+    fn drop(&mut self) {
+        let _ = std::io::stdout().write_all(b"\x1b[=0u\x1b[?1l\x1b>\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1016l\x1b[?2004l\x1b[?6l\x1b[?69l\x1b[r\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l");
+        let _ = std::io::stdout().flush();
+        let _ = disable_raw_mode();
+    }
 }
 
 async fn attach_terminal(
