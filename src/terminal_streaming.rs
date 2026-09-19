@@ -10,9 +10,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::{Context, Result, ensure};
 use prost::Message;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 use crate::{
+    compression::EncodedPayload,
     protocol::{
         HistoryPageChunk, TerminalStateAck, TerminalStateChunk, TerminalStateDiff,
         TerminalStateRepairRequest, TerminalViewportDatagram, TerminalViewportRowPatch,
@@ -70,6 +72,7 @@ pub struct HistoryPageAssembler {
 #[derive(Default)]
 struct TransferAssembler {
     pending: Option<PendingTransfer>,
+    allow_zstd: bool,
 }
 
 struct PendingTransfer {
@@ -79,9 +82,21 @@ struct PendingTransfer {
     chunks: Vec<Option<Vec<u8>>>,
     received_size: usize,
     received_chunks: usize,
+    encoding: i32,
+    uncompressed_size: u32,
 }
 
 impl TerminalStateAssembler {
+    pub fn with_zstd(allow_zstd: bool) -> Self {
+        Self {
+            transfer: TransferAssembler {
+                allow_zstd,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Synchronous decode/validation; async callers should use a bounded worker.
     pub fn push(&mut self, chunk: TerminalStateChunk) -> Result<Option<State>> {
         let encoded = self.transfer.push(
             TransferChunk::from(chunk),
@@ -97,6 +112,16 @@ impl TerminalStateAssembler {
 }
 
 impl HistoryPageAssembler {
+    pub fn with_zstd(allow_zstd: bool) -> Self {
+        Self {
+            transfer: TransferAssembler {
+                allow_zstd,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Synchronous decode/validation; async callers should use a bounded worker.
     pub fn push(&mut self, chunk: HistoryPageChunk) -> Result<Option<HistoryPage>> {
         let encoded = self.transfer.push(
             TransferChunk::from(chunk),
@@ -119,6 +144,8 @@ struct TransferChunk {
     total_size: u32,
     sha256: Vec<u8>,
     data: Vec<u8>,
+    encoding: i32,
+    uncompressed_size: u32,
 }
 
 impl From<TerminalStateChunk> for TransferChunk {
@@ -130,6 +157,8 @@ impl From<TerminalStateChunk> for TransferChunk {
             total_size: chunk.total_size,
             sha256: chunk.sha256,
             data: chunk.data,
+            encoding: chunk.encoding,
+            uncompressed_size: chunk.uncompressed_size,
         }
     }
 }
@@ -143,6 +172,8 @@ impl From<HistoryPageChunk> for TransferChunk {
             total_size: chunk.total_size,
             sha256: chunk.sha256,
             data: chunk.data,
+            encoding: chunk.encoding,
+            uncompressed_size: chunk.uncompressed_size,
         }
     }
 }
@@ -169,6 +200,13 @@ impl TransferAssembler {
             "terminal transfer chunk index is invalid"
         );
         ensure!(total_size <= maximum_size, "terminal transfer is too large");
+        EncodedPayload::validate_header(
+            chunk.encoding,
+            chunk.uncompressed_size,
+            total_size,
+            self.allow_zstd,
+            maximum_size,
+        )?;
         if let Some(pending) = &self.pending {
             ensure!(
                 pending.transfer_id == chunk.transfer_id,
@@ -186,6 +224,8 @@ impl TransferAssembler {
                 chunks: vec![None; chunk_count],
                 received_size: 0,
                 received_chunks: 0,
+                encoding: chunk.encoding,
+                uncompressed_size: chunk.uncompressed_size,
             });
         }
         let pending = self
@@ -196,6 +236,8 @@ impl TransferAssembler {
             pending.transfer_id == chunk.transfer_id
                 && pending.total_size == total_size
                 && pending.sha256 == chunk.sha256
+                && pending.encoding == chunk.encoding
+                && pending.uncompressed_size == chunk.uncompressed_size
                 && pending.chunks.len() == chunk_count,
             "terminal transfer metadata changed"
         );
@@ -234,10 +276,12 @@ impl TransferAssembler {
             encoded.len() == pending.total_size,
             "terminal transfer size does not match"
         );
-        ensure!(
-            Sha256::digest(&encoded).as_slice() == pending.sha256,
-            "terminal transfer digest does not match"
-        );
+        let encoded = EncodedPayload {
+            data: encoded,
+            encoding: pending.encoding,
+            uncompressed_size: pending.uncompressed_size,
+        }
+        .decode(self.allow_zstd, maximum_size, &pending.sha256)?;
         Ok(Some(encoded))
     }
 }
@@ -1109,6 +1153,8 @@ mod tests {
                 total_size: encoded.len() as u32,
                 sha256: digest.clone(),
                 data: data.to_vec(),
+                encoding: 0,
+                uncompressed_size: 0,
             })
             .collect()
     }
@@ -1128,6 +1174,8 @@ mod tests {
                 total_size: encoded.len() as u32,
                 sha256: digest.clone(),
                 data: data.to_vec(),
+                encoding: 0,
+                uncompressed_size: 0,
             })
             .collect()
     }

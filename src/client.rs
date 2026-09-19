@@ -16,10 +16,11 @@ use tokio::sync::watch;
 use crate::{
     ALPN,
     auth::{authentication_payload, sign_challenge},
+    compression::{self, Background, WorkClass},
     known_hosts::{StrictHostKeyChecking, verify_server_certificate},
     negotiation::{
-        CAPABILITY_DATAGRAM_STATE, NegotiatedProtocol, ProtocolSupport, client_hello,
-        validate_server_hello,
+        CAPABILITY_DATAGRAM_STATE, CAPABILITY_PAYLOAD_ZSTD, NegotiatedProtocol, ProtocolSupport,
+        client_hello, validate_server_hello,
     },
     protocol::{
         AbortUploadRequest, AttachRequest, AttachResponse, BeginDownloadRequest,
@@ -52,6 +53,27 @@ impl fmt::Display for ServerResponseError {
 }
 
 impl std::error::Error for ServerResponseError {}
+
+/// A permanent payload/schema/integrity failure, not a lost connection. File
+/// transfer retry loops must surface this rather than reconnecting indefinitely.
+#[derive(Debug)]
+pub struct FilePayloadError {
+    pub message: String,
+}
+
+impl fmt::Display for FilePayloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid file payload: {}", self.message)
+    }
+}
+
+impl std::error::Error for FilePayloadError {}
+
+fn file_payload_error(error: anyhow::Error) -> FilePayloadError {
+    FilePayloadError {
+        message: error.to_string(),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum ServerTrust {
@@ -301,10 +323,19 @@ pub struct StreamingAttachment {
     next_sequence: u64,
     state_assembler: TerminalStateAssembler,
     history_assembler: HistoryPageAssembler,
+    pending_decode: Option<Background<DecodedChunk>>,
     replica: StreamingReplica,
     datagram_receiver: watch::Receiver<Option<DatagramDelivery>>,
     datagram_router: DatagramRouter,
     route: DatagramRoute,
+}
+
+enum DecodedChunk {
+    State(
+        TerminalStateAssembler,
+        Option<Box<crate::terminal_state_v2::State>>,
+    ),
+    History(HistoryPageAssembler, Option<Box<HistoryPage>>),
 }
 
 impl Drop for StreamingAttachment {
@@ -610,8 +641,13 @@ impl AstraClient {
             next_lease_renewal: lease_ttl.map(next_lease_renewal),
             lease_ttl,
             next_sequence: 1,
-            state_assembler: TerminalStateAssembler::default(),
-            history_assembler: HistoryPageAssembler::default(),
+            state_assembler: TerminalStateAssembler::with_zstd(
+                self.negotiated.has(CAPABILITY_PAYLOAD_ZSTD, 1),
+            ),
+            history_assembler: HistoryPageAssembler::with_zstd(
+                self.negotiated.has(CAPABILITY_PAYLOAD_ZSTD, 1),
+            ),
+            pending_decode: None,
             replica: StreamingReplica::for_route(terminal_id, attachment_id)?,
             datagram_receiver,
             datagram_router: self.datagrams.clone(),
@@ -702,6 +738,12 @@ impl AstraClient {
         &self,
         request: WriteFileChunkRequest,
     ) -> Result<UploadStatusResponse> {
+        let zstd = self.negotiated.has(CAPABILITY_PAYLOAD_ZSTD, 1);
+        let request = compression::run(WorkClass::File, move || {
+            compression::encode_upload(request, zstd)
+        })
+        .await
+        .map_err(file_payload_error)?;
         self.upload_status(request::Command::WriteFileChunk(request))
             .await
     }
@@ -749,11 +791,25 @@ impl AstraClient {
         &self,
         request: ReadFileChunkRequest,
     ) -> Result<FileChunkResponse> {
+        let offset = request.offset;
+        let length = request.length as usize;
         let response = self
             .file_unary(request::Command::ReadFileChunk(request))
             .await?;
         match response.result {
-            Some(response::Result::FileChunk(chunk)) => Ok(chunk),
+            Some(response::Result::FileChunk(chunk)) => {
+                let zstd = self.negotiated.has(CAPABILITY_PAYLOAD_ZSTD, 1);
+                compression::run(WorkClass::File, move || {
+                    let chunk = compression::decode_download(chunk, zstd)?;
+                    anyhow::ensure!(
+                        chunk.offset == offset && chunk.data.len() <= length,
+                        "file response range does not match request"
+                    );
+                    Ok(chunk)
+                })
+                .await
+                .map_err(|error| file_payload_error(error).into())
+            }
             Some(response::Result::Error(error)) => Err(server_response_error(error)),
             _ => bail!("server returned the wrong response to file read"),
         }
@@ -856,6 +912,51 @@ impl StreamingAttachment {
 
     pub async fn next_event(&mut self) -> Result<StreamingAttachmentEvent> {
         loop {
+            // Await the owned job before reading another reliable event (notably
+            // Exited). Cancellation by input/resize leaves this job intact.
+            if let Some(job) = &mut self.pending_decode {
+                let decoded = job.finish().await;
+                self.pending_decode = None;
+                match decoded? {
+                    DecodedChunk::State(assembler, state) => {
+                        self.state_assembler = assembler;
+                        if let Some(state) = state {
+                            match self.replica.apply_keyframe(*state)? {
+                                ApplyDisposition::Applied => {
+                                    self.datagram_router.commit_keyframe(
+                                        &self.route,
+                                        self.replica
+                                            .current()
+                                            .context("missing committed keyframe")?,
+                                    );
+                                    self.send_state_ack().await?;
+                                    return Ok(StreamingAttachmentEvent::State {
+                                        state: Box::new(
+                                            self.replica
+                                                .current()
+                                                .context("applied terminal state disappeared")?
+                                                .clone(),
+                                        ),
+                                        delivery: TerminalStateDelivery::ReliableKeyframe,
+                                    });
+                                }
+                                ApplyDisposition::Stale => {
+                                    self.send_state_ack().await?;
+                                }
+                                ApplyDisposition::MissingBase => {
+                                    unreachable!("a reliable keyframe does not need a base")
+                                }
+                            }
+                        }
+                    }
+                    DecodedChunk::History(assembler, page) => {
+                        self.history_assembler = assembler;
+                        if let Some(page) = page {
+                            return Ok(StreamingAttachmentEvent::HistoryPage(page));
+                        }
+                    }
+                }
+            }
             enum Incoming {
                 Reliable(Result<Option<Box<WireMessage>>>),
                 Datagram(Option<DatagramDelivery>),
@@ -920,34 +1021,11 @@ impl StreamingAttachment {
                     self.validate_event_target(&event)?;
                     match event.event {
                         Some(terminal_event::Event::SemanticStateChunk(chunk)) => {
-                            if let Some(state) = self.state_assembler.push(chunk)? {
-                                match self.replica.apply_keyframe(state)? {
-                                    ApplyDisposition::Applied => {
-                                        self.datagram_router.commit_keyframe(
-                                            &self.route,
-                                            self.replica
-                                                .current()
-                                                .context("missing committed keyframe")?,
-                                        );
-                                        self.send_state_ack().await?;
-                                        return Ok(StreamingAttachmentEvent::State {
-                                            state: Box::new(
-                                                self.replica
-                                                    .current()
-                                                    .context("applied terminal state disappeared")?
-                                                    .clone(),
-                                            ),
-                                            delivery: TerminalStateDelivery::ReliableKeyframe,
-                                        });
-                                    }
-                                    ApplyDisposition::Stale => {
-                                        self.send_state_ack().await?;
-                                    }
-                                    ApplyDisposition::MissingBase => {
-                                        unreachable!("a reliable keyframe does not need a base")
-                                    }
-                                }
-                            }
+                            let mut assembler = std::mem::take(&mut self.state_assembler);
+                            self.pending_decode = Some(Background::terminal(move || {
+                                let state = assembler.push(chunk)?;
+                                Ok(DecodedChunk::State(assembler, state.map(Box::new)))
+                            }));
                         }
                         Some(terminal_event::Event::Exited(code)) => {
                             return Ok(StreamingAttachmentEvent::Exited(code));
@@ -979,9 +1057,11 @@ impl StreamingAttachment {
                             return Ok(StreamingAttachmentEvent::ClipboardWrite(write));
                         }
                         Some(terminal_event::Event::HistoryPageChunk(chunk)) => {
-                            if let Some(page) = self.history_assembler.push(chunk)? {
-                                return Ok(StreamingAttachmentEvent::HistoryPage(Box::new(page)));
-                            }
+                            let mut assembler = std::mem::take(&mut self.history_assembler);
+                            self.pending_decode = Some(Background::terminal(move || {
+                                let page = assembler.push(chunk)?;
+                                Ok(DecodedChunk::History(assembler, page.map(Box::new)))
+                            }));
                         }
                         Some(terminal_event::Event::SemanticStateDiffChunk(_)) => {
                             bail!("server mixed reliable semantic diffs with datagram state")
@@ -1533,6 +1613,197 @@ mod tests {
         drop(reconnected);
         server.abort();
         let _ = server.await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn files_compress_over_quic_resume_and_fall_back_for_old_peers() -> Result<()> {
+        use crate::files::MAX_FILE_CHUNK_SIZE;
+        use sha2::{Digest, Sha256};
+        struct Stop(tokio::task::JoinHandle<Result<()>>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let temporary = tempfile::tempdir()?;
+        let paths = ServerPaths::new(temporary.path().join("state"));
+        initialize_state(&paths)?;
+        let identity = PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ed25519)?;
+        let identity_path = temporary.path().join("id_ed25519");
+        fs::write(&identity_path, identity.to_openssh(LineEnding::LF)?)?;
+        fs::set_permissions(&identity_path, fs::Permissions::from_mode(0o600))?;
+        fs::write(
+            &paths.authorized_keys,
+            format!("{}\n", identity.public_key().to_openssh()?),
+        )?;
+        let session_root = temporary.path().join("home");
+        fs::create_dir(&session_root)?;
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let listen = reservation.local_addr()?;
+        drop(reservation);
+        let _server = Stop(tokio::spawn(serve(ServerOptions {
+            listen,
+            paths: paths.clone(),
+            mode: ServerMode::Rootless {
+                session_root: session_root.clone(),
+            },
+            resource_policy: ResourcePolicy::default(),
+        })));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let username = SystemAccount::current()?.username;
+        let trust = ServerTrust::PinnedCertificate(paths.cert.clone());
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for enabled in [true, false] {
+                let mut support = ProtocolSupport::command_line_client();
+                if !enabled {
+                    support
+                        .capabilities
+                        .retain(|cap| cap.name != CAPABILITY_PAYLOAD_ZSTD);
+                }
+                let client = AstraClient::connect_with_support(
+                    listen,
+                    "localhost",
+                    &trust,
+                    &identity_path,
+                    &username,
+                    support,
+                )
+                .await?;
+                assert_eq!(client.negotiated.has(CAPABILITY_PAYLOAD_ZSTD, 1), enabled);
+                let path = format!("transfer-{enabled}.bin").into_bytes();
+                let contents = vec![b'x'; MAX_FILE_CHUNK_SIZE + 8192];
+                let transfer_id = uuid::Uuid::new_v4().to_string();
+                client
+                    .begin_upload(BeginUploadRequest {
+                        transfer_id: transfer_id.clone(),
+                        path: path.clone(),
+                        size: contents.len() as u64,
+                        sha256: Sha256::digest(&contents).to_vec(),
+                        mode: 0o600,
+                        overwrite: false,
+                    })
+                    .await?;
+                let first = WriteFileChunkRequest {
+                    transfer_id: transfer_id.clone(),
+                    offset: 0,
+                    data: contents[..MAX_FILE_CHUNK_SIZE].to_vec(),
+                    sha256: Sha256::digest(&contents[..MAX_FILE_CHUNK_SIZE]).to_vec(),
+                    ..Default::default()
+                };
+                let mut invalid = compression::encode_upload(first.clone(), true)?;
+                if enabled {
+                    invalid.sha256[0] ^= 1;
+                }
+                let rejected = client
+                    .file_unary(request::Command::WriteFileChunk(invalid))
+                    .await?;
+                let Some(response::Result::Error(error)) = rejected.result else {
+                    bail!("invalid upload accepted")
+                };
+                assert_eq!(
+                    error.code,
+                    if enabled {
+                        "checksum_mismatch"
+                    } else {
+                        "invalid"
+                    }
+                );
+                assert_eq!(
+                    client
+                        .query_upload(transfer_id.clone())
+                        .await?
+                        .committed_offset,
+                    0
+                );
+                assert_eq!(
+                    client
+                        .write_file_chunk(first.clone())
+                        .await?
+                        .committed_offset,
+                    MAX_FILE_CHUNK_SIZE as u64
+                );
+
+                client.connection.close(0u32.into(), b"file resume test");
+                let resumed = client.reconnect().await?;
+                drop(client);
+                assert_eq!(
+                    resumed
+                        .query_upload(transfer_id.clone())
+                        .await?
+                        .committed_offset,
+                    MAX_FILE_CHUNK_SIZE as u64
+                );
+                // Replay an already committed chunk through the real wire path.
+                assert_eq!(
+                    resumed.write_file_chunk(first).await?.committed_offset,
+                    MAX_FILE_CHUNK_SIZE as u64
+                );
+                resumed
+                    .write_file_chunk(WriteFileChunkRequest {
+                        transfer_id: transfer_id.clone(),
+                        offset: MAX_FILE_CHUNK_SIZE as u64,
+                        data: contents[MAX_FILE_CHUNK_SIZE..].to_vec(),
+                        sha256: Sha256::digest(&contents[MAX_FILE_CHUNK_SIZE..]).to_vec(),
+                        ..Default::default()
+                    })
+                    .await?;
+                resumed.commit_upload(transfer_id).await?;
+                assert_eq!(
+                    fs::read(session_root.join(String::from_utf8(path.clone())?))?,
+                    contents
+                );
+                let download = resumed.begin_download(path.clone(), true).await?;
+                let request = ReadFileChunkRequest {
+                    path: path.clone(),
+                    snapshot: download.snapshot.clone(),
+                    offset: 0,
+                    length: MAX_FILE_CHUNK_SIZE as u32,
+                };
+                let wire = resumed
+                    .file_unary(request::Command::ReadFileChunk(request.clone()))
+                    .await?;
+                let Some(response::Result::FileChunk(wire)) = wire.result else {
+                    bail!("missing file chunk")
+                };
+                assert_eq!(wire.encoding, i32::from(enabled));
+                if enabled {
+                    assert!(wire.data.len() < 1024);
+                } else {
+                    assert_eq!(wire.data, contents[..MAX_FILE_CHUNK_SIZE]);
+                }
+                let first = resumed.read_file_chunk(request).await?;
+                assert_eq!(first.encoding, 0); // public API always returns original bytes
+                assert_eq!(first.data, contents[..MAX_FILE_CHUNK_SIZE]);
+                assert!(!first.eof);
+                resumed
+                    .connection
+                    .close(0u32.into(), b"download resume test");
+                let last = resumed.reconnect().await?;
+                drop(resumed);
+                let tail = last
+                    .read_file_chunk(ReadFileChunkRequest {
+                        path: path.clone(),
+                        snapshot: download.snapshot.clone(),
+                        offset: MAX_FILE_CHUNK_SIZE as u64,
+                        length: MAX_FILE_CHUNK_SIZE as u32,
+                    })
+                    .await?;
+                assert_eq!(tail.data, contents[MAX_FILE_CHUNK_SIZE..]);
+                assert!(tail.eof);
+                let empty = last
+                    .read_file_chunk(ReadFileChunkRequest {
+                        path,
+                        snapshot: download.snapshot,
+                        offset: contents.len() as u64,
+                        length: 1,
+                    })
+                    .await?;
+                assert!(empty.eof && empty.data.is_empty());
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
         Ok(())
     }
 

@@ -17,6 +17,8 @@ managed 模式不会把 QUIC 交给 worker。gateway 在 `WorkerStreamHello.maxi
 
 ## Keyframe 与 cumulative delta
 
+可选 `payload.zstd` v1 对可靠 keyframe 和历史页独立压缩，DATAGRAM 编码及其 MTU 判断不变。压缩不改变发送时机、ACK gate 或 base/generation 语义。详见 `payload-compression-v1.md`。
+
 attach 后服务端从权威 TerminalEngine **直接**导出 primary/alternate 当前 viewport，不先构造 scrollback 再丢弃。样式表仅由可见单元格构建；相同引擎更新的 viewport 在多个 attachment 间复用缓存。历史仍通过 Anchor 分页读取。初始 keyframe 使用可靠 `TerminalStateChunk`、整份 SHA-256 和 State v2 validator。客户端原子提交后发送 `TerminalStateAck`，在此之前服务端只合并 dirty，不发依赖该 base 的 datagram。
 
 之后每份 datagram 都是从一个明确 retained base 直接到目标 generation 的 cumulative `TerminalStateDiff`，不依赖前一 datagram。相对 base 未变化的 styles、hyperlinks、modes、title、working directory 和 palette 由 `inherited_fields` 位标记继承，不能同时携带冲突值。客户端必须：

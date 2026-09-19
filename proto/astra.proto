@@ -175,6 +175,8 @@ message WriteFileChunkRequest {
   uint64 offset = 2;
   bytes data = 3;
   bytes sha256 = 4;
+  PayloadEncoding encoding = 5;
+  uint32 uncompressed_size = 6;
 }
 message QueryUploadRequest { string transfer_id = 1; }
 message CommitUploadRequest { string transfer_id = 1; }
@@ -368,6 +370,8 @@ message FileChunkResponse {
   bytes data = 2;
   bytes sha256 = 3;
   bool eof = 4;
+  PayloadEncoding encoding = 5;
+  uint32 uncompressed_size = 6;
 }
 message GitFileStatus {
   // Path relative to repository_root. Status uses Git porcelain-v2 XY characters.
@@ -462,6 +466,12 @@ message ClipboardWrite {
   bytes contents = 2;
   bool clear = 3;
 }
+// Requires payload.zstd v1 for ZSTD. NONE uses the legacy bytes and zero
+// uncompressed_size. Hashes and file offsets always refer to original bytes.
+enum PayloadEncoding {
+  PAYLOAD_ENCODING_NONE = 0;
+  PAYLOAD_ENCODING_ZSTD = 1;
+}
 // One reliable fragment of an encoded astra.terminal.v2.State. The receiver
 // validates size, ordering, digest and the complete State before publication.
 message TerminalStateChunk {
@@ -471,6 +481,8 @@ message TerminalStateChunk {
   uint32 total_size = 4;
   bytes sha256 = 5;
   bytes data = 6;
+  PayloadEncoding encoding = 7;
+  uint32 uncompressed_size = 8;
 }
 // A cumulative semantic update from one client-acknowledged State generation
 // to the latest generation. target_metadata carries every State field except
@@ -529,6 +541,8 @@ message HistoryPageChunk {
   uint32 total_size = 4;
   bytes sha256 = 5;
   bytes data = 6;
+  PayloadEncoding encoding = 7;
+  uint32 uncompressed_size = 8;
 }
 message LeaseChanged {
   bool read_only = 1;

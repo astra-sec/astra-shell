@@ -166,6 +166,8 @@ Rootless 与 managed 模式使用同一套分层 `ResourceGovernor`。默认每�
 
 文件操作复用终端所在的同一条认证 QUIC 连接，但每个请求使用独立、低于终端优先级的双向 Stream。它不是 SFTP：协议以稳定传输 ID、幂等 offset chunk 和文件快照为核心，因此 QUIC 连接完全失效后仍能在新连接上恢复。
 
+本实验分支的 Rust peers 协商 `payload.zstd` 后自动对关键帧、历史页和文件块使用 zstd level 1；小数据或压缩收益不足时发送原文，旧客户端（包括尚未接入的 Swift）继续使用原格式。文件 offset、进度和 SHA-256 始终针对原始内容，断点续传不依赖压缩上下文。格式与安全限制见 [Payload compression v1](docs/protocol/payload-compression-v1.md)。
+
 ```bash
 # 查看能力、目录和元数据
 astra -p 4433 mimi@HOST files capabilities

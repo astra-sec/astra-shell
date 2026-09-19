@@ -31,6 +31,8 @@
 
 ## 回退与边界
 
+可选 `payload.zstd` v1 只对完整 State/HistoryPage 生效：先压缩再可靠分片，解压后校验原始 SHA-256；本路径的 TerminalStateDiffChunk 保持原文。比较 diff/State 大小时仍使用未压缩的 protobuf 长度。详见 `payload-compression-v1.md`。
+
 - epoch 变化、没有已 ACK base 或 diff 编码大小不小于完整 State：发送完整 State。
 - broadcast lag：只标记 dirty；已 ACK base 到最新 State 的累计更新覆盖所有跳过事件。
 - diff 不会跨 attachment、epoch 或 generation base 重用。

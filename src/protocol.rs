@@ -352,6 +352,10 @@ pub struct WriteFileChunkRequest {
     pub data: Vec<u8>,
     #[prost(bytes = "vec", tag = "4")]
     pub sha256: Vec<u8>,
+    #[prost(enumeration = "PayloadEncoding", tag = "5")]
+    pub encoding: i32,
+    #[prost(uint32, tag = "6")]
+    pub uncompressed_size: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -577,6 +581,10 @@ pub struct FileChunkResponse {
     pub sha256: Vec<u8>,
     #[prost(bool, tag = "4")]
     pub eof: bool,
+    #[prost(enumeration = "PayloadEncoding", tag = "5")]
+    pub encoding: i32,
+    #[prost(uint32, tag = "6")]
+    pub uncompressed_size: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -953,6 +961,14 @@ pub enum ClipboardSelection {
     Primary = 2,
 }
 
+/// Optional, negotiated payload encoding. Hashes always cover the original bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum PayloadEncoding {
+    None = 0,
+    Zstd = 1,
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct TerminalStateChunk {
     #[prost(bytes = "vec", tag = "1")]
@@ -967,6 +983,10 @@ pub struct TerminalStateChunk {
     pub sha256: Vec<u8>,
     #[prost(bytes = "vec", tag = "6")]
     pub data: Vec<u8>,
+    #[prost(enumeration = "PayloadEncoding", tag = "7")]
+    pub encoding: i32,
+    #[prost(uint32, tag = "8")]
+    pub uncompressed_size: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1073,6 +1093,10 @@ pub struct HistoryPageChunk {
     pub sha256: Vec<u8>,
     #[prost(bytes = "vec", tag = "6")]
     pub data: Vec<u8>,
+    #[prost(enumeration = "PayloadEncoding", tag = "7")]
+    pub encoding: i32,
+    #[prost(uint32, tag = "8")]
+    pub uncompressed_size: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1172,6 +1196,88 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_payload_encoding_preserves_legacy_wire_bytes() {
+        use super::*;
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyTransfer {
+            #[prost(bytes = "vec", tag = "1")]
+            transfer_id: Vec<u8>,
+            #[prost(uint32, tag = "2")]
+            chunk_index: u32,
+            #[prost(uint32, tag = "3")]
+            chunk_count: u32,
+            #[prost(uint32, tag = "4")]
+            total_size: u32,
+            #[prost(bytes = "vec", tag = "5")]
+            sha256: Vec<u8>,
+            #[prost(bytes = "vec", tag = "6")]
+            data: Vec<u8>,
+        }
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyUpload {
+            #[prost(string, tag = "1")]
+            transfer_id: String,
+            #[prost(uint64, tag = "2")]
+            offset: u64,
+            #[prost(bytes = "vec", tag = "3")]
+            data: Vec<u8>,
+            #[prost(bytes = "vec", tag = "4")]
+            sha256: Vec<u8>,
+        }
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyDownload {
+            #[prost(uint64, tag = "1")]
+            offset: u64,
+            #[prost(bytes = "vec", tag = "2")]
+            data: Vec<u8>,
+            #[prost(bytes = "vec", tag = "3")]
+            sha256: Vec<u8>,
+            #[prost(bool, tag = "4")]
+            eof: bool,
+        }
+        let legacy = LegacyTransfer {
+            transfer_id: vec![7; 16],
+            chunk_index: 0,
+            chunk_count: 1,
+            total_size: 3,
+            sha256: vec![8; 32],
+            data: b"abc".to_vec(),
+        }
+        .encode_to_vec();
+        let state = TerminalStateChunk::decode(legacy.as_slice()).unwrap();
+        let history = HistoryPageChunk::decode(legacy.as_slice()).unwrap();
+        assert_eq!(state.encoding, 0);
+        assert_eq!(history.encoding, 0);
+        assert_eq!(state.encode_to_vec(), legacy);
+        assert_eq!(history.encode_to_vec(), legacy);
+        let legacy = LegacyUpload {
+            transfer_id: "transfer".into(),
+            offset: 1024,
+            data: b"abc".to_vec(),
+            sha256: vec![8; 32],
+        }
+        .encode_to_vec();
+        assert_eq!(
+            WriteFileChunkRequest::decode(legacy.as_slice())
+                .unwrap()
+                .encode_to_vec(),
+            legacy
+        );
+        let legacy = LegacyDownload {
+            offset: 1024,
+            data: b"abc".to_vec(),
+            sha256: vec![8; 32],
+            eof: true,
+        }
+        .encode_to_vec();
+        assert_eq!(
+            FileChunkResponse::decode(legacy.as_slice())
+                .unwrap()
+                .encode_to_vec(),
+            legacy
+        );
+    }
     use super::*;
 
     #[tokio::test]
@@ -1392,6 +1498,8 @@ mod tests {
                 total_size: 0,
                 sha256: vec![3; 32],
                 data: vec![],
+                encoding: 0,
+                uncompressed_size: 0,
             })),
         };
         let legacy = LegacyTerminalEvent::decode(event.encode_to_vec().as_slice()).unwrap();

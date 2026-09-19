@@ -47,6 +47,32 @@ cargo test --offline --lib dense_viewports_one_cell_delta -- --nocapture
 
 压缩接入前的全量结果：139 个 library tests、4 个 astra CLI tests、2 个 astrad tests、1 个真实 PTY integration test，共 146 项通过。
 
+## Zstd 接入验证（2026-09-05）
+
+协议见 `../protocol/payload-compression-v1.md`。现在已实现 `payload.zstd` v1 的关键帧、历史页和双向文件块编码，不只是离线压缩实验。上方编码尺寸表中的 keyframe 数字是压缩前 State protobuf 本体。
+
+- 151 项 library tests 通过；默认跳过的 1 项手动 release benchmark 单独执行通过。
+- astra CLI 5 项（包括新增永久 payload 错误不能无限重连）、astrad 2 项、真实 PTY 集成 1 项通过，共 159 项功能测试。CLI 新增用例在全量测试后单独运行 `cargo test --offline --bin astra` 验证。
+- `cargo clippy --offline --all-targets -- -D warnings`、`cargo build --offline --bins`、`git diff --check` 和 protoc schema 编译通过。
+- 真实 loopback QUIC 上验证压缩上传/下载、上传与下载过程中分别断开连接后恢复、重复已提交块、空 EOF，以及未 offer zstd 时收到原文。
+- FileService 重建后恢复原始 committed offset；已压缩上传块可以改成原文重试，结果一致。非法压缩/错误 SHA 不推进上传进度。
+- 跨片关键帧原子组装、历史页独立解码、原格式 wire 字节完全不变、协商/worker 校验、截断/尾随/拼接/未知编码/错误 hash/解压长度或 window 超限拒绝均有测试。
+- 后台解码等待取消后继续同一任务；取消文件任务后许可保留到实际工作结束，文件队列不占用终端队列的许可。
+
+### Release codec 微基准
+
+本机 Apple M1 Pro，zstd 1.5.7 / Rust zstd 0.13.3，level 1；每项预热 20 次、记录 200 次，取 p50/p95。原文复制不计时；encode 包括尝试压缩与原文回退；decode 包括 SHA-256。**不包括 protobuf 解码/终端 validator、任务调度、渲染或网络，不是端到端交互延迟基准。**
+
+| 合成样本 | 原文 B | 实际 payload B | encode p50 / p95 μs | decode+SHA p50 / p95 μs |
+|---|---:|---:|---:|---:|
+| 50×200 混合 ASCII 关键帧 | 95,550 | 14,410 | 174 / 223 | 371 / 480 |
+| 1 MiB 重复 x 文件块 | 1,048,576 | 51 | 123 / 194 | 3,318 / 3,480 |
+| 1 MiB 伪随机文件块 | 1,048,576 | 1,048,576（原文回退） | 158 / 219 | 2,991 / 3,079 |
+
+重复 x 是极易压缩样本，不能外推普通文件的压缩率；随机块回退仍有尝试压缩的 CPU 成本。传输封装/QUIC/UDP/IP 不在 payload 数字内。原文 hash 在文件存储/客户端传输层各执行一次，CLI 不再重复校验同一下载块，最终文件校验仍保留。
+
+复现：`cargo test --offline --release --lib payload_codec_benchmark -- --ignored --nocapture`。
+
 ## 边界
 
 超 MTU 的大幅变化仍走有 ACK gate 的可靠关键帧，受 RTT/带宽限制；没有宣称实现可取消、独立传输流的关键帧替换。历史分页 API 可用，但实验 CLI 尚无独立 scrollback 浏览 UI，且要求交互 TTY。Swift 仍未协商本能力。能力名为 `terminal.datagram_state` v2，试用必须配套本分支的 astrad；默认 CLI 不变。

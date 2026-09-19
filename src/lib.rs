@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod auth;
 pub mod client;
+pub(crate) mod compression;
 pub mod files;
 pub mod known_hosts;
 pub mod negotiation;

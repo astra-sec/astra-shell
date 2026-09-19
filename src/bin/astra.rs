@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use astra_shell::{
-    client::{AstraClient, ServerResponseError, ServerTrust},
+    client::{AstraClient, FilePayloadError, ServerResponseError, ServerTrust},
     known_hosts::{StrictHostKeyChecking, default_known_hosts_file},
     protocol::{
         AttachResponse, BeginDownloadResponse, BeginUploadRequest, EnvironmentVariable, FileKind,
@@ -471,6 +471,8 @@ async fn upload_file(
             offset,
             sha256: Sha256::digest(&data).to_vec(),
             data,
+            encoding: 0,
+            uncompressed_size: 0,
         };
         status = write_chunk_with_reconnect(client, &request, chunk).await?;
         offset = status.committed_offset;
@@ -545,9 +547,7 @@ async fn download_file(
         if chunk.offset != offset || chunk.data.is_empty() {
             bail!("server returned a non-progressing download chunk")
         }
-        if Sha256::digest(&chunk.data).as_slice() != chunk.sha256.as_slice() {
-            bail!("downloaded chunk failed SHA-256 verification")
-        }
+        // read_file_chunk already decoded and verified the raw chunk SHA-256.
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         file.write_all(&chunk.data).await?;
         offset += chunk.data.len() as u64;
@@ -590,7 +590,7 @@ async fn begin_upload_with_reconnect(
     loop {
         match client.begin_upload(request.clone()).await {
             Ok(status) => return Ok(status),
-            Err(error) if is_server_error(&error) => return Err(error),
+            Err(error) if is_permanent_file_error(&error) => return Err(error),
             Err(error) => reconnect_file_client(client, &error).await?,
         }
     }
@@ -603,7 +603,7 @@ async fn write_chunk_with_reconnect(
 ) -> Result<astra_shell::protocol::UploadStatusResponse> {
     match client.write_file_chunk(chunk).await {
         Ok(status) => Ok(status),
-        Err(error) if is_server_error(&error) => Err(error),
+        Err(error) if is_permanent_file_error(&error) => Err(error),
         Err(error) => {
             reconnect_file_client(client, &error).await?;
             begin_upload_with_reconnect(client, begin).await
@@ -618,7 +618,7 @@ async fn commit_upload_with_reconnect(
     loop {
         match client.commit_upload(begin.transfer_id.clone()).await {
             Ok(status) => return Ok(status),
-            Err(error) if is_server_error(&error) => return Err(error),
+            Err(error) if is_permanent_file_error(&error) => return Err(error),
             Err(error) => {
                 reconnect_file_client(client, &error).await?;
                 let status = begin_upload_with_reconnect(client, begin).await?;
@@ -637,7 +637,7 @@ async fn begin_download_with_reconnect(
     loop {
         match client.begin_download(path.clone(), true).await {
             Ok(download) => return Ok(download),
-            Err(error) if is_server_error(&error) => return Err(error),
+            Err(error) if is_permanent_file_error(&error) => return Err(error),
             Err(error) => reconnect_file_client(client, &error).await?,
         }
     }
@@ -656,7 +656,7 @@ async fn read_chunk_with_reconnect(
     loop {
         match client.read_file_chunk(request.clone()).await {
             Ok(chunk) => return Ok((current, chunk)),
-            Err(error) if is_server_error(&error) => return Err(error),
+            Err(error) if is_permanent_file_error(&error) => return Err(error),
             Err(error) => {
                 reconnect_file_client(client, &error).await?;
                 let resumed = begin_download_with_reconnect(client, path.clone()).await?;
@@ -686,8 +686,9 @@ async fn reconnect_file_client(client: &mut AstraClient, error: &anyhow::Error) 
     }
 }
 
-fn is_server_error(error: &anyhow::Error) -> bool {
+fn is_permanent_file_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<ServerResponseError>().is_some()
+        || error.downcast_ref::<FilePayloadError>().is_some()
 }
 
 fn remote_path_bytes(path: &Path) -> Vec<u8> {
@@ -1421,6 +1422,21 @@ async fn wait_for_window_change(_source: &mut WindowChangeSource) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_file_payloads_are_not_retried_as_connection_failures() {
+        let payload = anyhow::Error::new(super::FilePayloadError {
+            message: "payload digest does not match".into(),
+        })
+        .context("downloading file");
+        assert!(super::is_permanent_file_error(&payload));
+        let server = anyhow::Error::new(super::ServerResponseError {
+            code: "checksum_mismatch".into(),
+            message: "invalid checksum".into(),
+        });
+        assert!(super::is_permanent_file_error(&server));
+        let network = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(!super::is_permanent_file_error(&network));
+    }
     use super::*;
 
     #[test]

@@ -17,6 +17,7 @@ pub const CAPABILITY_SEMANTIC_DIFF: &str = "terminal.semantic_diff";
 pub const CAPABILITY_CLIPBOARD_WRITE: &str = "terminal.clipboard_write";
 pub const CAPABILITY_SESSION_OBJECTS: &str = "session.objects";
 pub const CAPABILITY_INPUT_LEASE: &str = "terminal.input_lease";
+pub const CAPABILITY_PAYLOAD_ZSTD: &str = "payload.zstd";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityRange {
@@ -39,6 +40,11 @@ impl ProtocolSupport {
             minimum_version: MINIMUM_PROTOCOL_VERSION,
             maximum_version: PROTOCOL_VERSION,
             capabilities: vec![
+                CapabilityRange {
+                    name: CAPABILITY_PAYLOAD_ZSTD,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
                 CapabilityRange {
                     name: CAPABILITY_LEGACY_ANSI_SNAPSHOT,
                     minimum_version: 1,
@@ -94,11 +100,18 @@ impl ProtocolSupport {
         Self {
             minimum_version: MINIMUM_PROTOCOL_VERSION,
             maximum_version: PROTOCOL_VERSION,
-            capabilities: vec![CapabilityRange {
-                name: CAPABILITY_LEGACY_ANSI_SNAPSHOT,
-                minimum_version: 1,
-                maximum_version: 1,
-            }],
+            capabilities: vec![
+                CapabilityRange {
+                    name: CAPABILITY_LEGACY_ANSI_SNAPSHOT,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_PAYLOAD_ZSTD,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
+            ],
         }
     }
 
@@ -496,6 +509,40 @@ mod tests {
     use prost::Message;
 
     use super::*;
+
+    #[test]
+    fn zstd_is_selected_only_in_the_peer_intersection_and_worker_validates_it() {
+        let current = ProtocolSupport::runtime();
+        let mut old = current.clone();
+        old.capabilities
+            .retain(|cap| cap.name != CAPABILITY_PAYLOAD_ZSTD);
+        for client in [&old, &current, &ProtocolSupport::command_line_client()] {
+            for server in [&old, &current] {
+                let hello = client_hello("client", client);
+                let selected = negotiate_client_hello(&hello, server).unwrap();
+                let expected = client
+                    .capabilities
+                    .iter()
+                    .any(|cap| cap.name == CAPABILITY_PAYLOAD_ZSTD)
+                    && server
+                        .capabilities
+                        .iter()
+                        .any(|cap| cap.name == CAPABILITY_PAYLOAD_ZSTD);
+                assert_eq!(selected.has(CAPABILITY_PAYLOAD_ZSTD, 1), expected);
+                validate_worker_selection(selected.version, &selections(&selected), server)
+                    .unwrap();
+                validate_server_hello(
+                    &hello,
+                    &ServerHello {
+                        protocol_version: selected.version,
+                        capabilities: selections(&selected),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+        }
+    }
 
     #[test]
     fn new_peers_select_current_version_and_capability_intersection() {

@@ -17,12 +17,14 @@ use crate::{
     ALPN,
     accounts::{SystemAccount, authorized_key_files, effective_uid},
     auth::{authentication_payload, verify_authorized_key, verify_authorized_keys},
+    compression::{self, EncodedPayload, WorkClass},
     files::{FileResult, FileService},
     negotiation::{
         CAPABILITY_CLIPBOARD_WRITE, CAPABILITY_DATAGRAM_STATE, CAPABILITY_HISTORY_PAGING,
-        CAPABILITY_INPUT_LEASE, CAPABILITY_SEMANTIC_DIFF, CAPABILITY_SEMANTIC_STATE,
-        CAPABILITY_SESSION_OBJECTS, CAPABILITY_STATE_ACK, NegotiatedProtocol, ProtocolSupport,
-        negotiate_client_hello, selections, validate_worker_selection,
+        CAPABILITY_INPUT_LEASE, CAPABILITY_PAYLOAD_ZSTD, CAPABILITY_SEMANTIC_DIFF,
+        CAPABILITY_SEMANTIC_STATE, CAPABILITY_SESSION_OBJECTS, CAPABILITY_STATE_ACK,
+        NegotiatedProtocol, ProtocolSupport, negotiate_client_hello, selections,
+        validate_worker_selection,
     },
     process_lock::ProcessLock,
     protocol::{
@@ -828,6 +830,7 @@ where
         None
     };
     let session_objects = context.negotiated.has(CAPABILITY_SESSION_OBJECTS, 1);
+    let zstd = context.negotiated.has(CAPABILITY_PAYLOAD_ZSTD, 1);
     match request.command {
         Some(request::Command::List(_)) => {
             let terminals = manager.list_legacy_terminals();
@@ -995,7 +998,13 @@ where
         }
         Some(request::Command::WriteFileChunk(chunk)) => {
             let service = files.clone();
-            let result = tokio::task::spawn_blocking(move || service.write_chunk(chunk)).await?;
+            let result = compression::run(WorkClass::File, move || {
+                let chunk = compression::decode_upload(chunk, zstd).map_err(|error| {
+                    crate::files::FileServiceError::new("invalid", error.to_string())
+                });
+                Ok(chunk.and_then(|chunk| service.write_chunk(chunk)))
+            })
+            .await?;
             send_file_result(
                 &mut send,
                 request_id,
@@ -1056,7 +1065,14 @@ where
         }
         Some(request::Command::ReadFileChunk(chunk)) => {
             let service = files.clone();
-            let result = tokio::task::spawn_blocking(move || service.read_chunk(chunk)).await?;
+            let result = compression::run(WorkClass::File, move || {
+                Ok(service.read_chunk(chunk).and_then(|chunk| {
+                    compression::encode_download(chunk, zstd).map_err(|error| {
+                        crate::files::FileServiceError::new("invalid", error.to_string())
+                    })
+                }))
+            })
+            .await?;
             send_file_result(&mut send, request_id, result, response::Result::FileChunk).await?;
         }
         Some(request::Command::MakeDirectory(directory)) => {
@@ -1324,6 +1340,7 @@ where
     attachment.set_state(crate::protocol::AttachmentState::Snapshotting)?;
     let attachment_info = attachment.info();
     let semantic = negotiated.has(CAPABILITY_SEMANTIC_STATE, 2);
+    let zstd = negotiated.has(CAPABILITY_PAYLOAD_ZSTD, 1);
     let session_objects = negotiated.has(CAPABILITY_SESSION_OBJECTS, 1);
     let history_paging = semantic && negotiated.has(CAPABILITY_HISTORY_PAGING, 1);
     let clipboard_write = semantic && negotiated.has(CAPABILITY_CLIPBOARD_WRITE, 1);
@@ -1374,7 +1391,7 @@ where
     )
     .await?;
     if let Some(state) = initial_state {
-        write_terminal_state(&mut send, &info.id, &attachment_info.id, &state).await?;
+        write_terminal_state(&mut send, &info.id, &attachment_info.id, &state, zstd).await?;
         if datagram_state {
             streaming_sync = Some(StreamingStateWindow::with_route(
                 state,
@@ -1488,6 +1505,7 @@ where
                                                 &info.id,
                                                 &attachment_info.id,
                                                 &state,
+                                                zstd,
                                             ).await?;
                                         }
                                     }
@@ -1502,6 +1520,7 @@ where
                                         &info.id,
                                         &attachment_info.id,
                                         &page,
+                                        zstd,
                                     ).await?;
                                 }
                                 Some(terminal_command::Command::LeaseControl(control)) => {
@@ -1575,6 +1594,7 @@ where
                                         &info.id,
                                         &attachment_info.id,
                                         &update,
+                                        zstd,
                                     ).await?;
                                     last_state_sent = tokio::time::Instant::now();
                                     last_streaming_rekey = last_state_sent;
@@ -1634,6 +1654,7 @@ where
                                 &info.id,
                                 &attachment_info.id,
                                 &update,
+                                zstd,
                             ).await?;
                             last_state_sent = tokio::time::Instant::now();
                             if matches!(update, StreamingUpdate::ReliableKeyframe(_)) {
@@ -1648,6 +1669,7 @@ where
                                 &info.id,
                                 &attachment_info.id,
                                 &update,
+                                zstd,
                             ).await?;
                             last_state_sent = tokio::time::Instant::now();
                         }
@@ -1665,6 +1687,7 @@ where
                             &info.id,
                             &attachment_info.id,
                             &update,
+                            zstd,
                         ).await?;
                         last_state_sent = tokio::time::Instant::now();
                         if matches!(update, StreamingUpdate::ReliableKeyframe(_)) {
@@ -1684,6 +1707,7 @@ where
                             &info.id,
                             &attachment_info.id,
                             &update,
+                            zstd,
                         ).await?;
                         last_state_sent = tokio::time::Instant::now();
                         last_streaming_rekey = last_state_sent;
@@ -1704,6 +1728,7 @@ where
                                         &info.id,
                                         &attachment_info.id,
                                         &state,
+                                        zstd,
                                     ).await?;
                                 }
                             } else {
@@ -1731,6 +1756,7 @@ where
                                     &info.id,
                                     &attachment_info.id,
                                     &state,
+                                    zstd,
                                 ).await?;
                             }
                             write_terminal_event(
@@ -1798,6 +1824,7 @@ where
                                     &info.id,
                                     &attachment_info.id,
                                     &state,
+                                    zstd,
                                 ).await?;
                             } else if !semantic {
                                 let (snapshot, replacement) = terminal.snapshot_and_subscribe()?;
@@ -1926,13 +1953,15 @@ where
     .await
 }
 
-fn terminal_state_chunks(state: &State) -> Result<Vec<TerminalStateChunk>> {
+fn terminal_state_chunks(state: &State, zstd: bool) -> Result<Vec<TerminalStateChunk>> {
     let encoded = state.encode_to_vec();
     if encoded.len() > MAX_ENCODED_STATE_BYTES {
         bail!("terminal state exceeds the semantic state transport limit")
     }
     let transfer_id = uuid::Uuid::new_v4().as_bytes().to_vec();
     let digest = Sha256::digest(&encoded).to_vec();
+    let payload = EncodedPayload::encode(encoded, zstd, MAX_ENCODED_STATE_BYTES)?;
+    let encoded = payload.data;
     let chunk_count = encoded.len().max(1).div_ceil(TERMINAL_STATE_CHUNK_BYTES);
     let total_size = u32::try_from(encoded.len())?;
     let chunk_count = u32::try_from(chunk_count)?;
@@ -1947,6 +1976,8 @@ fn terminal_state_chunks(state: &State) -> Result<Vec<TerminalStateChunk>> {
             total_size,
             sha256: digest.clone(),
             data: encoded[start..end].to_vec(),
+            encoding: payload.encoding,
+            uncompressed_size: payload.uncompressed_size,
         });
     }
     Ok(chunks)
@@ -1978,13 +2009,15 @@ fn terminal_state_diff_chunks(diff: &TerminalStateDiff) -> Result<Vec<TerminalSt
     Ok(chunks)
 }
 
-fn history_page_chunks(page: &HistoryPage) -> Result<Vec<HistoryPageChunk>> {
+fn history_page_chunks(page: &HistoryPage, zstd: bool) -> Result<Vec<HistoryPageChunk>> {
     let encoded = page.encode_to_vec();
     if encoded.len() > MAX_ENCODED_HISTORY_PAGE_BYTES {
         bail!("terminal history page exceeds the transport limit")
     }
     let transfer_id = uuid::Uuid::new_v4().as_bytes().to_vec();
     let digest = Sha256::digest(&encoded).to_vec();
+    let payload = EncodedPayload::encode(encoded, zstd, MAX_ENCODED_HISTORY_PAGE_BYTES)?;
+    let encoded = payload.data;
     let chunk_count = encoded.len().max(1).div_ceil(TERMINAL_STATE_CHUNK_BYTES);
     let total_size = u32::try_from(encoded.len())?;
     let chunk_count = u32::try_from(chunk_count)?;
@@ -1999,6 +2032,8 @@ fn history_page_chunks(page: &HistoryPage) -> Result<Vec<HistoryPageChunk>> {
             total_size,
             sha256: digest.clone(),
             data: encoded[start..end].to_vec(),
+            encoding: payload.encoding,
+            uncompressed_size: payload.uncompressed_size,
         });
     }
     Ok(chunks)
@@ -2009,11 +2044,17 @@ async fn write_terminal_state<W>(
     terminal_id: &str,
     attachment_id: &str,
     state: &State,
+    zstd: bool,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    for chunk in terminal_state_chunks(state)? {
+    let state = state.clone();
+    let chunks = compression::run(WorkClass::Terminal, move || {
+        terminal_state_chunks(&state, zstd)
+    })
+    .await?;
+    for chunk in chunks {
         write_terminal_event(
             send,
             terminal_id,
@@ -2051,13 +2092,14 @@ async fn write_prepared_state_update<W>(
     terminal_id: &str,
     attachment_id: &str,
     update: &PreparedStateUpdate,
+    zstd: bool,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     match update {
         PreparedStateUpdate::Snapshot(state) => {
-            write_terminal_state(send, terminal_id, attachment_id, state).await
+            write_terminal_state(send, terminal_id, attachment_id, state, zstd).await
         }
         PreparedStateUpdate::Diff(diff) => {
             write_terminal_state_diff(send, terminal_id, attachment_id, diff).await
@@ -2071,13 +2113,14 @@ async fn write_streaming_update<W>(
     terminal_id: &str,
     attachment_id: &str,
     update: &StreamingUpdate,
+    zstd: bool,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     match update {
         StreamingUpdate::ReliableKeyframe(state) => {
-            write_terminal_state(send, terminal_id, attachment_id, state).await
+            write_terminal_state(send, terminal_id, attachment_id, state, zstd).await
         }
         StreamingUpdate::DatagramDelta(datagram) => match transport {
             TerminalDatagramTransport::Direct(connection) => {
@@ -2130,11 +2173,17 @@ async fn write_history_page<W>(
     terminal_id: &str,
     attachment_id: &str,
     page: &HistoryPage,
+    zstd: bool,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    for chunk in history_page_chunks(page)? {
+    let page = page.clone();
+    let chunks = compression::run(WorkClass::Terminal, move || {
+        history_page_chunks(&page, zstd)
+    })
+    .await?;
+    for chunk in chunks {
         write_terminal_event(
             send,
             terminal_id,
@@ -2316,7 +2365,7 @@ mod tests {
         let mut state = engine.semantic_state().unwrap();
         state.title = "x".repeat(TERMINAL_STATE_CHUNK_BYTES + 1);
         let encoded = state.encode_to_vec();
-        let chunks = terminal_state_chunks(&state).unwrap();
+        let chunks = terminal_state_chunks(&state, false).unwrap();
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].chunk_index, 0);
         assert_eq!(chunks[1].chunk_index, 1);
@@ -2324,6 +2373,93 @@ mod tests {
         assert_eq!(chunks[0].transfer_id, chunks[1].transfer_id);
         assert_eq!(chunks[0].sha256, Sha256::digest(&encoded).to_vec());
         assert_eq!(chunks.concat_data(), encoded);
+    }
+
+    #[test]
+    fn compressed_keyframe_is_atomic_independent_and_legacy_fallback_is_raw() {
+        use crate::terminal_streaming::TerminalStateAssembler;
+        let mut engine = TerminalEngine::new(50, 200, 128, Box::new(std::io::sink())).unwrap();
+        for row in 0..50 {
+            engine.advance(format!("\x1b[{};1H{}", row + 1, "x".repeat(199)).as_bytes());
+        }
+        let state = engine.semantic_viewport().unwrap();
+        let raw = state.encode_to_vec();
+        let legacy = terminal_state_chunks(&state, false).unwrap();
+        assert!(
+            legacy
+                .iter()
+                .all(|chunk| chunk.encoding == 0 && chunk.uncompressed_size == 0)
+        );
+        assert_eq!(legacy.concat_data(), raw);
+
+        let chunks = terminal_state_chunks(&state, true).unwrap();
+        let first = &chunks[0];
+        assert_eq!(first.encoding, 1);
+        assert_eq!(first.uncompressed_size as usize, raw.len());
+        let encoded = chunks.concat_data();
+        assert!(encoded.len() < raw.len() / 5);
+        assert_eq!(first.total_size as usize, encoded.len());
+        assert_eq!(first.sha256, Sha256::digest(&raw).to_vec());
+        assert!(
+            TerminalStateAssembler::default()
+                .push(first.clone())
+                .is_err()
+        );
+
+        // A single zstd frame can cross reliable fragment boundaries. Changing
+        // any compression metadata mid-transfer must not publish partial state.
+        let mut assembler = TerminalStateAssembler::with_zstd(true);
+        let mut changed = TerminalStateAssembler::with_zstd(true);
+        let count = encoded.len().div_ceil(37) as u32;
+        let mut completed = None;
+        for (index, bytes) in encoded.chunks(37).enumerate() {
+            let chunk = TerminalStateChunk {
+                chunk_index: index as u32,
+                chunk_count: count,
+                data: bytes.to_vec(),
+                ..first.clone()
+            };
+            if index == 0 {
+                changed.push(chunk.clone()).unwrap();
+            } else if index == 1 {
+                let mut invalid = chunk.clone();
+                invalid.uncompressed_size -= 1;
+                assert!(changed.push(invalid).is_err());
+            }
+            let result = assembler.push(chunk).unwrap();
+            assert_eq!(result.is_some(), index + 1 == count as usize);
+            completed = result.or(completed);
+        }
+        assert_eq!(completed, Some(state));
+    }
+
+    #[test]
+    fn compressed_history_page_round_trips_without_other_pages() {
+        use crate::terminal_streaming::HistoryPageAssembler;
+        let mut engine = TerminalEngine::new(24, 80, 512, Box::new(std::io::sink())).unwrap();
+        for row in 0..150 {
+            engine.advance(format!("line {row:03} {}\r\n", "x".repeat(60)).as_bytes());
+        }
+        let state = engine.semantic_state().unwrap();
+        let page = engine
+            .history_page(
+                1,
+                &crate::terminal_state_v2::HistoryPageRequest {
+                    epoch: state.epoch,
+                    before: state.primary.unwrap().newest_available,
+                    maximum_rows: 100,
+                },
+            )
+            .unwrap();
+        let chunks = history_page_chunks(&page, true).unwrap();
+        assert_eq!(chunks[0].encoding, 1);
+        assert!(chunks.concat_data().len() < page.encoded_len() / 2);
+        let mut assembler = HistoryPageAssembler::with_zstd(true);
+        let mut completed = None;
+        for chunk in chunks {
+            completed = assembler.push(chunk).unwrap().or(completed);
+        }
+        assert_eq!(completed, Some(page));
     }
 
     #[test]
@@ -2345,7 +2481,7 @@ mod tests {
         };
         let page = engine.history_page(1, &request).unwrap();
         let encoded = page.encode_to_vec();
-        let chunks = history_page_chunks(&page).unwrap();
+        let chunks = history_page_chunks(&page, false).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].transfer_id.len(), 16);
         assert_eq!(chunks[0].sha256, Sha256::digest(&encoded).to_vec());

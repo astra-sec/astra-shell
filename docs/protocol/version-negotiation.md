@@ -20,6 +20,7 @@
 
 | 名称 | v1 语义 | 当前 runtime 是否 offer | 开启条件 |
 |---|---|---|---|
+| `payload.zstd` | 关键帧、历史页和文件块的独立 zstd frame；原文回退 | 是（Rust runtime/CLI v1；Swift 尚未 offer） | 双方协商后才可发送；不依赖终端 renderer 能力，详见 `payload-compression-v1.md` |
 | `terminal.legacy_ansi_snapshot` | 旧 `TerminalSnapshot` + ANSI replay | 是 | 迁移期保留 |
 | `terminal.semantic_state` | 可靠分片传输的 `astra.terminal.v2.State`；禁止混发 raw PTY | 是（Apple client/server v2） | `TERM-03`、`TERM-04` 已完成；CLI 未实现 replica，因此只 offer legacy capability |
 | `terminal.clipboard_write` | semantic attachment 上的 OSC 52 单向、受限剪贴板写事件；不包含读取 | 是（Apple client/server v1） | 必须同时选择 `terminal.semantic_state` v2；CLI 不 offer |
@@ -41,6 +42,8 @@ semantic attachment 的 `AttachResponse` 不携带 legacy snapshot。服务端�
 同时选择 `terminal.datagram_state` v2 后改用 latest-state-wins live data plane：初始 viewport keyframe 仍可靠分片；验证并原子提交后 ACK，此后无需等待逐代 ACK，可每 16 ms 从 retained base 生成最新 cumulative datagram。稀疏行与 cell splice 减少 MTU 压力；100 ms quiet-tail retry 覆盖尾包丢失，1 s re-key 和显式 repair 覆盖缺失 base。超 MTU 或 epoch/尺寸变化可立即发 keyframe，但最多一份未 ACK keyframe，期间只保留最新 pending。每包携带 Terminal/Attachment ID，多个 shell 复用一条 QUIC 连接。详细定义见 `terminal-datagram-state-v2.md`。
 
 history paging 只在 semantic v2 同时选择时生效。`HistoryPageRequest` 和 `HistoryPageChunk` 是 appended oneof；未选择能力的 N-1 decoder 会忽略它们。每页最多 512 rows/4 MiB，仍以可靠 512 KiB chunks 和整页 SHA-256 原子发布。
+
+同时选择 `payload.zstd` v1 时，State/Page 可以在分片前独立压缩；total_size 表示压缩后传输长度，新增 uncompressed_size 表示原始长度，SHA-256 仍针对原文。接收端先执行有界解压再进入原来的校验流程。不选择该能力时新增字段为零、data 仍为原文。见 `payload-compression-v1.md`。
 
 session objects 的 Workspace RPC 也是 appended oneof，所有资源身份字段只追加 tag。N-1 客户端映射到同一 SessionManager 的默认 Workspace；新客户端只在 capability 被选择后发送正式 RPC。详细边界见 `session-objects-v1.md`。
 

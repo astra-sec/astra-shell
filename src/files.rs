@@ -51,7 +51,7 @@ pub struct FileServiceError {
 }
 
 impl FileServiceError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -585,6 +585,12 @@ impl FileService {
     }
 
     pub fn write_chunk(&self, request: WriteFileChunkRequest) -> FileResult<UploadStatusResponse> {
+        if request.encoding != 0 || request.uncompressed_size != 0 {
+            return Err(FileServiceError::new(
+                "invalid",
+                "file service requires decoded raw bytes",
+            ));
+        }
         validate_transfer_id(&request.transfer_id)?;
         validate_digest(&request.sha256, false)?;
         if request.data.is_empty() {
@@ -853,6 +859,8 @@ impl FileService {
             sha256: Sha256::digest(&data).to_vec(),
             data,
             eof,
+            encoding: 0,
+            uncompressed_size: 0,
         })
     }
 
@@ -1326,6 +1334,8 @@ mod tests {
             offset: 0,
             data: first.to_vec(),
             sha256: digest(first),
+            encoding: 0,
+            uncompressed_size: 0,
         };
         assert_eq!(
             service
@@ -1342,6 +1352,8 @@ mod tests {
                 offset: 10,
                 data: remainder.to_vec(),
                 sha256: digest(remainder),
+                encoding: 0,
+                uncompressed_size: 0,
             })
             .unwrap();
         let committed = service.commit_upload(&transfer_id).unwrap();
@@ -1374,6 +1386,8 @@ mod tests {
                 offset: 0,
                 data: contents[..8].to_vec(),
                 sha256: digest(&contents[..8]),
+                encoding: 0,
+                uncompressed_size: 0,
             })
             .unwrap();
         drop(service);
@@ -1387,6 +1401,8 @@ mod tests {
                 offset: 8,
                 data: contents[8..].to_vec(),
                 sha256: digest(&contents[8..]),
+                encoding: 0,
+                uncompressed_size: 0,
             })
             .unwrap();
         assert_eq!(
