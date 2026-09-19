@@ -302,27 +302,34 @@ async fn run() -> Result<()> {
             }
         }
         Some(Command::Attach(arguments)) => {
+            let terminal_id = resolve_terminal_uuid(&client, &arguments.terminal_id).await?;
             if cli.streaming {
                 attach_streaming_terminal(
                     client,
                     workspace_id,
-                    arguments.terminal_id,
+                    terminal_id,
                     arguments.read_only,
                     arguments.takeover,
                 )
                 .await?;
                 return Ok(());
             }
-            attach_terminal(
-                client,
-                arguments.terminal_id,
-                arguments.read_only,
-                arguments.takeover,
-            )
-            .await?;
+            attach_terminal(client, terminal_id, arguments.read_only, arguments.takeover).await?;
         }
         Some(Command::Close { terminal_id }) => {
-            println!("{}", client.close(terminal_id).await?)
+            let terminal_id = resolve_terminal_uuid(&client, &terminal_id).await?;
+            if cli.streaming {
+                // Formal session-object peers require the workspace alongside
+                // the canonical terminal UUID.
+                println!(
+                    "{}",
+                    client
+                        .close_in_workspace(workspace_id, terminal_id)
+                        .await?
+                )
+            } else {
+                println!("{}", client.close(terminal_id).await?)
+            }
         }
         Some(Command::Files(arguments)) => run_file_command(client, arguments.command).await?,
     }
@@ -1245,6 +1252,39 @@ fn terminal_reference(terminal: &astra_shell::protocol::TerminalInfo) -> String 
     }
 }
 
+/// Formal session-object peers require the canonical terminal UUID, while the
+/// CLI documents both the short display ID and the UUID. Resolve one into the
+/// other through the terminal list; legacy peers that still accept display
+/// IDs pass the selector through unchanged.
+async fn resolve_terminal_uuid(client: &AstraClient, selector: &str) -> Result<String> {
+    if !client
+        .negotiated_protocol()
+        .has(astra_shell::negotiation::CAPABILITY_SESSION_OBJECTS, 1)
+    {
+        return Ok(selector.to_owned());
+    }
+    let terminals = client.list().await?;
+    resolve_terminal_reference(&terminals, selector)
+}
+
+fn resolve_terminal_reference(
+    terminals: &[astra_shell::protocol::TerminalInfo],
+    selector: &str,
+) -> Result<String> {
+    if is_canonical_uuid(selector) {
+        return Ok(selector.to_owned());
+    }
+    terminals
+        .iter()
+        .find(|terminal| terminal_reference(terminal) == selector)
+        .map(|terminal| terminal.id.clone())
+        .with_context(|| format!("no active terminal matches reference {selector:?}"))
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value)
+}
+
 fn default_username() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
@@ -1493,5 +1533,37 @@ mod tests {
     #[test]
     fn uses_generated_certificate_name_for_ip_destinations() {
         assert_eq!(inferred_server_name("203.0.113.7"), "astra.local");
+    }
+
+    #[test]
+    fn display_id_references_resolve_to_canonical_uuids() {
+        let terminal = astra_shell::protocol::TerminalInfo {
+            id: "8be2756e-f2b0-43df-9d49-69e2ccb342c5".into(),
+            display_id: 7,
+            ..Default::default()
+        };
+        // The short display ID printed by `new` and `list` resolves to the UUID
+        // required by formal session-object commands.
+        assert_eq!(
+            resolve_terminal_reference(std::slice::from_ref(&terminal), "7").unwrap(),
+            terminal.id
+        );
+        // A canonical UUID passes through without depending on the list.
+        assert_eq!(
+            resolve_terminal_reference(&[], &terminal.id).unwrap(),
+            terminal.id
+        );
+        // Legacy servers without display IDs use the UUID as the reference.
+        let legacy = astra_shell::protocol::TerminalInfo {
+            id: terminal.id.clone(),
+            display_id: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_terminal_reference(&[legacy], &terminal.id).unwrap(),
+            terminal.id
+        );
+        // Unknown references fail instead of attaching the wrong terminal.
+        assert!(resolve_terminal_reference(&[terminal], "999").is_err());
     }
 }
