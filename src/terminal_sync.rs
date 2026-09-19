@@ -139,19 +139,7 @@ pub(crate) fn terminal_state_diff(base: &State, target: &State) -> Result<Termin
         .as_ref()
         .context("target alternate screen is missing")?;
 
-    let mut metadata = target.clone();
-    metadata
-        .primary
-        .as_mut()
-        .expect("validated state has primary screen")
-        .included_rows
-        .clear();
-    metadata
-        .alternate
-        .as_mut()
-        .expect("validated state has alternate screen")
-        .included_rows
-        .clear();
+    let metadata = state_metadata(target);
 
     Ok(TerminalStateDiff {
         epoch: target.epoch.clone(),
@@ -161,6 +149,43 @@ pub(crate) fn terminal_state_diff(base: &State, target: &State) -> Result<Termin
         primary_rows: diff_rows(base_primary, target_primary)?,
         alternate_rows: diff_rows(base_alternate, target_alternate)?,
     })
+}
+
+/// Construct metadata without cloning then discarding every cell in both screens.
+pub(crate) fn state_metadata(state: &State) -> State {
+    fn screen_metadata(screen: &Screen) -> Screen {
+        Screen {
+            included_rows: Vec::new(),
+            viewport_start: screen.viewport_start,
+            cursor: screen.cursor.clone(),
+            saved_cursor: screen.saved_cursor.clone(),
+            oldest_available: screen.oldest_available.clone(),
+            newest_available: screen.newest_available.clone(),
+            included_start: screen.included_start.clone(),
+            included_end: screen.included_end.clone(),
+            scroll_margin_top: screen.scroll_margin_top,
+            scroll_margin_bottom: screen.scroll_margin_bottom,
+            scroll_margin_left: screen.scroll_margin_left,
+            scroll_margin_right: screen.scroll_margin_right,
+            tab_stops: screen.tab_stops.clone(),
+        }
+    }
+    State {
+        schema_version: state.schema_version,
+        epoch: state.epoch.clone(),
+        generation: state.generation,
+        rows: state.rows,
+        cols: state.cols,
+        primary: state.primary.as_ref().map(screen_metadata),
+        alternate: state.alternate.as_ref().map(screen_metadata),
+        active_screen: state.active_screen,
+        styles: state.styles.clone(),
+        hyperlinks: state.hyperlinks.clone(),
+        modes: state.modes.clone(),
+        title: state.title.clone(),
+        working_directory: state.working_directory.clone(),
+        palette: state.palette.clone(),
+    }
 }
 
 #[allow(dead_code)]

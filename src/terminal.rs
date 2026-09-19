@@ -153,6 +153,21 @@ impl Terminal {
             .semantic_state()
     }
 
+    pub fn semantic_viewport_and_subscribe(
+        &self,
+    ) -> Result<(State, broadcast::Receiver<PtyEvent>)> {
+        let mut engine = self.engine.lock().expect("terminal engine poisoned");
+        let receiver = self.events.subscribe();
+        Ok((engine.semantic_viewport()?, receiver))
+    }
+
+    pub fn semantic_viewport(&self) -> Result<State> {
+        self.engine
+            .lock()
+            .expect("terminal engine poisoned")
+            .semantic_viewport()
+    }
+
     pub fn history_page(
         &self,
         request_id: u64,

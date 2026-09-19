@@ -79,6 +79,7 @@ pub struct TerminalEngine {
     epoch: [u8; 16],
     identity_epoch: (u64, u64),
     epoch_sequence_start: u64,
+    cached_viewport: Option<State>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,10 +143,12 @@ impl TerminalEngine {
             epoch: *Uuid::new_v4().as_bytes(),
             identity_epoch,
             epoch_sequence_start,
+            cached_viewport: None,
         })
     }
 
     pub fn advance(&mut self, bytes: &[u8]) {
+        self.cached_viewport = None;
         self.terminal.advance_bytes(bytes);
     }
 
@@ -160,6 +163,7 @@ impl TerminalEngine {
         pixel_width: u32,
         pixel_height: u32,
     ) -> Result<()> {
+        self.cached_viewport = None;
         ensure!(
             (1..=terminal_state_v2::MAX_DIMENSION).contains(&rows)
                 && (1..=terminal_state_v2::MAX_DIMENSION).contains(&columns),
@@ -180,6 +184,21 @@ impl TerminalEngine {
     }
 
     pub fn semantic_state(&mut self) -> Result<State> {
+        self.export_state(false)
+    }
+
+    /// Live updates never traverse or construct scrollback. History is exported
+    /// only by the legacy snapshot or explicit history-page paths.
+    pub fn semantic_viewport(&mut self) -> Result<State> {
+        if let Some(state) = &self.cached_viewport {
+            return Ok(state.clone());
+        }
+        let state = self.export_state(true)?;
+        self.cached_viewport = Some(state.clone());
+        Ok(state)
+    }
+
+    fn export_state(&mut self, viewport_only: bool) -> Result<State> {
         self.refresh_identity_epoch();
         let view = self.terminal.astra_view();
         validate_authoritative_screens(&view, self.history_limits)?;
@@ -190,7 +209,11 @@ impl TerminalEngine {
             alternate_row_count <= terminal_state_v2::MAX_INCLUDED_ROWS,
             "alternate screen exceeds terminal state row budget"
         );
-        let primary_row_budget = terminal_state_v2::MAX_INCLUDED_ROWS - alternate_row_count;
+        let primary_row_budget = if viewport_only {
+            view.rows()
+        } else {
+            terminal_state_v2::MAX_INCLUDED_ROWS - alternate_row_count
+        };
         let primary = export_screen(
             &view.primary,
             primary_row_budget,
@@ -420,13 +443,70 @@ fn generation(
 }
 
 fn render_legacy_screen(state: &State, screen: &Screen) -> Vec<u8> {
+    render_screen(state, screen, None, true)
+}
+
+/// ANSI is only the local display backend here, never the network data plane.
+/// Compares actual visible cells; a row identity/version change alone does not
+/// redraw text. Painting happens with origin/margins/wrapping disabled.
+#[derive(Default)]
+pub struct ViewportRenderer {
+    previous: Option<State>,
+}
+
+impl ViewportRenderer {
+    pub fn render(&mut self, state: &State) -> Result<Vec<u8>> {
+        terminal_state_v2::validate(state)?;
+        let screen = if state.active_screen == ScreenKind::Alternate as i32 {
+            &state.alternate
+        } else {
+            &state.primary
+        };
+        let screen = screen.as_ref().context("active viewport missing")?;
+        let previous = self.previous.as_ref().filter(|old| {
+            old.rows == state.rows
+                && old.cols == state.cols
+                && old.active_screen == state.active_screen
+        });
+        let previous = previous.and_then(|old| {
+            let screen = if old.active_screen == ScreenKind::Alternate as i32 {
+                &old.alternate
+            } else {
+                &old.primary
+            };
+            screen.as_ref().map(|screen| (old, screen))
+        });
+        let output = render_screen(state, screen, previous, false);
+        self.previous = Some(state.clone());
+        Ok(output)
+    }
+
+    pub fn invalidate(&mut self) {
+        self.previous = None;
+    }
+}
+
+fn render_screen(
+    state: &State,
+    screen: &Screen,
+    previous: Option<(&State, &Screen)>,
+    restore_output_modes: bool,
+) -> Vec<u8> {
     let styles: BTreeMap<_, _> = state.styles.iter().map(|style| (style.id, style)).collect();
     let hyperlinks: BTreeMap<_, _> = state
         .hyperlinks
         .iter()
         .map(|link| (link.id, link))
         .collect();
-    let mut output = b"\x1b[2J\x1b[H".to_vec();
+    let mut output = if restore_output_modes {
+        b"\x1b[2J\x1b[H".to_vec()
+    } else {
+        Vec::new()
+    };
+    output.extend_from_slice(b"\x1b[?25l\x1b[?6l\x1b[?69l\x1b[r\x1b[?7l\x1b[4l\x1b[0m");
+    if previous.is_none() && !restore_output_modes {
+        output.extend_from_slice(b"\x1b[2J\x1b[H");
+    }
     let start = screen.viewport_start as usize;
     for (row_index, row) in screen
         .included_rows
@@ -435,6 +515,18 @@ fn render_legacy_screen(state: &State, screen: &Screen) -> Vec<u8> {
         .take(state.rows as usize)
         .enumerate()
     {
+        if previous.is_some_and(|(old, old_screen)| {
+            old.styles == state.styles
+                && old.hyperlinks == state.hyperlinks
+                && old.palette == state.palette
+                && old_screen
+                    .included_rows
+                    .get(old_screen.viewport_start as usize + row_index)
+                    .is_some_and(|old_row| old_row.cells == row.cells)
+        }) {
+            continue;
+        }
+        output.extend_from_slice(format!("\x1b[{};1H\x1b[0m\x1b[2K", row_index + 1).as_bytes());
         for cell in &row.cells {
             output.extend_from_slice(
                 format!("\x1b[{};{}H", row_index + 1, cell.column + 1).as_bytes(),
@@ -443,7 +535,10 @@ fn render_legacy_screen(state: &State, screen: &Screen) -> Vec<u8> {
             if let Some(style) = styles.get(&cell.style_id) {
                 output.extend_from_slice(legacy_sgr(style).as_bytes());
             }
-            if let Some(link) = hyperlinks.get(&cell.hyperlink_id) {
+            if let Some(link) = hyperlinks.get(&cell.hyperlink_id).filter(|link| {
+                !link.uri.chars().any(char::is_control)
+                    && !link.explicit_id.chars().any(char::is_control)
+            }) {
                 output.extend_from_slice(b"\x1b]8;");
                 if !link.explicit_id.is_empty() {
                     output.extend_from_slice(b"id=");
@@ -453,7 +548,9 @@ fn render_legacy_screen(state: &State, screen: &Screen) -> Vec<u8> {
                 output.extend_from_slice(link.uri.as_bytes());
                 output.extend_from_slice(b"\x1b\\");
             }
-            output.extend_from_slice(cell.grapheme.as_bytes());
+            if !cell.grapheme.chars().any(char::is_control) {
+                output.extend_from_slice(cell.grapheme.as_bytes());
+            }
             if cell.hyperlink_id != 0 {
                 output.extend_from_slice(b"\x1b]8;;\x1b\\");
             }
@@ -461,6 +558,12 @@ fn render_legacy_screen(state: &State, screen: &Screen) -> Vec<u8> {
     }
     output.extend_from_slice(b"\x1b[0m");
     if let Some(cursor) = &screen.cursor {
+        let shape = match CursorShape::try_from(cursor.shape).unwrap_or(CursorShape::Block) {
+            CursorShape::Bar => 5,
+            CursorShape::Underline => 3,
+            _ => 1,
+        };
+        output.extend_from_slice(format!("\x1b[{shape} q").as_bytes());
         output.extend_from_slice(format!("\x1b[{};{}H", cursor.y + 1, cursor.x + 1).as_bytes());
         output.extend_from_slice(if cursor.visible {
             b"\x1b[?25h"
@@ -469,12 +572,19 @@ fn render_legacy_screen(state: &State, screen: &Screen) -> Vec<u8> {
         });
     }
     if let Some(modes) = &state.modes {
+        // Reset previous mouse modes before selecting the new encoding. A TUI
+        // disabling mouse tracking must give scrolling back to the terminal.
+        for mode in [9, 1000, 1002, 1003, 1005, 1006, 1016] {
+            legacy_mode(&mut output, mode, false);
+        }
         legacy_mode(&mut output, 1, modes.application_cursor_keys);
         legacy_mode(&mut output, 5, modes.reverse_video);
-        legacy_mode(&mut output, 6, modes.origin);
-        legacy_mode(&mut output, 7, modes.auto_wrap);
-        legacy_mode(&mut output, 45, modes.reverse_wraparound);
-        legacy_mode(&mut output, 69, modes.left_right_margin);
+        if restore_output_modes {
+            legacy_mode(&mut output, 6, modes.origin);
+            legacy_mode(&mut output, 7, modes.auto_wrap);
+            legacy_mode(&mut output, 45, modes.reverse_wraparound);
+            legacy_mode(&mut output, 69, modes.left_right_margin);
+        }
         legacy_mode(&mut output, 1004, modes.focus_tracking);
         legacy_mode(&mut output, 1007, modes.alternate_scroll);
         legacy_mode(&mut output, 2004, modes.bracketed_paste);
@@ -496,6 +606,14 @@ fn render_legacy_screen(state: &State, screen: &Screen) -> Vec<u8> {
         } else {
             b"\x1b>"
         });
+        match KeyboardEncoding::try_from(modes.keyboard_encoding).unwrap_or(KeyboardEncoding::Xterm)
+        {
+            KeyboardEncoding::Kitty => {
+                output.extend_from_slice(format!("\x1b[={}u", modes.keyboard_flags).as_bytes())
+            }
+            KeyboardEncoding::CsiU => output.extend_from_slice(b"\x1b[=1u"),
+            KeyboardEncoding::Xterm => output.extend_from_slice(b"\x1b[=0u"),
+        }
     }
     output
 }
@@ -979,6 +1097,59 @@ mod tests {
     use crate::resources::ResourcePolicy;
 
     use super::*;
+
+    #[test]
+    fn streaming_renderer_preserves_grid_and_cursor_across_tui_modes() {
+        let mut remote = TerminalEngine::new(8, 40, 128, Box::new(std::io::sink())).unwrap();
+        let mut display = TerminalEngine::new(8, 40, 128, Box::new(std::io::sink())).unwrap();
+        let mut renderer = ViewportRenderer::default();
+        for commands in [
+            "first\r\nsecond\r\nthird",
+            "\x1b[3;6r\x1b[?6h\x1b[2;4H界",
+            "\x1b[?6l\x1b[r\x1b[1;1Hnew",
+            "\x1b[?1049h\x1b[2;3Halternate",
+            "\x1b[?1049l",
+        ] {
+            remote.advance(commands.as_bytes());
+            let state = remote.semantic_viewport().unwrap();
+            let bytes = renderer.render(&state).unwrap();
+            display.advance(&bytes);
+            let actual = display.semantic_viewport().unwrap();
+            let expected = if state.active_screen == ScreenKind::Alternate as i32 {
+                state.alternate.as_ref().unwrap()
+            } else {
+                state.primary.as_ref().unwrap()
+            };
+            let actual = actual.primary.as_ref().unwrap();
+            let cells = |screen: &Screen| {
+                screen
+                    .included_rows
+                    .iter()
+                    .map(|row| {
+                        row.cells
+                            .iter()
+                            .map(|cell| (cell.column, cell.grapheme.clone(), cell.width))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(cells(actual), cells(expected));
+            assert_eq!(
+                (
+                    actual.cursor.as_ref().unwrap().x,
+                    actual.cursor.as_ref().unwrap().y
+                ),
+                (
+                    expected.cursor.as_ref().unwrap().x,
+                    expected.cursor.as_ref().unwrap().y
+                )
+            );
+        }
+        let unchanged = renderer
+            .render(&remote.semantic_viewport().unwrap())
+            .unwrap();
+        assert!(!unchanged.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+    }
 
     #[derive(Clone, Default)]
     struct ReplySink(Arc<Mutex<Vec<u8>>>);
