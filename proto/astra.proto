@@ -493,6 +493,18 @@ message TerminalViewportDatagram {
   string attachment_id = 2;
   TerminalStateDiff diff = 3;
   uint32 inherited_fields = 4;
+  // terminal.datagram_state v2: omitted rows inherit the same base index.
+  bool sparse_rows = 5;
+  repeated TerminalViewportRowPatch primary_patches = 6;
+  repeated TerminalViewportRowPatch alternate_patches = 7;
+}
+message TerminalViewportRowPatch {
+  uint32 index = 1;
+  uint32 base_index = 2;
+  astra.terminal.v2.Row metadata = 3; // cells must be empty
+  uint32 cell_start = 4;
+  uint32 delete_count = 5;
+  repeated astra.terminal.v2.Cell cells = 6;
 }
 message TerminalStateRow {
   oneof source {

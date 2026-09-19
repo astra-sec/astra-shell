@@ -998,6 +998,31 @@ pub struct TerminalViewportDatagram {
     pub diff: Option<TerminalStateDiff>,
     #[prost(uint32, tag = "4")]
     pub inherited_fields: u32,
+    /// v2: rows omitted from these patches are inherited at the same index.
+    #[prost(bool, tag = "5")]
+    pub sparse_rows: bool,
+    #[prost(message, repeated, tag = "6")]
+    pub primary_patches: Vec<TerminalViewportRowPatch>,
+    #[prost(message, repeated, tag = "7")]
+    pub alternate_patches: Vec<TerminalViewportRowPatch>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TerminalViewportRowPatch {
+    #[prost(uint32, tag = "1")]
+    pub index: u32,
+    #[prost(uint32, tag = "2")]
+    pub base_index: u32,
+    /// All row fields except cells (including the new row version/anchor).
+    #[prost(message, optional, tag = "3")]
+    pub metadata: Option<Row>,
+    /// Splice indices count semantic cells, not display columns or UTF-8 bytes.
+    #[prost(uint32, tag = "4")]
+    pub cell_start: u32,
+    #[prost(uint32, tag = "5")]
+    pub delete_count: u32,
+    #[prost(message, repeated, tag = "6")]
+    pub cells: Vec<crate::terminal_state_v2::Cell>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1087,20 +1112,53 @@ pub async fn read_message<R>(reader: &mut R) -> Result<Option<WireMessage>>
 where
     R: AsyncRead + Unpin,
 {
-    let length = match reader.read_u32().await {
-        Ok(length) => length as usize,
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if length > MAX_FRAME_SIZE {
-        bail!("peer sent oversized frame: {length} bytes");
+    MessageReader::default().read(reader).await
+}
+
+/// Keep this parser outside `select!`: cancellation of `read` preserves every
+/// consumed header/payload byte. The one-shot `read_message` helper must only be
+/// used when a cancelled read also discards the stream.
+#[derive(Default)]
+pub struct MessageReader {
+    header: [u8; 4],
+    header_read: usize,
+    payload: Vec<u8>,
+    payload_read: usize,
+}
+
+impl MessageReader {
+    pub async fn read<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Option<WireMessage>> {
+        while self.header_read < self.header.len() {
+            let count = reader.read(&mut self.header[self.header_read..]).await?;
+            if count == 0 {
+                if self.header_read == 0 {
+                    return Ok(None);
+                }
+                bail!("truncated protocol frame header");
+            }
+            self.header_read += count;
+        }
+        let length = u32::from_be_bytes(self.header) as usize;
+        if length > MAX_FRAME_SIZE {
+            bail!("peer sent oversized frame: {length} bytes");
+        }
+        self.payload.resize(length, 0);
+        while self.payload_read < length {
+            let count = reader.read(&mut self.payload[self.payload_read..]).await?;
+            if count == 0 {
+                bail!("truncated protocol frame payload");
+            }
+            self.payload_read += count;
+        }
+        let decoded = WireMessage::decode(self.payload.as_slice());
+        self.header_read = 0;
+        self.payload_read = 0;
+        self.payload.clear();
+        Ok(Some(decoded?))
     }
-    let mut payload = vec![0; length];
-    reader
-        .read_exact(&mut payload)
-        .await
-        .context("truncated protocol frame")?;
-    Ok(Some(WireMessage::decode(payload.as_slice())?))
 }
 
 pub async fn require_message<R>(reader: &mut R) -> Result<WireMessage>
@@ -1115,6 +1173,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn framed_read_survives_cancellation_at_every_byte_boundary() {
+        let message = WireMessage::new(wire_message::Body::TerminalCommand(TerminalCommand {
+            terminal_id: "test".into(),
+            command: Some(terminal_command::Command::Input(b"hello".to_vec())),
+            ..Default::default()
+        }));
+        let payload = message.encode_to_vec();
+        let bytes = [(payload.len() as u32).to_be_bytes().as_slice(), &payload].concat();
+        for split in 1..bytes.len() {
+            let (mut sender, mut receiver) = tokio::io::duplex(1024);
+            let mut reader = MessageReader::default();
+            sender.write_all(&bytes[..split]).await.unwrap();
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(1),
+                    reader.read(&mut receiver)
+                )
+                .await
+                .is_err()
+            );
+            sender.write_all(&bytes[split..]).await.unwrap();
+            sender.write_all(&bytes).await.unwrap();
+            assert_eq!(
+                reader.read(&mut receiver).await.unwrap(),
+                Some(message.clone())
+            );
+            assert_eq!(
+                reader.read(&mut receiver).await.unwrap(),
+                Some(message.clone())
+            );
+            sender.shutdown().await.unwrap();
+            assert!(reader.read(&mut receiver).await.unwrap().is_none());
+        }
+    }
 
     #[test]
     fn recursive_file_watch_capability_is_additive_for_n_minus_one() {
@@ -1583,6 +1677,7 @@ mod tests {
                     attachment_id: "attachment".into(),
                     diff: None,
                     inherited_fields: 0,
+                    ..Default::default()
                 },
             ))),
         };

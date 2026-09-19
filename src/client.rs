@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use prost::Message;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 
 use crate::{
@@ -134,7 +135,27 @@ type DatagramRoute = (String, String);
 
 #[derive(Clone)]
 struct DatagramRouter {
-    routes: Arc<Mutex<HashMap<DatagramRoute, watch::Sender<Option<DatagramDelivery>>>>>,
+    routes: Arc<Mutex<HashMap<DatagramRoute, DatagramMailbox>>>,
+}
+
+struct DatagramMailbox {
+    sender: watch::Sender<Option<DatagramDelivery>>,
+    epoch: Vec<u8>,
+    generation: u64,
+}
+
+impl DatagramMailbox {
+    fn deliver(&mut self, datagram: Box<TerminalViewportDatagram>) {
+        let Some(diff) = &datagram.diff else {
+            return;
+        };
+        if diff.epoch != self.epoch || diff.target_generation <= self.generation {
+            return;
+        }
+        self.generation = diff.target_generation;
+        self.sender
+            .send_replace(Some(DatagramDelivery::Datagram(datagram)));
+    }
 }
 
 #[derive(Clone)]
@@ -145,10 +166,7 @@ enum DatagramDelivery {
 
 impl DatagramRouter {
     fn new(connection: quinn::Connection) -> Self {
-        let routes = Arc::new(Mutex::new(HashMap::<
-            DatagramRoute,
-            watch::Sender<Option<DatagramDelivery>>,
-        >::new()));
+        let routes = Arc::new(Mutex::new(HashMap::<DatagramRoute, DatagramMailbox>::new()));
         let task_routes = routes.clone();
         tokio::spawn(async move {
             loop {
@@ -173,11 +191,13 @@ impl DatagramRouter {
                     Err(error) => {
                         let message = format!("terminal datagram connection ended: {error}");
                         let mut routes = task_routes.lock().expect("datagram routes poisoned");
-                        routes.retain(|_, sender| {
-                            if sender.is_closed() {
+                        routes.retain(|_, mailbox| {
+                            if mailbox.sender.is_closed() {
                                 return false;
                             }
-                            sender.send_replace(Some(DatagramDelivery::Closed(message.clone())));
+                            mailbox
+                                .sender
+                                .send_replace(Some(DatagramDelivery::Closed(message.clone())));
                             true
                         });
                         break;
@@ -188,13 +208,15 @@ impl DatagramRouter {
                 };
                 let route = (datagram.terminal_id.clone(), datagram.attachment_id.clone());
                 let mut routes = task_routes.lock().expect("datagram routes poisoned");
-                if let Some(sender) = routes.get(&route) {
-                    if sender.is_closed() {
+                if let Some(mailbox) = routes.get_mut(&route) {
+                    if mailbox.sender.is_closed() {
                         routes.remove(&route);
                     } else {
                         // Latest-state-wins: a renderer can be arbitrarily slow
                         // without building an unbounded FIFO of obsolete frames.
-                        sender.send_replace(Some(delivery));
+                        if let DatagramDelivery::Datagram(datagram) = delivery {
+                            mailbox.deliver(datagram);
+                        }
                     }
                 }
             }
@@ -205,11 +227,38 @@ impl DatagramRouter {
     fn register(&self, route: DatagramRoute) -> Result<watch::Receiver<Option<DatagramDelivery>>> {
         let (sender, receiver) = watch::channel(None);
         let mut routes = self.routes.lock().expect("datagram routes poisoned");
-        if routes.get(&route).is_some_and(|sender| !sender.is_closed()) {
+        if routes
+            .get(&route)
+            .is_some_and(|mailbox| !mailbox.sender.is_closed())
+        {
             bail!("terminal attachment already has a datagram consumer")
         }
-        routes.insert(route, sender);
+        routes.insert(
+            route,
+            DatagramMailbox {
+                sender,
+                epoch: Vec::new(),
+                generation: 0,
+            },
+        );
         Ok(receiver)
+    }
+
+    fn commit_keyframe(&self, route: &DatagramRoute, state: &crate::terminal_state_v2::State) {
+        if let Some(mailbox) = self
+            .routes
+            .lock()
+            .expect("datagram routes poisoned")
+            .get_mut(route)
+        {
+            if mailbox.epoch != state.epoch {
+                mailbox.sender.send_replace(None);
+                mailbox.generation = state.generation;
+                mailbox.epoch.clone_from(&state.epoch);
+            } else {
+                mailbox.generation = mailbox.generation.max(state.generation);
+            }
+        }
     }
 
     fn unregister(&self, route: &DatagramRoute) {
@@ -240,8 +289,10 @@ pub enum StreamingAttachmentEvent {
 }
 
 pub struct StreamingAttachment {
-    send: quinn::SendStream,
+    send: crate::queued_writer::QueuedWriter,
+    writer_task: tokio::task::JoinHandle<Result<()>>,
     recv: quinn::RecvStream,
+    reader: crate::protocol::MessageReader,
     terminal_id: String,
     attachment_id: String,
     lease_id: String,
@@ -258,6 +309,7 @@ pub struct StreamingAttachment {
 
 impl Drop for StreamingAttachment {
     fn drop(&mut self) {
+        self.writer_task.abort();
         self.datagram_router.unregister(&self.route);
     }
 }
@@ -520,7 +572,7 @@ impl AstraClient {
         &self,
         request: AttachRequest,
     ) -> Result<(StreamingAttachment, AttachResponse)> {
-        if !self.negotiated.has(CAPABILITY_DATAGRAM_STATE, 1) {
+        if !self.negotiated.has(CAPABILITY_DATAGRAM_STATE, 2) {
             bail!("terminal datagram state was not negotiated")
         }
         if request.workspace_id.is_empty() {
@@ -543,7 +595,10 @@ impl AstraClient {
         let datagram_receiver = self.datagrams.register(route.clone())?;
         let lease_ttl = (!attached.lease_id.is_empty() && attached.lease_ttl_ms > 0)
             .then(|| std::time::Duration::from_millis(u64::from(attached.lease_ttl_ms)));
+        let (send, writer_task) = crate::queued_writer::owned_writer(send);
         let attachment = StreamingAttachment {
+            writer_task,
+            reader: crate::protocol::MessageReader::default(),
             send,
             recv,
             terminal_id: terminal_id.clone(),
@@ -811,7 +866,11 @@ impl StreamingAttachment {
                 }
             };
             let incoming = tokio::select! {
-                message = read_message(&mut self.recv) => {
+                result = &mut self.writer_task => {
+                    result.context("terminal command writer stopped")??;
+                    bail!("terminal command stream ended");
+                },
+                message = self.reader.read(&mut self.recv) => {
                     Incoming::Reliable(message.map(|message| message.map(Box::new)))
                 },
                 datagram = next_datagram(&mut self.datagram_receiver) => {
@@ -847,7 +906,7 @@ impl StreamingAttachment {
                     }
                 }
                 Incoming::Datagram(Some(DatagramDelivery::Closed(message))) => bail!(message),
-                Incoming::Datagram(None) => bail!("terminal datagram router stopped"),
+                Incoming::Datagram(None) => continue,
                 Incoming::Reliable(Err(error)) => return Err(error),
                 Incoming::Reliable(Ok(None)) => bail!("attachment stream ended"),
                 Incoming::Reliable(Ok(Some(message))) => {
@@ -861,6 +920,12 @@ impl StreamingAttachment {
                             if let Some(state) = self.state_assembler.push(chunk)? {
                                 match self.replica.apply_keyframe(state)? {
                                     ApplyDisposition::Applied => {
+                                        self.datagram_router.commit_keyframe(
+                                            &self.route,
+                                            self.replica
+                                                .current()
+                                                .context("missing committed keyframe")?,
+                                        );
                                         self.send_state_ack().await?;
                                         return Ok(StreamingAttachmentEvent::State {
                                             state: Box::new(
@@ -955,7 +1020,11 @@ impl StreamingAttachment {
     pub async fn detach(mut self) -> Result<()> {
         self.send_command(0, terminal_command::Command::Detach(true))
             .await?;
-        self.send.finish()?;
+        self.send.shutdown().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut self.writer_task)
+            .await
+            .context("timed out detaching terminal")?
+            .context("terminal writer stopped")??;
         Ok(())
     }
 
@@ -1242,19 +1311,31 @@ mod tests {
     #[tokio::test]
     async fn datagram_mailbox_keeps_only_the_latest_viewport() {
         let (sender, mut receiver) = watch::channel(None);
-        for generation in 1..=100 {
-            sender.send_replace(Some(DatagramDelivery::Datagram(Box::new(
-                TerminalViewportDatagram {
-                    terminal_id: "terminal".into(),
-                    attachment_id: "attachment".into(),
-                    diff: Some(crate::protocol::TerminalStateDiff {
-                        target_generation: generation,
-                        ..Default::default()
-                    }),
+        let mut mailbox = DatagramMailbox {
+            sender,
+            epoch: vec![1; 16],
+            generation: 0,
+        };
+        for generation in (1..=100).chain([99, 3, 100]) {
+            mailbox.deliver(Box::new(TerminalViewportDatagram {
+                terminal_id: "terminal".into(),
+                attachment_id: "attachment".into(),
+                diff: Some(crate::protocol::TerminalStateDiff {
+                    epoch: vec![1; 16],
+                    target_generation: generation,
                     ..Default::default()
-                },
-            ))));
+                }),
+                ..Default::default()
+            }));
         }
+        mailbox.deliver(Box::new(TerminalViewportDatagram {
+            diff: Some(crate::protocol::TerminalStateDiff {
+                epoch: vec![2; 16],
+                target_generation: 1000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
 
         let Some(DatagramDelivery::Datagram(datagram)) = next_datagram(&mut receiver).await else {
             panic!("latest viewport datagram was not delivered")

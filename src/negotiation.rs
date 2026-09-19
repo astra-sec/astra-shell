@@ -66,8 +66,8 @@ impl ProtocolSupport {
                 },
                 CapabilityRange {
                     name: CAPABILITY_DATAGRAM_STATE,
-                    minimum_version: 1,
-                    maximum_version: 1,
+                    minimum_version: 2,
+                    maximum_version: 2,
                 },
                 CapabilityRange {
                     name: CAPABILITY_CLIPBOARD_WRITE,
@@ -127,8 +127,8 @@ impl ProtocolSupport {
                 },
                 CapabilityRange {
                     name: CAPABILITY_DATAGRAM_STATE,
-                    minimum_version: 1,
-                    maximum_version: 1,
+                    minimum_version: 2,
+                    maximum_version: 2,
                 },
                 CapabilityRange {
                     name: CAPABILITY_STATE_ACK,
@@ -717,6 +717,22 @@ mod tests {
             validate_worker_selection(PROTOCOL_VERSION, &invalid_worker_selection, &support,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn withdrawn_datagram_v1_falls_back_without_mixing_wire_encodings() {
+        let support = ProtocolSupport::runtime();
+        let mut hello = client_hello("old-experiment", &support);
+        let offer = hello
+            .capabilities
+            .iter_mut()
+            .find(|offer| offer.name == CAPABILITY_DATAGRAM_STATE)
+            .unwrap();
+        offer.minimum_version = 1;
+        offer.maximum_version = 1;
+        let negotiated = negotiate_client_hello(&hello, &support).unwrap();
+        assert!(!negotiated.has(CAPABILITY_DATAGRAM_STATE, 1));
+        assert!(negotiated.has(CAPABILITY_SEMANTIC_STATE, 2));
     }
 
     #[test]

@@ -767,12 +767,13 @@ async fn attach_terminal(
             None
         };
 
+        let mut reader = astra_shell::protocol::MessageReader::default();
         let disconnect = if let Some(error) = initial_disconnect {
             error
         } else {
             loop {
                 let disconnect = tokio::select! {
-                    incoming = read_message(&mut recv) => {
+                    incoming = reader.read(&mut recv) => {
                         match incoming {
                             Ok(Some(WireMessage { body: Some(wire_message::Body::TerminalEvent(event)) })) => {
                                 if event.terminal_id != terminal_id {

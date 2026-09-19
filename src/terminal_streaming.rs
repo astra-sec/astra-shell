@@ -1,12 +1,12 @@
 //! Latest-state-wins synchronization for the live terminal viewport.
 //!
-//! Rust peers negotiate this data plane as `terminal.datagram_state` v1. A
+//! Rust peers negotiate this data plane as `terminal.datagram_state` v2. A
 //! reliable semantic keyframe establishes a committed base; cumulative QUIC
 //! DATAGRAM deltas then update only the live viewport. Reliable history paging
 //! remains independent, and repair/re-key messages guarantee convergence after
 //! loss, reordering, or receiver eviction.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::{Context, Result, ensure};
 use prost::Message;
@@ -15,10 +15,10 @@ use sha2::{Digest, Sha256};
 use crate::{
     protocol::{
         HistoryPageChunk, TerminalStateAck, TerminalStateChunk, TerminalStateDiff,
-        TerminalStateRepairRequest, TerminalViewportDatagram,
+        TerminalStateRepairRequest, TerminalViewportDatagram, TerminalViewportRowPatch,
     },
-    terminal_state_v2::{self, HistoryPage, State},
-    terminal_sync::{AckDisposition, apply_terminal_state_diff, terminal_state_diff},
+    terminal_state_v2::{self, HistoryPage, Row, State},
+    terminal_sync::{AckDisposition, apply_terminal_state_diff, state_metadata},
 };
 
 const DEFAULT_RETAINED_GENERATIONS: usize = 128;
@@ -257,6 +257,7 @@ impl StreamingUpdate {
 /// Projects a full semantic state down to the two live viewports. Primary
 /// scrollback remains available through the existing reliable history paging
 /// protocol and is intentionally excluded from live updates.
+#[cfg(test)]
 pub(crate) fn viewport_state(mut state: State) -> Result<State> {
     terminal_state_v2::validate(&state).context("full terminal state is invalid")?;
     let primary = state
@@ -332,6 +333,7 @@ pub(crate) struct StreamingStateWindow {
     sent: BTreeMap<u64, State>,
     latest_target: Option<State>,
     retained_generations: usize,
+    retired_epochs: VecDeque<Vec<u8>>,
 }
 
 impl StreamingStateWindow {
@@ -373,35 +375,40 @@ impl StreamingStateWindow {
             sent,
             latest_target: None,
             retained_generations,
+            retired_epochs: VecDeque::new(),
         })
     }
 
     /// Prepares the newest live state immediately. A delta is used only when
     /// it fits the supplied QUIC DATAGRAM payload budget and is smaller than a
-    /// reliable keyframe. Oversized states are coalesced as the latest pending
-    /// target; the transport's bounded keyframe timer calls `rekey_latest`
-    /// instead of allowing a reliable-stream backlog to grow per generation.
+    /// reliable keyframe. An oversized state starts a keyframe immediately if
+    /// no keyframe is in flight; subsequent states replace one pending target
+    /// until its ACK. Rate-limiting alone is not a backpressure guarantee.
     pub(crate) fn prepare_update(
         &mut self,
         latest: State,
         datagram_payload_budget: usize,
     ) -> Result<Option<StreamingUpdate>> {
         validate_viewport_state(&latest)?;
-        if latest.epoch == self.base.epoch && latest.generation <= self.latest_generation() {
+        if latest.epoch == self.base.epoch
+            && (latest.generation <= self.base.generation
+                || latest.generation < self.latest_generation()
+                || (latest.generation == self.latest_generation()
+                    && self.sent.contains_key(&latest.generation)))
+        {
             return Ok(None);
-        }
-        if latest.epoch != self.base.epoch {
-            return self.install_keyframe(latest).map(Some);
         }
         if !self.base_acknowledged {
             self.latest_target = Some(latest);
             return Ok(None);
         }
+        if latest.epoch != self.base.epoch {
+            return self.install_keyframe(latest).map(Some);
+        }
 
         let update = self.update_from_base(&latest, datagram_payload_budget)?;
         if matches!(update, StreamingUpdate::ReliableKeyframe(_)) {
-            self.latest_target = Some(latest);
-            return Ok(None);
+            return self.install_keyframe(latest).map(Some);
         }
         self.remember(latest);
         Ok(Some(update))
@@ -421,16 +428,17 @@ impl StreamingStateWindow {
             self.latest_target = None;
             return Ok(None);
         }
-        if latest.epoch != self.base.epoch {
-            return self.install_keyframe(latest).map(Some);
-        }
         if !self.base_acknowledged {
             return Ok(None);
+        }
+        if latest.epoch != self.base.epoch {
+            return self.install_keyframe(latest).map(Some);
         }
         let update = self.update_from_base(&latest, datagram_payload_budget)?;
         if matches!(update, StreamingUpdate::ReliableKeyframe(_)) {
             return self.install_keyframe(latest).map(Some);
         }
+        self.remember(latest);
         Ok(Some(update))
     }
 
@@ -438,6 +446,9 @@ impl StreamingStateWindow {
     /// transport calls this after its bounded datagram retry interval expires,
     /// or when the peer reports that the named base is no longer retained.
     pub(crate) fn rekey_latest(&mut self) -> Result<Option<StreamingUpdate>> {
+        if !self.base_acknowledged {
+            return Ok(None);
+        }
         let Some(latest) = self.latest_target.clone() else {
             return Ok(None);
         };
@@ -464,6 +475,9 @@ impl StreamingStateWindow {
             request.newest_seen_generation >= request.missing_base_generation,
             "terminal state repair generation range is reversed"
         );
+        if self.retired_epochs.contains(&request.epoch) {
+            return Ok(None);
+        }
         ensure!(
             request.epoch == self.base.epoch,
             "terminal state repair epoch changed"
@@ -472,6 +486,10 @@ impl StreamingStateWindow {
             request.missing_base_generation <= self.latest_generation(),
             "terminal state repair names a future base"
         );
+        // A repair already in flight also repairs every duplicate request.
+        if !self.base_acknowledged {
+            return Ok(None);
+        }
         match self.rekey_latest()? {
             Some(update) => Ok(Some(update)),
             None => {
@@ -499,6 +517,9 @@ impl StreamingStateWindow {
             "terminal state ACK epoch is invalid"
         );
         ensure!(ack.generation > 0, "terminal state ACK generation is zero");
+        if self.retired_epochs.contains(&ack.epoch) {
+            return Ok(AckDisposition::Duplicate);
+        }
         if ack.epoch == self.base.epoch && ack.generation <= self.base.generation {
             if ack.generation == self.base.generation {
                 self.base_acknowledged = true;
@@ -506,7 +527,7 @@ impl StreamingStateWindow {
             if self
                 .latest_target
                 .as_ref()
-                .is_some_and(|state| state.generation <= ack.generation)
+                .is_some_and(|state| state.epoch == ack.epoch && state.generation <= ack.generation)
             {
                 self.latest_target = None;
             }
@@ -535,7 +556,7 @@ impl StreamingStateWindow {
         if self
             .latest_target
             .as_ref()
-            .is_some_and(|state| state.generation <= ack.generation)
+            .is_some_and(|state| state.epoch == ack.epoch && state.generation <= ack.generation)
         {
             self.latest_target = None;
         }
@@ -547,6 +568,9 @@ impl StreamingStateWindow {
         latest: &State,
         datagram_payload_budget: usize,
     ) -> Result<StreamingUpdate> {
+        if latest.rows != self.base.rows || latest.cols != self.base.cols {
+            return Ok(StreamingUpdate::ReliableKeyframe(latest.clone()));
+        }
         let delta =
             compact_viewport_datagram(&self.terminal_id, &self.attachment_id, &self.base, latest)?;
         if delta.encoded_len() <= datagram_payload_budget
@@ -560,6 +584,16 @@ impl StreamingStateWindow {
 
     fn install_keyframe(&mut self, state: State) -> Result<StreamingUpdate> {
         validate_viewport_state(&state)?;
+        ensure!(
+            self.base_acknowledged,
+            "a reliable keyframe is already in flight"
+        );
+        if self.base.epoch != state.epoch {
+            self.retired_epochs.push_back(self.base.epoch.clone());
+            if self.retired_epochs.len() > DEFAULT_RETAINED_GENERATIONS {
+                self.retired_epochs.pop_front();
+            }
+        }
         self.base = state.clone();
         self.base_acknowledged = false;
         self.sent.clear();
@@ -763,7 +797,17 @@ fn compact_viewport_datagram(
         !terminal_id.is_empty() && !attachment_id.is_empty(),
         "terminal viewport datagram route is empty"
     );
-    let mut diff = terminal_state_diff(base, target)?;
+    ensure!(
+        base.epoch == target.epoch && target.generation > base.generation,
+        "invalid cumulative viewport generation"
+    );
+    let mut diff = TerminalStateDiff {
+        epoch: target.epoch.clone(),
+        base_generation: base.generation,
+        target_generation: target.generation,
+        target_metadata: Some(state_metadata(target)),
+        ..Default::default()
+    };
     let metadata = diff
         .target_metadata
         .as_mut()
@@ -793,12 +837,131 @@ fn compact_viewport_datagram(
         metadata.palette = None;
         inherited_fields |= INHERIT_PALETTE;
     }
+    let primary_patches = sparse_row_patches(
+        &base
+            .primary
+            .as_ref()
+            .context("missing primary")?
+            .included_rows,
+        &target
+            .primary
+            .as_ref()
+            .context("missing primary")?
+            .included_rows,
+    )?;
+    let alternate_patches = sparse_row_patches(
+        &base
+            .alternate
+            .as_ref()
+            .context("missing alternate")?
+            .included_rows,
+        &target
+            .alternate
+            .as_ref()
+            .context("missing alternate")?
+            .included_rows,
+    )?;
+    diff.primary_rows.clear();
+    diff.alternate_rows.clear();
     Ok(TerminalViewportDatagram {
         terminal_id: terminal_id.to_owned(),
         attachment_id: attachment_id.to_owned(),
         diff: Some(diff),
         inherited_fields,
+        sparse_rows: true,
+        primary_patches,
+        alternate_patches,
     })
+}
+
+fn sparse_row_patches(base: &[Row], target: &[Row]) -> Result<Vec<TerminalViewportRowPatch>> {
+    ensure!(
+        base.len() == target.len(),
+        "viewport geometry changed without keyframe"
+    );
+    let mut patches = Vec::new();
+    let anchors: BTreeMap<_, _> = base
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            row.start
+                .as_ref()
+                .map(|anchor| ((anchor.logical_line_id, anchor.cell_offset), index))
+        })
+        .collect();
+    for (index, row) in target.iter().enumerate() {
+        if row == &base[index] {
+            continue;
+        }
+        let base_index = row
+            .start
+            .as_ref()
+            .and_then(|anchor| anchors.get(&(anchor.logical_line_id, anchor.cell_offset)))
+            .copied()
+            .unwrap_or(index);
+        let old = &base[base_index];
+        let prefix = old
+            .cells
+            .iter()
+            .zip(&row.cells)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let suffix = old.cells[prefix..]
+            .iter()
+            .rev()
+            .zip(row.cells[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let metadata = Row {
+            start: row.start.clone(),
+            row_version: row.row_version,
+            wrapped_to_next: row.wrapped_to_next,
+            cells: Vec::new(),
+        };
+        patches.push(TerminalViewportRowPatch {
+            index: index as u32,
+            base_index: base_index as u32,
+            metadata: Some(metadata),
+            cell_start: prefix as u32,
+            delete_count: (old.cells.len() - prefix - suffix) as u32,
+            cells: row.cells[prefix..row.cells.len() - suffix].to_vec(),
+        });
+    }
+    Ok(patches)
+}
+
+fn apply_sparse_rows(base: &[Row], patches: &[TerminalViewportRowPatch]) -> Result<Vec<Row>> {
+    ensure!(patches.len() <= base.len(), "too many viewport row patches");
+    let mut target = base.to_vec();
+    let mut seen = BTreeSet::new();
+    for patch in patches {
+        let index = patch.index as usize;
+        ensure!(
+            index < base.len() && seen.insert(index),
+            "invalid or duplicate viewport row index"
+        );
+        let old = base
+            .get(patch.base_index as usize)
+            .context("invalid viewport base row index")?;
+        let start = patch.cell_start as usize;
+        let end = start
+            .checked_add(patch.delete_count as usize)
+            .context("cell splice overflow")?;
+        ensure!(end <= old.cells.len(), "cell splice exceeds base row");
+        let mut row = patch
+            .metadata
+            .clone()
+            .context("viewport row metadata missing")?;
+        ensure!(row.cells.is_empty(), "viewport row metadata contains cells");
+        row.cells = old.cells[..start]
+            .iter()
+            .chain(&patch.cells)
+            .chain(&old.cells[end..])
+            .cloned()
+            .collect();
+        target[index] = row;
+    }
+    Ok(target)
 }
 
 fn apply_compact_viewport_delta(base: &State, delta: &TerminalViewportDatagram) -> Result<State> {
@@ -849,13 +1012,60 @@ fn apply_compact_viewport_delta(base: &State, delta: &TerminalViewportDatagram) 
         );
         metadata.palette = base.palette.clone();
     }
-    apply_terminal_state_diff(base, &diff)
+    if !delta.sparse_rows {
+        ensure!(
+            delta.primary_patches.is_empty() && delta.alternate_patches.is_empty(),
+            "sparse patches without encoding flag"
+        );
+        return apply_terminal_state_diff(base, &diff);
+    }
+    ensure!(
+        diff.primary_rows.is_empty() && diff.alternate_rows.is_empty(),
+        "mixed row encodings"
+    );
+    ensure!(
+        base.epoch == diff.epoch
+            && base.generation == diff.base_generation
+            && diff.target_generation > diff.base_generation,
+        "invalid viewport diff base"
+    );
+    ensure!(
+        metadata.epoch == diff.epoch
+            && metadata.generation == diff.target_generation
+            && metadata.rows == base.rows
+            && metadata.cols == base.cols,
+        "invalid viewport diff metadata"
+    );
+    for (screen, original, patches) in [
+        (&mut metadata.primary, &base.primary, &delta.primary_patches),
+        (
+            &mut metadata.alternate,
+            &base.alternate,
+            &delta.alternate_patches,
+        ),
+    ] {
+        let screen = screen.as_mut().context("missing viewport screen")?;
+        ensure!(
+            screen.included_rows.is_empty(),
+            "viewport metadata contains rows"
+        );
+        screen.included_rows = apply_sparse_rows(
+            &original
+                .as_ref()
+                .context("missing base screen")?
+                .included_rows,
+            patches,
+        )?;
+    }
+    validate_viewport_state(metadata)?;
+    Ok(metadata.clone())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::terminal_engine::TerminalEngine;
+    use crate::terminal_sync::terminal_state_diff;
 
     const DATAGRAM_BUDGET: usize = 1_200;
     const TERMINAL_ID: &str = "terminal-1";
@@ -1379,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_updates_coalesce_until_the_reliable_keyframe_tick() {
+    fn oversized_updates_allow_only_one_unacknowledged_keyframe() {
         let mut engine = TerminalEngine::new(24, 80, 128, Box::new(std::io::sink())).unwrap();
         let initial = viewport(&mut engine);
         let mut sender = sender(initial);
@@ -1388,21 +1598,168 @@ mod tests {
                 .advance(format!("row {index:02} with a large replacement payload\r\n").as_bytes());
         }
         let expected = viewport(&mut engine);
-        assert!(
-            sender
-                .prepare_update(expected.clone(), 64)
-                .unwrap()
-                .is_none()
-        );
+        assert!(matches!(
+            sender.prepare_update(expected.clone(), 64).unwrap(),
+            Some(StreamingUpdate::ReliableKeyframe(_))
+        ));
         engine.advance(b"newer state replaces the pending keyframe");
         let newest = viewport(&mut engine);
         assert!(sender.prepare_update(newest.clone(), 64).unwrap().is_none());
+        for _ in 0..8 {
+            assert!(sender.rekey_latest().unwrap().is_none());
+            assert!(sender.retry_latest(64).unwrap().is_none());
+        }
+        sender
+            .acknowledge(&TerminalStateAck {
+                epoch: expected.epoch.clone(),
+                generation: expected.generation,
+            })
+            .unwrap();
         let keyframe = sender.rekey_latest().unwrap().unwrap();
         let StreamingUpdate::ReliableKeyframe(state) = keyframe else {
             panic!("keyframe timer did not promote the pending state")
         };
         assert_eq!(state, newest);
         assert_ne!(state, expected);
+    }
+
+    #[test]
+    fn late_epoch_controls_are_ignored_and_pending_epoch_survives_ack() {
+        let mut engine = TerminalEngine::new(24, 80, 128, Box::new(std::io::sink())).unwrap();
+        let initial = engine.semantic_viewport().unwrap();
+        let old_ack = TerminalStateAck {
+            epoch: initial.epoch.clone(),
+            generation: initial.generation,
+        };
+        let mut window =
+            StreamingStateWindow::with_route(initial, TERMINAL_ID.into(), ATTACHMENT_ID.into())
+                .unwrap();
+        engine.advance(b"\x1b[2;1H\x1b[L");
+        let newest = engine.semantic_viewport().unwrap();
+        assert_ne!(newest.epoch, old_ack.epoch);
+        assert!(
+            window
+                .prepare_update(newest.clone(), DATAGRAM_BUDGET)
+                .unwrap()
+                .is_none()
+        );
+        window.acknowledge(&old_ack).unwrap();
+        assert!(window.has_pending_update());
+        assert!(matches!(
+            window.retry_latest(DATAGRAM_BUDGET).unwrap(),
+            Some(StreamingUpdate::ReliableKeyframe(_))
+        ));
+        assert_eq!(
+            window.acknowledge(&old_ack).unwrap(),
+            AckDisposition::Duplicate
+        );
+        assert!(!window.base_is_acknowledged());
+        assert!(
+            window
+                .repair(&TerminalStateRepairRequest {
+                    epoch: old_ack.epoch,
+                    missing_base_generation: old_ack.generation,
+                    newest_seen_generation: old_ack.generation
+                })
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_delta_sent_by_retry_is_acknowledgeable() {
+        let mut engine = TerminalEngine::new(24, 80, 128, Box::new(std::io::sink())).unwrap();
+        let initial = engine.semantic_viewport().unwrap();
+        let ack = TerminalStateAck {
+            epoch: initial.epoch.clone(),
+            generation: initial.generation,
+        };
+        let mut window =
+            StreamingStateWindow::with_route(initial, TERMINAL_ID.into(), ATTACHMENT_ID.into())
+                .unwrap();
+        engine.advance(b"hello");
+        let latest = engine.semantic_viewport().unwrap();
+        assert!(
+            window
+                .prepare_update(latest.clone(), DATAGRAM_BUDGET)
+                .unwrap()
+                .is_none()
+        );
+        window.acknowledge(&ack).unwrap();
+        assert!(matches!(
+            window.retry_latest(DATAGRAM_BUDGET).unwrap(),
+            Some(StreamingUpdate::DatagramDelta(_))
+        ));
+        assert_eq!(
+            window
+                .acknowledge(&TerminalStateAck {
+                    epoch: latest.epoch,
+                    generation: latest.generation
+                })
+                .unwrap(),
+            AckDisposition::Accepted
+        );
+        assert!(!window.has_pending_update());
+    }
+
+    #[test]
+    fn dense_viewports_one_cell_delta_fits_real_quic_mtu() {
+        for (rows, cols) in [(24, 80), (40, 120), (50, 200), (60, 180)] {
+            let mut engine =
+                TerminalEngine::new(rows, cols, 1024, Box::new(std::io::sink())).unwrap();
+            for row in 1..=rows {
+                engine
+                    .advance(format!("\x1b[{row};1H{}", "x".repeat(cols as usize - 1)).as_bytes());
+            }
+            let initial = engine.semantic_viewport().unwrap();
+            engine.advance(b"\x1b[1;1Hy");
+            let latest = engine.semantic_viewport().unwrap();
+            let delta = compact_viewport_datagram(
+                "11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222",
+                &initial,
+                &latest,
+            )
+            .unwrap();
+            eprintln!(
+                "dense {rows}x{cols}: delta={}B keyframe={}B",
+                delta.encoded_len(),
+                latest.encoded_len()
+            );
+            assert!(delta.encoded_len() <= 1162);
+            assert_eq!(
+                apply_compact_viewport_delta(&initial, &delta).unwrap(),
+                latest
+            );
+        }
+    }
+
+    #[test]
+    fn viewport_export_is_independent_of_history_depth() {
+        let mut engine = TerminalEngine::new(24, 80, 4096, Box::new(std::io::sink())).unwrap();
+        for _ in 0..1000 {
+            engine.advance(b"history\r\n");
+        }
+        let live = engine.semantic_viewport().unwrap();
+        assert_eq!(live.primary.as_ref().unwrap().included_rows.len(), 24);
+        assert_eq!(
+            live,
+            viewport_state(engine.semantic_state().unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn sparse_cell_splices_preserve_wide_graphemes_and_reject_invalid_ranges() {
+        let mut engine = TerminalEngine::new(6, 40, 128, Box::new(std::io::sink())).unwrap();
+        engine.advance("abc界déf\r\nsecond row".as_bytes());
+        let base = engine.semantic_viewport().unwrap();
+        engine.advance("\x1b[1;4H字\x1b[2;1H\x1b[K中文".as_bytes());
+        let latest = engine.semantic_viewport().unwrap();
+        let mut delta =
+            compact_viewport_datagram(TERMINAL_ID, ATTACHMENT_ID, &base, &latest).unwrap();
+        assert_eq!(apply_compact_viewport_delta(&base, &delta).unwrap(), latest);
+        delta.primary_patches[0].delete_count = u32::MAX;
+        assert!(apply_compact_viewport_delta(&base, &delta).is_err());
     }
 
     #[tokio::test]

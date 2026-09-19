@@ -43,7 +43,7 @@ use crate::{
     terminal_state_v2::{
         HistoryPage, MAX_ENCODED_HISTORY_PAGE_BYTES, MAX_ENCODED_STATE_BYTES, State,
     },
-    terminal_streaming::{StreamingStateWindow, StreamingUpdate, viewport_state},
+    terminal_streaming::{StreamingStateWindow, StreamingUpdate},
     terminal_sync::{AckDisposition, PreparedStateUpdate, StateSyncWindow},
     worker::{WorkerProxyStream, WorkerRouter},
 };
@@ -1251,6 +1251,29 @@ async fn handle_attach<W, R>(
     request_id: String,
     request: crate::protocol::AttachRequest,
     mut send: W,
+    recv: R,
+    context: WorkerMessageContext,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let (queued, drain) = crate::queued_writer::queued_writer(&mut send);
+    crate::queued_writer::run_with_drain(
+        handle_attach_inner(
+            manager, terminal, request_id, request, queued, recv, context,
+        ),
+        drain,
+    )
+    .await
+}
+
+async fn handle_attach_inner<W, R>(
+    manager: SessionManager,
+    terminal: Arc<Terminal>,
+    request_id: String,
+    request: crate::protocol::AttachRequest,
+    mut send: W,
     mut recv: R,
     context: WorkerMessageContext,
 ) -> Result<()>
@@ -1278,6 +1301,15 @@ where
             return Ok(());
         }
     };
+    // The output drain can fail or the QUIC task can be cancelled at any await.
+    // Release only this lease ID (a newer resumed/taken-over lease is untouched).
+    struct ReleaseLease(Arc<Terminal>, String);
+    impl Drop for ReleaseLease {
+        fn drop(&mut self) {
+            self.0.release_lease(&self.1);
+        }
+    }
+    let _release_lease = ReleaseLease(terminal.clone(), lease.lease_id.clone());
     let info = terminal.info();
     let mut attachment = match manager.register_attachment(&connection_id, &info, request.read_only)
     {
@@ -1313,11 +1345,10 @@ where
     let mut streaming_sync = None;
     let mut streaming_dirty = false;
     let (snapshot, initial_state, mut events) = if semantic {
-        let (state, events) = terminal.semantic_state_and_subscribe()?;
-        let state = if datagram_state {
-            viewport_state(state)?
+        let (state, events) = if datagram_state {
+            terminal.semantic_viewport_and_subscribe()?
         } else {
-            state
+            terminal.semantic_state_and_subscribe()?
         };
         (None, Some(state), events)
     } else {
@@ -1355,6 +1386,8 @@ where
         }
     }
     let mut last_state_sent = tokio::time::Instant::now();
+    let mut last_state_sampled = last_state_sent;
+    let mut reader = crate::protocol::MessageReader::default();
     let mut last_streaming_rekey = last_state_sent;
     attachment.set_state(crate::protocol::AttachmentState::Live)?;
 
@@ -1381,7 +1414,7 @@ where
                     std::future::pending::<()>().await;
                 }
             };
-            let state_deadline = last_state_sent + TERMINAL_STATE_COALESCE_INTERVAL;
+            let state_deadline = last_state_sampled + TERMINAL_STATE_COALESCE_INTERVAL;
             let should_send_state = if datagram_state {
                 streaming_dirty
             } else {
@@ -1414,14 +1447,14 @@ where
             };
             let rekey_deadline = last_streaming_rekey + TERMINAL_DATAGRAM_REKEY_INTERVAL;
             let wait_for_streaming_rekey = async {
-                if datagram_state && streaming_pending {
+                if datagram_state && streaming_pending && streaming_base_acknowledged {
                     tokio::time::sleep_until(rekey_deadline).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
             };
             tokio::select! {
-                incoming = read_message(&mut recv) => {
+                incoming = reader.read(&mut recv) => {
                     match incoming? {
                         Some(WireMessage { body: Some(wire_message::Body::TerminalCommand(command)) }) => {
                             validate_terminal_command_target(
@@ -1532,11 +1565,10 @@ where
                                     if !datagram_state {
                                         bail!("terminal state repair requested without negotiated datagram capability")
                                     }
-                                    let update = streaming_sync
+                                    if let Some(update) = streaming_sync
                                         .as_mut()
                                         .context("terminal streaming state is missing")?
-                                        .repair(&repair)?
-                                        .context("terminal streaming repair produced no keyframe")?;
+                                        .repair(&repair)? {
                                     write_streaming_update(
                                         &mut send,
                                         datagram_transport.as_ref().context("terminal datagram transport is missing")?,
@@ -1546,6 +1578,7 @@ where
                                     ).await?;
                                     last_state_sent = tokio::time::Instant::now();
                                     last_streaming_rekey = last_state_sent;
+                                    }
                                 }
                                 Some(terminal_command::Command::Detach(_)) | None => break,
                             }
@@ -1583,13 +1616,17 @@ where
                     terminal.expire_lease_if_due(&lease.lease_id);
                 }
                 _ = wait_for_state_update, if should_send_state => {
+                    last_state_sampled = tokio::time::Instant::now();
                     if datagram_state {
                         streaming_dirty = false;
-                        let latest = viewport_state(terminal.semantic_state()?)?;
+                        let latest = terminal.semantic_viewport()?;
+                        if !streaming_pending {
+                            last_streaming_rekey = last_state_sampled;
+                        }
                         if let Some(update) = streaming_sync
                             .as_mut()
                             .context("terminal streaming state is missing")?
-                            .prepare_update(latest, datagram_payload_budget)?
+                            .prepare_update(latest, datagram_transport.as_ref().and_then(TerminalDatagramTransport::maximum_datagram_size).unwrap_or(0))?
                         {
                             write_streaming_update(
                                 &mut send,
@@ -1680,11 +1717,10 @@ where
                         }
                         Ok(PtyEvent::Exited(code)) => {
                             if semantic {
-                                let state = terminal.semantic_state()?;
                                 let state = if datagram_state {
-                                    viewport_state(state)?
+                                    terminal.semantic_viewport()?
                                 } else {
-                                    state
+                                    terminal.semantic_state()?
                                 };
                                 // The attachment stream is about to close, so
                                 // flush the authoritative final frame reliably;

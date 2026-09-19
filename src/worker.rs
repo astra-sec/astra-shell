@@ -311,6 +311,23 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    let (mut queued, drain) = crate::queued_writer::queued_writer(client_send);
+    crate::queued_writer::run_with_drain(
+        async move { forward_worker_messages_inner(worker_recv, &mut queued, connection).await },
+        drain,
+    )
+    .await
+}
+
+async fn forward_worker_messages_inner<R, W>(
+    worker_recv: &mut R,
+    client_send: &mut W,
+    connection: &quinn::Connection,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     while let Some(message) = read_message(worker_recv).await? {
         let datagram = match &message.body {
             Some(wire_message::Body::TerminalEvent(event)) => match &event.event {
@@ -689,6 +706,7 @@ mod tests {
                 ..Default::default()
             }),
             inherited_fields: 0,
+            ..Default::default()
         };
         let bridged = WireMessage::new(wire_message::Body::TerminalEvent(TerminalEvent {
             terminal_id: "terminal".into(),
