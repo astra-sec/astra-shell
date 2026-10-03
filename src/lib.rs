@@ -11,6 +11,7 @@ pub(crate) mod queued_writer;
 pub mod resources;
 pub mod server;
 pub mod session;
+pub mod stream_channels;
 pub mod streaming_client;
 pub mod terminal;
 pub mod terminal_engine;

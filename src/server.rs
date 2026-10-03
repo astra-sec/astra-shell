@@ -23,24 +23,25 @@ use crate::{
         CAPABILITY_CLIPBOARD_WRITE, CAPABILITY_DATAGRAM_STATE, CAPABILITY_HISTORY_PAGING,
         CAPABILITY_INPUT_LEASE, CAPABILITY_PAYLOAD_ZSTD, CAPABILITY_SEMANTIC_DIFF,
         CAPABILITY_SEMANTIC_STATE, CAPABILITY_SESSION_OBJECTS, CAPABILITY_STATE_ACK,
-        NegotiatedProtocol, ProtocolSupport, negotiate_client_hello, selections,
-        validate_worker_selection,
+        CAPABILITY_STREAM_CHANNELS, NegotiatedProtocol, ProtocolSupport, negotiate_client_hello,
+        selections, validate_worker_selection,
     },
     process_lock::ProcessLock,
     protocol::{
         AckResponse, AttachResponse, AttachmentListResponse, AttachmentRole, AuthResult,
         ClipboardSelection as WireClipboardSelection, ClipboardWrite, ErrorResponse,
         HistoryPageChunk, LeaseChanged, LeaseControlAction, ListResponse, Response, ServerHello,
-        SpawnResponse, TerminalEvent, TerminalListResponse, TerminalStateChunk, TerminalStateDiff,
-        TerminalStateDiffChunk, WireMessage, WorkerStreamHello, WorkspaceListResponse,
-        read_message, request, response, terminal_command, terminal_event, wire_message,
-        write_message,
+        SpawnResponse, StreamHello, TerminalEvent, TerminalListResponse, TerminalStateChunk,
+        TerminalStateDiff, TerminalStateDiffChunk, WireMessage, WorkerStreamHello,
+        WorkspaceListResponse, read_message, request, response, terminal_command, terminal_event,
+        wire_message, write_message,
     },
     resources::{
         QuotaExceeded, ResourceAccount, ResourceClaim, ResourceGovernor, ResourcePolicy,
         ResourceReservation,
     },
     session::SessionManager,
+    stream_channels,
     terminal::{ClipboardSelection, INPUT_LEASE_TTL, LeaseRevocationReason, PtyEvent, Terminal},
     terminal_state_v2::{
         HistoryPage, MAX_ENCODED_HISTORY_PAGE_BYTES, MAX_ENCODED_STATE_BYTES, State,
@@ -394,19 +395,26 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
     let connection = incoming.await.context("QUIC handshake failed")?;
     let remote = connection.remote_address();
     let connection = QuinnTransport::new(connection).into_connection();
-    let (username, fingerprint, backend, negotiated, connection_resources, _connection_reservation) =
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            authenticate_connection(&state, &connection),
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                connection.close(0x101, b"authentication timeout");
-                bail!("client authentication timed out")
-            }
-        };
+    let (
+        username,
+        fingerprint,
+        backend,
+        negotiated,
+        stream_epoch,
+        connection_resources,
+        _connection_reservation,
+    ) = match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        authenticate_connection(&state, &connection),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            connection.close(0x101, b"authentication timeout");
+            bail!("client authentication timed out")
+        }
+    };
     info!(
         %remote,
         %username,
@@ -430,6 +438,15 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
         let request_connection = connection.clone();
         tokio::spawn(async move {
             let result: Result<()> = async {
+                let stream_hello = if negotiated.has(CAPABILITY_STREAM_CHANNELS, 1) {
+                    let hello = stream_channels::read_hello(&mut recv, stream_epoch).await?;
+                    send.set_priority(
+                        stream_channels::validate_hello(&hello, stream_epoch)?.priority(),
+                    )?;
+                    Some(hello)
+                } else {
+                    None
+                };
                 let first_message = read_message(&mut recv)
                     .await?
                     .context("request stream ended before its first message")?;
@@ -445,7 +462,14 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
                     } else {
                         None
                     };
-                if is_file_request(&first_message) {
+                validate_stream_request(
+                    &negotiated,
+                    stream_epoch,
+                    stream_hello.as_ref(),
+                    &first_message,
+                )?;
+                if stream_hello.is_none() && is_file_request(&first_message) {
+                    // COMPAT-04: old peers have no declared channel metadata.
                     send.set_priority(-10)?;
                 }
                 match backend {
@@ -458,6 +482,8 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
                             first_message,
                             WorkerMessageContext {
                                 negotiated,
+                                stream_epoch,
+                                stream_hello,
                                 connection_id,
                                 datagram_transport: Some(TerminalDatagramTransport::Direct(
                                     request_connection,
@@ -475,6 +501,8 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
                                 WorkerProxyStream {
                                     first_message,
                                     negotiated,
+                                    stream_epoch,
+                                    stream_hello,
                                     connection_id,
                                     connection: request_connection,
                                 },
@@ -499,6 +527,7 @@ async fn authenticate_connection(
     String,
     ConnectionBackend,
     NegotiatedProtocol,
+    u64,
     ResourceAccount,
     ResourceReservation,
 )> {
@@ -557,6 +586,7 @@ async fn authenticate_connection(
                     ok: false,
                     message: "public key authentication failed".into(),
                     error_code: String::new(),
+                    stream_epoch: 0,
                 })),
             )
             .await;
@@ -590,12 +620,23 @@ async fn authenticate_connection(
             return Err(error.into());
         }
     };
+    let stream_epoch = if negotiated.has(CAPABILITY_STREAM_CHANNELS, 1) {
+        loop {
+            let epoch = rand::random::<u64>();
+            if epoch != 0 {
+                break epoch;
+            }
+        }
+    } else {
+        0
+    };
     write_message(
         &mut auth_send,
         &WireMessage::new(wire_message::Body::AuthResult(AuthResult {
             ok: true,
             message: fingerprint.clone(),
             error_code: String::new(),
+            stream_epoch,
         })),
     )
     .await?;
@@ -605,6 +646,7 @@ async fn authenticate_connection(
         fingerprint,
         backend,
         negotiated,
+        stream_epoch,
         connection_resources,
         connection_reservation,
     ))
@@ -615,6 +657,7 @@ fn connection_quota_auth_result(error: &QuotaExceeded) -> AuthResult {
         ok: false,
         message: error.to_string(),
         error_code: "connection_quota_exceeded".into(),
+        stream_epoch: 0,
     }
 }
 
@@ -725,7 +768,8 @@ where
     let hello = read_message(&mut recv)
         .await?
         .context("request stream ended before its first message")?;
-    let (negotiated, connection_id, maximum_datagram_size) = match hello {
+    let (negotiated, connection_id, maximum_datagram_size, stream_epoch, stream_hello) = match hello
+    {
         WireMessage {
             body:
                 Some(wire_message::Body::WorkerStreamHello(WorkerStreamHello {
@@ -733,6 +777,8 @@ where
                     capabilities,
                     connection_id,
                     maximum_datagram_size,
+                    stream_epoch,
+                    stream_hello,
                 })),
         } => (
             validate_worker_selection(
@@ -742,6 +788,8 @@ where
             )?,
             connection_id,
             maximum_datagram_size,
+            stream_epoch,
+            stream_hello,
         ),
         _ => bail!("expected WorkerStreamHello as first worker stream message"),
     };
@@ -778,6 +826,8 @@ where
         request,
         WorkerMessageContext {
             negotiated,
+            stream_epoch,
+            stream_hello,
             connection_id,
             datagram_transport,
         },
@@ -787,6 +837,8 @@ where
 
 struct WorkerMessageContext {
     negotiated: NegotiatedProtocol,
+    stream_epoch: u64,
+    stream_hello: Option<StreamHello>,
     connection_id: String,
     datagram_transport: Option<TerminalDatagramTransport>,
 }
@@ -803,7 +855,16 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let file_request = is_file_request(&first_message);
+    validate_stream_request(
+        &context.negotiated,
+        context.stream_epoch,
+        context.stream_hello.as_ref(),
+        &first_message,
+    )?;
+    let file_request = context.stream_hello.as_ref().map_or_else(
+        || is_file_request(&first_message),
+        |hello| hello.channel_kind == crate::protocol::StreamChannelKind::File as i32,
+    );
     let request = match first_message {
         WireMessage {
             body: Some(wire_message::Body::Request(request)),
@@ -1178,6 +1239,30 @@ where
     Ok(())
 }
 
+fn validate_stream_request(
+    negotiated: &NegotiatedProtocol,
+    epoch: u64,
+    hello: Option<&StreamHello>,
+    message: &WireMessage,
+) -> Result<()> {
+    let Some(wire_message::Body::Request(request)) = &message.body else {
+        bail!("expected Request after stream preamble");
+    };
+    if negotiated.has(CAPABILITY_STREAM_CHANNELS, 1) {
+        stream_channels::validate_request(
+            hello.context("missing negotiated StreamHello")?,
+            request,
+            epoch,
+        )
+    } else {
+        ensure!(
+            epoch == 0 && hello.is_none(),
+            "unnegotiated stream metadata"
+        );
+        Ok(())
+    }
+}
+
 fn is_file_request(message: &WireMessage) -> bool {
     matches!(
         message,
@@ -1304,6 +1389,7 @@ where
         negotiated,
         connection_id,
         datagram_transport,
+        ..
     } = context;
     let mut lease_events = terminal.subscribe_to_leases();
     let input_lease = negotiated.has(CAPABILITY_INPUT_LEASE, 1);
@@ -2204,6 +2290,122 @@ mod tests {
     use crate::terminal_engine::TerminalEngine;
 
     #[test]
+    fn gateway_and_worker_reject_missing_unnegotiated_and_mismatched_preambles() {
+        let request = Request {
+            request_id: "request".into(),
+            command: Some(request::Command::List(ListRequest {})),
+        };
+        let message = WireMessage::new(wire_message::Body::Request(request.clone()));
+        let hello = stream_channels::hello_for_request(&request, 7).unwrap();
+        let mut negotiated = NegotiatedProtocol {
+            version: crate::PROTOCOL_VERSION,
+            capabilities: BTreeMap::new(),
+        };
+        validate_stream_request(&negotiated, 0, None, &message).unwrap();
+        assert!(validate_stream_request(&negotiated, 7, Some(&hello), &message).is_err());
+        negotiated
+            .capabilities
+            .insert(CAPABILITY_STREAM_CHANNELS.into(), 1);
+        validate_stream_request(&negotiated, 7, Some(&hello), &message).unwrap();
+        assert!(validate_stream_request(&negotiated, 7, None, &message).is_err());
+        assert!(validate_stream_request(&negotiated, 8, Some(&hello), &message).is_err());
+        let substituted = WireMessage::new(wire_message::Body::Request(Request {
+            request_id: request.request_id,
+            command: Some(request::Command::FileCapabilities(
+                FileCapabilitiesRequest {},
+            )),
+        }));
+        assert!(validate_stream_request(&negotiated, 7, Some(&hello), &substituted).is_err());
+    }
+
+    #[tokio::test]
+    async fn worker_wire_roundtrip_revalidates_forwarded_channel_metadata() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("home");
+        fs::create_dir(&root)?;
+        let policy = ResourcePolicy::default();
+        let resources = ResourceAccount::standalone("test user", policy.user)?;
+        let manager = SessionManager::with_resources(
+            root.clone(),
+            temporary.path().join("catalog.pb"),
+            resources.clone(),
+            policy,
+        )?;
+        let files = FileService::with_resources(root, resources)?;
+        let request = Request {
+            request_id: "worker-request".into(),
+            command: Some(request::Command::List(ListRequest {})),
+        };
+        let channel = stream_channels::hello_for_request(&request, 7)?;
+        for mode in 0..4 {
+            let mut hello = WorkerStreamHello {
+                protocol_version: crate::PROTOCOL_VERSION,
+                capabilities: vec![crate::protocol::CapabilitySelection {
+                    name: CAPABILITY_STREAM_CHANNELS.into(),
+                    version: 1,
+                }],
+                connection_id: uuid::Uuid::new_v4().to_string(),
+                maximum_datagram_size: 0,
+                stream_epoch: 7,
+                stream_hello: Some(channel.clone()),
+            };
+            match mode {
+                1 => hello.stream_epoch = 8,
+                2 => hello.stream_hello = None,
+                3 => hello.capabilities.clear(),
+                _ => {}
+            }
+            let (mut client, server) = tokio::io::duplex(4096);
+            let (server_read, server_write) = tokio::io::split(server);
+            let client_exchange = async {
+                write_message(
+                    &mut client,
+                    &WireMessage::new(wire_message::Body::WorkerStreamHello(hello)),
+                )
+                .await?;
+                write_message(
+                    &mut client,
+                    &WireMessage::new(wire_message::Body::Request(request.clone())),
+                )
+                .await?;
+                client.shutdown().await?;
+                read_message(&mut client).await
+            };
+            let (worker_result, response) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    tokio::join!(
+                        handle_worker_request(
+                            manager.clone(),
+                            files.clone(),
+                            server_write,
+                            server_read
+                        ),
+                        client_exchange
+                    )
+                })
+                .await?;
+            if mode == 0 {
+                worker_result?;
+                let Some(WireMessage {
+                    body: Some(wire_message::Body::Response(response)),
+                }) = response?
+                else {
+                    bail!("worker did not return a response")
+                };
+                assert_eq!(response.request_id, request.request_id);
+                assert!(matches!(response.result, Some(response::Result::List(_))));
+            } else {
+                assert!(worker_result.is_err());
+                assert!(
+                    response?.is_none(),
+                    "rejected worker request must have no result"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn formal_terminal_commands_are_fenced_by_attachment_identity() {
         let mut command = crate::protocol::TerminalCommand {
             terminal_id: "terminal".into(),
@@ -2336,6 +2538,8 @@ mod tests {
                     version: crate::PROTOCOL_VERSION,
                     capabilities: BTreeMap::new(),
                 },
+                stream_epoch: 0,
+                stream_hello: None,
                 connection_id: uuid::Uuid::new_v4().to_string(),
                 datagram_transport: None,
             },

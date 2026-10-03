@@ -20,6 +20,7 @@
 
 | 名称 | v1 语义 | 当前 runtime 是否 offer | 开启条件 |
 |---|---|---|---|
+| `transport.stream_channels` | 认证后 StreamHello 声明通道、handle、连接 epoch 和 request ID；独立 Stream QoS | 是（Rust runtime/CLI、Apple v1） | 双方协商；认证流保持 ClientHello-first，详见 `stream-channels-v1.md` |
 | `payload.zstd` | 关键帧、历史页和文件块的独立 zstd frame；原文回退 | 是（Rust runtime/CLI v1；Swift 尚未 offer） | 双方协商后才可发送；不依赖终端 renderer 能力，详见 `payload-compression-v1.md` |
 | `terminal.legacy_ansi_snapshot` | 旧 `TerminalSnapshot` + ANSI replay | 是 | 迁移期保留 |
 | `terminal.semantic_state` | 可靠分片传输的 `astra.terminal.v2.State`；禁止混发 raw PTY | 是（Apple client/server v2） | `TERM-03`、`TERM-04` 已完成；CLI 未实现 replica，因此只 offer legacy capability |

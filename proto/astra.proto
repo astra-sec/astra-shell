@@ -16,6 +16,8 @@ message WireMessage {
     ClientHello client_hello = 8;
     // Gateway-to-worker metadata. Network clients must never send this.
     WorkerStreamHello worker_stream_hello = 9;
+    // First frame on post-authentication streams when transport.stream_channels v1 is selected.
+    StreamHello stream_hello = 10;
   }
 }
 
@@ -52,6 +54,23 @@ message WorkerStreamHello {
   // Connection-scoped payload limit reported by Quinn. Zero when datagram
   // delivery was not negotiated.
   uint32 maximum_datagram_size = 4;
+  uint64 stream_epoch = 5;
+  StreamHello stream_hello = 6;
+}
+enum StreamChannelKind {
+  STREAM_CHANNEL_KIND_UNSPECIFIED = 0;
+  STREAM_CHANNEL_KIND_CONTROL = 1;
+  STREAM_CHANNEL_KIND_TERMINAL = 2;
+  STREAM_CHANNEL_KIND_FILE = 3;
+}
+message StreamHello {
+  uint32 version = 1;
+  StreamChannelKind channel_kind = 2;
+  // Attach terminal ID; upload transfer ID where present; otherwise empty.
+  string handle = 3;
+  // Authentication connection epoch, not the terminal State epoch.
+  uint64 epoch = 4;
+  string request_id = 5;
 }
 message AuthRequest {
   string public_key = 1;
@@ -62,6 +81,8 @@ message AuthResult {
   string message = 2;
   // Stable machine-readable failure code. Empty for success and legacy servers.
   string error_code = 3;
+  // Nonzero only on success when transport.stream_channels v1 was selected.
+  uint64 stream_epoch = 4;
 }
 
 message Request {

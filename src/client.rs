@@ -19,8 +19,8 @@ use crate::{
     compression::{self, Background, WorkClass},
     known_hosts::{StrictHostKeyChecking, verify_server_certificate},
     negotiation::{
-        CAPABILITY_DATAGRAM_STATE, CAPABILITY_PAYLOAD_ZSTD, NegotiatedProtocol, ProtocolSupport,
-        client_hello, validate_server_hello,
+        CAPABILITY_DATAGRAM_STATE, CAPABILITY_PAYLOAD_ZSTD, CAPABILITY_STREAM_CHANNELS,
+        NegotiatedProtocol, ProtocolSupport, client_hello, validate_server_hello,
     },
     protocol::{
         AbortUploadRequest, AttachRequest, AttachResponse, BeginDownloadRequest,
@@ -34,6 +34,7 @@ use crate::{
         WriteFileChunkRequest, read_message, request, response, terminal_command, terminal_event,
         wire_message, write_message,
     },
+    stream_channels,
     terminal_state_v2::{HistoryPage, HistoryPageRequest},
     terminal_streaming::{
         ApplyDisposition, HistoryPageAssembler, StreamingReplica, TerminalStateAssembler,
@@ -151,6 +152,7 @@ pub struct AstraClient {
     connection: TransportConnection,
     reconnect: ReconnectConfig,
     negotiated: NegotiatedProtocol,
+    stream_epoch: u64,
     datagrams: DatagramRouter,
 }
 
@@ -462,7 +464,7 @@ impl AstraClient {
             return Err(error);
         }
         let connection = QuinnTransport::new(connection).into_connection();
-        let negotiated = authenticate(
+        let (negotiated, stream_epoch) = authenticate(
             &connection,
             &reconnect.identity,
             &reconnect.username,
@@ -475,6 +477,7 @@ impl AstraClient {
             connection,
             reconnect,
             negotiated,
+            stream_epoch,
             datagrams,
         })
     }
@@ -580,28 +583,14 @@ impl AstraClient {
         takeover: bool,
         resume_token: String,
     ) -> Result<(FramedSendStream, FramedRecvStream, AttachResponse)> {
-        let (mut send, mut recv) = self.connection.open_bi().await?;
-        let request_id = uuid::Uuid::new_v4().to_string();
-        write_message(
-            &mut send,
-            &WireMessage::new(wire_message::Body::Request(Request {
-                request_id: request_id.clone(),
-                command: Some(request::Command::Attach(AttachRequest {
-                    terminal_id,
-                    read_only,
-                    takeover,
-                    resume_token,
-                    workspace_id: String::new(),
-                })),
-            })),
-        )
-        .await?;
-        let response = require_response(&mut recv, &request_id).await?;
-        match response.result {
-            Some(response::Result::Attach(attach)) => Ok((send, recv, attach)),
-            Some(response::Result::Error(error)) => Err(server_response_error(error)),
-            _ => bail!("server returned the wrong response to attach"),
-        }
+        self.attach_request(AttachRequest {
+            terminal_id,
+            read_only,
+            takeover,
+            resume_token,
+            workspace_id: String::new(),
+        })
+        .await
     }
 
     pub async fn attach_streaming(
@@ -662,16 +651,9 @@ impl AstraClient {
         &self,
         request: AttachRequest,
     ) -> Result<(FramedSendStream, FramedRecvStream, AttachResponse)> {
-        let (mut send, mut recv) = self.connection.open_bi().await?;
-        let request_id = uuid::Uuid::new_v4().to_string();
-        write_message(
-            &mut send,
-            &WireMessage::new(wire_message::Body::Request(Request {
-                request_id: request_id.clone(),
-                command: Some(request::Command::Attach(request)),
-            })),
-        )
-        .await?;
+        let (send, mut recv, request_id) = self
+            .open_request_stream(request::Command::Attach(request))
+            .await?;
         let response = require_response(&mut recv, &request_id).await?;
         match response.result {
             Some(response::Result::Attach(attach)) => Ok((send, recv, attach)),
@@ -862,33 +844,45 @@ impl AstraClient {
     }
 
     async fn unary(&self, command: request::Command) -> Result<Response> {
-        self.unary_with_priority(command, 0).await
+        let (mut send, mut recv, request_id) = self.open_request_stream(command).await?;
+        send.finish().await?;
+        require_response(&mut recv, &request_id).await
     }
 
     async fn file_unary(&self, command: request::Command) -> Result<Response> {
-        // Quinn schedules higher numeric priorities first. File traffic stays below terminal
-        // streams so a large upload cannot make interactive input feel sluggish.
-        self.unary_with_priority(command, -10).await
+        self.unary(command).await
     }
 
-    async fn unary_with_priority(
+    async fn open_request_stream(
         &self,
         command: request::Command,
-        priority: i32,
-    ) -> Result<Response> {
-        let (mut send, mut recv) = self.connection.open_bi().await?;
-        send.set_priority(priority)?;
+    ) -> Result<(FramedSendStream, FramedRecvStream, String)> {
         let request_id = uuid::Uuid::new_v4().to_string();
+        let request = Request {
+            request_id: request_id.clone(),
+            command: Some(command),
+        };
+        let (kind, _) = stream_channels::request_channel(&request)?;
+        let hello = self
+            .negotiated
+            .has(CAPABILITY_STREAM_CHANNELS, 1)
+            .then(|| stream_channels::hello_for_request(&request, self.stream_epoch))
+            .transpose()?;
+        let (mut send, recv) = self.connection.open_bi().await?;
+        send.set_priority(kind.priority())?;
+        if let Some(hello) = hello {
+            write_message(
+                &mut send,
+                &WireMessage::new(wire_message::Body::StreamHello(hello)),
+            )
+            .await?;
+        }
         write_message(
             &mut send,
-            &WireMessage::new(wire_message::Body::Request(Request {
-                request_id: request_id.clone(),
-                command: Some(command),
-            })),
+            &WireMessage::new(wire_message::Body::Request(request)),
         )
         .await?;
-        send.finish().await?;
-        require_response(&mut recv, &request_id).await
+        Ok((send, recv, request_id))
     }
 }
 
@@ -1250,7 +1244,7 @@ async fn authenticate(
     identity: &Path,
     username: &str,
     support: &ProtocolSupport,
-) -> Result<NegotiatedProtocol> {
+) -> Result<(NegotiatedProtocol, u64)> {
     let (mut send, mut recv) = connection.open_bi().await?;
     let client_hello = client_hello(username, support);
     write_message(
@@ -1281,7 +1275,13 @@ async fn authenticate(
     match read_message(&mut recv).await? {
         Some(WireMessage {
             body: Some(wire_message::Body::AuthResult(result)),
-        }) if result.ok => Ok(negotiated),
+        }) if result.ok => {
+            anyhow::ensure!(
+                negotiated.has(CAPABILITY_STREAM_CHANNELS, 1) == (result.stream_epoch != 0),
+                "server returned an invalid stream epoch for the negotiated capabilities"
+            );
+            Ok((negotiated, result.stream_epoch))
+        }
         Some(WireMessage {
             body: Some(wire_message::Body::AuthResult(result)),
         }) if !result.error_code.is_empty() => Err(ServerResponseError {
@@ -1659,9 +1659,10 @@ mod tests {
             for enabled in [true, false] {
                 let mut support = ProtocolSupport::command_line_client();
                 if !enabled {
-                    support
-                        .capabilities
-                        .retain(|cap| cap.name != CAPABILITY_PAYLOAD_ZSTD);
+                    support.capabilities.retain(|cap| {
+                        cap.name != CAPABILITY_PAYLOAD_ZSTD
+                            && cap.name != CAPABILITY_STREAM_CHANNELS
+                    });
                 }
                 let client = AstraClient::connect_with_support(
                     listen,
@@ -1673,6 +1674,11 @@ mod tests {
                 )
                 .await?;
                 assert_eq!(client.negotiated.has(CAPABILITY_PAYLOAD_ZSTD, 1), enabled);
+                assert_eq!(
+                    client.negotiated.has(CAPABILITY_STREAM_CHANNELS, 1),
+                    enabled
+                );
+                assert_eq!(client.stream_epoch != 0, enabled);
                 let path = format!("transfer-{enabled}.bin").into_bytes();
                 let contents = vec![b'x'; MAX_FILE_CHUNK_SIZE + 8192];
                 let transfer_id = uuid::Uuid::new_v4().to_string();
@@ -1778,9 +1784,7 @@ mod tests {
                 assert_eq!(first.encoding, 0); // public API always returns original bytes
                 assert_eq!(first.data, contents[..MAX_FILE_CHUNK_SIZE]);
                 assert!(!first.eof);
-                resumed
-                    .connection
-                    .close(0, b"download resume test");
+                resumed.connection.close(0, b"download resume test");
                 let last = resumed.reconnect().await?;
                 drop(resumed);
                 let tail = last
@@ -1806,6 +1810,215 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         })
         .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_channels_keep_two_terminals_control_and_bulk_files_making_progress()
+    -> Result<()> {
+        use sha2::{Digest, Sha256};
+        const CHUNK: usize = 1024 * 1024;
+        const ROUNDS: usize = 8;
+        struct Stop(tokio::task::JoinHandle<Result<()>>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        async fn echo(
+            stream: &mut (FramedSendStream, FramedRecvStream, AttachResponse),
+            marker: &str,
+            sequence: u64,
+        ) -> Result<()> {
+            let (send, recv, attached) = stream;
+            write_message(
+                send,
+                &WireMessage::new(wire_message::Body::TerminalCommand(TerminalCommand {
+                    terminal_id: attached
+                        .terminal
+                        .as_ref()
+                        .context("missing attached terminal")?
+                        .id
+                        .clone(),
+                    lease_id: attached.lease_id.clone(),
+                    sequence,
+                    command: Some(terminal_command::Command::Input(
+                        format!("{marker}\n").into_bytes(),
+                    )),
+                    ..Default::default()
+                })),
+            )
+            .await?;
+            let mut tail = Vec::new();
+            loop {
+                let message = read_message(recv).await?.context("terminal stream ended")?;
+                if let Some(wire_message::Body::TerminalEvent(event)) = message.body {
+                    match event.event {
+                        Some(terminal_event::Event::Output(bytes)) => {
+                            tail.extend(bytes);
+                            if tail
+                                .windows(marker.len())
+                                .any(|window| window == marker.as_bytes())
+                            {
+                                return Ok(());
+                            }
+                            if tail.len() > 4096 {
+                                tail.drain(..tail.len() - 4096);
+                            }
+                        }
+                        Some(terminal_event::Event::Error(error)) => bail!(error),
+                        Some(terminal_event::Event::Exited(_)) => {
+                            bail!("terminal exited before echo")
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let temporary = tempfile::tempdir()?;
+        let paths = ServerPaths::new(temporary.path().join("state"));
+        initialize_state(&paths)?;
+        let identity = PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ed25519)?;
+        let identity_path = temporary.path().join("id_ed25519");
+        fs::write(&identity_path, identity.to_openssh(LineEnding::LF)?)?;
+        fs::set_permissions(&identity_path, fs::Permissions::from_mode(0o600))?;
+        fs::write(
+            &paths.authorized_keys,
+            format!("{}\n", identity.public_key().to_openssh()?),
+        )?;
+        let session_root = temporary.path().join("home");
+        fs::create_dir(&session_root)?;
+        let contents: Vec<u8> = (0..CHUNK * ROUNDS)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        fs::write(session_root.join("source.bin"), &contents)?;
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let listen = reservation.local_addr()?;
+        drop(reservation);
+        let _server = Stop(tokio::spawn(serve(ServerOptions {
+            listen,
+            paths: paths.clone(),
+            mode: ServerMode::Rootless {
+                session_root: session_root.clone(),
+            },
+            resource_policy: ResourcePolicy::default(),
+        })));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Exercise reliable terminal send scheduling, and transmit actual bulk
+        // bytes instead of allowing repetitive test content to compress away.
+        let mut support = ProtocolSupport::command_line_client();
+        support.capabilities.retain(|cap| {
+            cap.name != CAPABILITY_DATAGRAM_STATE && cap.name != CAPABILITY_PAYLOAD_ZSTD
+        });
+        let client = AstraClient::connect_with_support(
+            listen,
+            "localhost",
+            &ServerTrust::PinnedCertificate(paths.cert),
+            &identity_path,
+            &SystemAccount::current()?.username,
+            support,
+        )
+        .await?;
+        assert!(client.negotiated.has(CAPABILITY_STREAM_CHANNELS, 1));
+        let spawn = |name: &str| SpawnRequest {
+            name: name.into(),
+            argv: vec!["/bin/cat".into()],
+            rows: 6,
+            cols: 40,
+            term: "xterm-256color".into(),
+            ..Default::default()
+        };
+        let first = client.spawn(spawn("qos-first")).await?;
+        let second = client.spawn(spawn("qos-second")).await?;
+        let first_id = first.id.clone();
+        let second_id = second.id.clone();
+        let mut first = client.attach(first.id, false, false, String::new()).await?;
+        let mut second = client
+            .attach(second.id, false, false, String::new())
+            .await?;
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        client
+            .begin_upload(BeginUploadRequest {
+                transfer_id: transfer_id.clone(),
+                path: b"destination.bin".to_vec(),
+                size: contents.len() as u64,
+                sha256: Sha256::digest(&contents).to_vec(),
+                mode: 0o600,
+                overwrite: false,
+            })
+            .await?;
+        let download = client.begin_download(b"source.bin".to_vec(), false).await?;
+        let barrier = tokio::sync::Barrier::new(3);
+        let terminals = async {
+            for round in 0..ROUNDS {
+                barrier.wait().await;
+                let marker = format!("interactive-{round}");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::try_join!(
+                        echo(&mut first, &marker, round as u64 + 1),
+                        echo(&mut second, &marker, round as u64 + 1)
+                    )?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+                .context("terminal stalled behind bulk files")??;
+                barrier.wait().await;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let control = async {
+            for _ in 0..ROUNDS {
+                barrier.wait().await;
+                let terminals = tokio::time::timeout(Duration::from_secs(5), client.list())
+                    .await
+                    .context("control stalled behind bulk files")??;
+                assert!(terminals.iter().any(|value| value.id == first_id));
+                assert!(terminals.iter().any(|value| value.id == second_id));
+                barrier.wait().await;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let bulk = async {
+            for round in 0..ROUNDS {
+                barrier.wait().await;
+                let offset = round * CHUNK;
+                let data = contents[offset..offset + CHUNK].to_vec();
+                let (uploaded, downloaded) = tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::try_join!(
+                        client.write_file_chunk(WriteFileChunkRequest {
+                            transfer_id: transfer_id.clone(),
+                            offset: offset as u64,
+                            sha256: Sha256::digest(&data).to_vec(),
+                            data,
+                            ..Default::default()
+                        }),
+                        client.read_file_chunk(ReadFileChunkRequest {
+                            path: b"source.bin".to_vec(),
+                            snapshot: download.snapshot.clone(),
+                            offset: offset as u64,
+                            length: CHUNK as u32,
+                        }),
+                    )
+                })
+                .await
+                .context("bulk file stream starved")??;
+                assert_eq!(uploaded.committed_offset, (offset + CHUNK) as u64);
+                assert_eq!(downloaded.data, contents[offset..offset + CHUNK]);
+                barrier.wait().await;
+            }
+            client.commit_upload(transfer_id).await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::try_join!(terminals, control, bulk)
+        })
+        .await??;
+        assert_eq!(fs::read(session_root.join("destination.bin"))?, contents);
+        drop(first);
+        drop(second);
+        client.close(first_id).await?;
+        client.close(second_id).await?;
         Ok(())
     }
 

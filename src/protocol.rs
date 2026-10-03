@@ -25,7 +25,7 @@ pub const LOCALE_ENVIRONMENT_VARIABLES: &[&str] = &[
 
 #[derive(Clone, PartialEq, Message)]
 pub struct WireMessage {
-    #[prost(oneof = "wire_message::Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "wire_message::Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub body: Option<wire_message::Body>,
 }
 
@@ -55,6 +55,8 @@ pub mod wire_message {
         ClientHello(ClientHello),
         #[prost(message, tag = "9")]
         WorkerStreamHello(WorkerStreamHello),
+        #[prost(message, tag = "10")]
+        StreamHello(StreamHello),
     }
 }
 
@@ -112,6 +114,33 @@ pub struct WorkerStreamHello {
     pub connection_id: String,
     #[prost(uint32, tag = "4")]
     pub maximum_datagram_size: u32,
+    #[prost(uint64, tag = "5")]
+    pub stream_epoch: u64,
+    #[prost(message, optional, tag = "6")]
+    pub stream_hello: Option<StreamHello>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum StreamChannelKind {
+    Unspecified = 0,
+    Control = 1,
+    Terminal = 2,
+    File = 3,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct StreamHello {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(enumeration = "StreamChannelKind", tag = "2")]
+    pub channel_kind: i32,
+    #[prost(string, tag = "3")]
+    pub handle: String,
+    #[prost(uint64, tag = "4")]
+    pub epoch: u64,
+    #[prost(string, tag = "5")]
+    pub request_id: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -130,6 +159,8 @@ pub struct AuthResult {
     pub message: String,
     #[prost(string, tag = "3")]
     pub error_code: String,
+    #[prost(uint64, tag = "4")]
+    pub stream_epoch: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1139,6 +1170,15 @@ where
     MessageReader::default().read(reader).await
 }
 
+/// Initial negotiated stream metadata is much smaller than application frames.
+/// Reject its advertised length before allocating a payload buffer.
+pub async fn read_message_limited<R>(reader: &mut R, limit: usize) -> Result<Option<WireMessage>>
+where
+    R: AsyncRead + Unpin,
+{
+    MessageReader::default().read_limited(reader, limit).await
+}
+
 /// Keep this parser outside `select!`: cancellation of `read` preserves every
 /// consumed header/payload byte. The one-shot `read_message` helper must only be
 /// used when a cancelled read also discards the stream.
@@ -1155,6 +1195,14 @@ impl MessageReader {
         &mut self,
         reader: &mut R,
     ) -> Result<Option<WireMessage>> {
+        self.read_limited(reader, MAX_FRAME_SIZE).await
+    }
+
+    async fn read_limited<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+        limit: usize,
+    ) -> Result<Option<WireMessage>> {
         while self.header_read < self.header.len() {
             let count = reader.read(&mut self.header[self.header_read..]).await?;
             if count == 0 {
@@ -1166,7 +1214,7 @@ impl MessageReader {
             self.header_read += count;
         }
         let length = u32::from_be_bytes(self.header) as usize;
-        if length > MAX_FRAME_SIZE {
+        if length > limit.min(MAX_FRAME_SIZE) {
             bail!("peer sent oversized frame: {length} bytes");
         }
         self.payload.resize(length, 0);
@@ -1380,6 +1428,7 @@ mod tests {
             ok: false,
             message: "connection limit reached".into(),
             error_code: "connection_quota_exceeded".into(),
+            stream_epoch: 0,
         };
         let legacy = LegacyAuthResult::decode(current.encode_to_vec().as_slice()).unwrap();
         assert!(!legacy.ok);
@@ -1391,6 +1440,15 @@ mod tests {
         };
         let current = AuthResult::decode(legacy.encode_to_vec().as_slice()).unwrap();
         assert_eq!(current.error_code, "");
+        assert_eq!(current.stream_epoch, 0);
+
+        let current = AuthResult {
+            ok: true,
+            stream_epoch: 42,
+            ..Default::default()
+        };
+        let legacy = LegacyAuthResult::decode(current.encode_to_vec().as_slice()).unwrap();
+        assert!(legacy.ok);
     }
 
     #[test]
@@ -1757,6 +1815,8 @@ mod tests {
             capabilities: vec![],
             connection_id: "connection".into(),
             maximum_datagram_size: 1_200,
+            stream_epoch: 0,
+            stream_hello: None,
         };
         let legacy = LegacyWorkerStreamHello::decode(worker.encode_to_vec().as_slice()).unwrap();
         assert_eq!(legacy.connection_id, "connection");

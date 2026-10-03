@@ -26,7 +26,8 @@ use crate::{
     negotiation::{CAPABILITY_DATAGRAM_STATE, NegotiatedProtocol, selections},
     process_lock::ProcessLock,
     protocol::{
-        WireMessage, WorkerStreamHello, read_message, terminal_event, wire_message, write_message,
+        StreamHello, WireMessage, WorkerStreamHello, read_message, terminal_event, wire_message,
+        write_message,
     },
     resources::{ResourceAccount, ResourceGovernor, ResourcePolicy, ResourceReservation},
     server::handle_worker_request,
@@ -46,6 +47,8 @@ pub struct WorkerRouter {
 pub(crate) struct WorkerProxyStream {
     pub(crate) first_message: WireMessage,
     pub(crate) negotiated: NegotiatedProtocol,
+    pub(crate) stream_epoch: u64,
+    pub(crate) stream_hello: Option<StreamHello>,
     pub(crate) connection_id: String,
     pub(crate) connection: TransportConnection,
 }
@@ -87,6 +90,8 @@ impl WorkerRouter {
         let WorkerProxyStream {
             first_message,
             negotiated,
+            stream_epoch,
+            stream_hello,
             connection_id,
             connection,
         } = request;
@@ -99,6 +104,8 @@ impl WorkerRouter {
                 capabilities: selections(&negotiated),
                 connection_id,
                 maximum_datagram_size: worker_datagram_payload_limit(&negotiated, &connection)?,
+                stream_epoch,
+                stream_hello,
             })),
         )
         .await?;
@@ -692,6 +699,7 @@ mod tests {
             ok: true,
             message: "control".into(),
             error_code: String::new(),
+            stream_epoch: 0,
         }));
         let viewport = TerminalViewportDatagram {
             terminal_id: "terminal".into(),
@@ -729,6 +737,7 @@ mod tests {
             ok: true,
             message: "after-pmtu-shrink".into(),
             error_code: String::new(),
+            stream_epoch: 0,
         }));
         let (mut worker_writer, mut worker_reader) = tokio::io::duplex(16 * 1024);
         let (mut reliable_reader, mut reliable_writer) = tokio::io::duplex(16 * 1024);

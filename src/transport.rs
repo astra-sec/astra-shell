@@ -224,6 +224,7 @@ mod tests {
             ok: true,
             message: "transport-independent framing".into(),
             error_code: String::new(),
+            stream_epoch: 0,
         }));
         let client = async {
             write_message(&mut left_send, &message).await?;
