@@ -1637,6 +1637,55 @@ mod tests {
     }
 
     #[test]
+    fn datagram_size_budget_boundary_alone_selects_reliable_keyframe() {
+        let mut engine = TerminalEngine::new(24, 80, 128, Box::new(std::io::sink())).unwrap();
+        for row in 1..=24 {
+            engine.advance(format!("\x1b[{row};1H{}", "x".repeat(79)).as_bytes());
+        }
+        let initial = viewport(&mut engine);
+        for row in [1, 6, 12, 18] {
+            engine.advance(format!("\x1b[{row};1H{}", "y".repeat(79)).as_bytes());
+        }
+        let latest = viewport(&mut engine);
+        let delta =
+            compact_viewport_datagram(TERMINAL_ID, ATTACHMENT_ID, &initial, &latest).unwrap();
+        let delta_bytes = delta.encoded_len();
+        assert_eq!(initial.epoch, latest.epoch);
+        assert_eq!((initial.rows, initial.cols), (latest.rows, latest.cols));
+        assert!(delta_bytes > DATAGRAM_BUDGET);
+        assert!(delta_bytes < latest.encoded_len());
+
+        // Both senders have the identical ACKed base and target. No timer,
+        // retry, repair, epoch change or resize participates: one byte of
+        // payload budget is the only difference between these decisions.
+        let mut fitting_sender = sender(initial.clone());
+        let mut oversized_sender = sender(initial);
+        let fitting = fitting_sender
+            .prepare_update(latest.clone(), delta_bytes)
+            .unwrap()
+            .unwrap();
+        let StreamingUpdate::DatagramDelta(actual_delta) = fitting else {
+            panic!("a delta at the exact payload budget must fit")
+        };
+        assert_eq!(actual_delta, delta);
+        assert_eq!(
+            apply_compact_viewport_delta(&fitting_sender.base, &actual_delta).unwrap(),
+            latest
+        );
+
+        let oversized = oversized_sender
+            .prepare_update(latest.clone(), delta_bytes - 1)
+            .unwrap()
+            .unwrap();
+        let StreamingUpdate::ReliableKeyframe(actual_state) = oversized else {
+            panic!("a delta one byte over budget must use a reliable keyframe")
+        };
+        assert_eq!(actual_state, latest);
+        assert!(fitting_sender.base_is_acknowledged());
+        assert!(!oversized_sender.base_is_acknowledged());
+    }
+
+    #[test]
     fn oversized_updates_allow_only_one_unacknowledged_keyframe() {
         let mut engine = TerminalEngine::new(24, 80, 128, Box::new(std::io::sink())).unwrap();
         let initial = viewport(&mut engine);
