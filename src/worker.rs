@@ -30,6 +30,7 @@ use crate::{
     },
     resources::{ResourceAccount, ResourceGovernor, ResourcePolicy, ResourceReservation},
     server::handle_worker_request,
+    transport::{FramedRecvStream, FramedSendStream, TransportConnection},
 };
 
 pub struct WorkerRouter {
@@ -46,7 +47,7 @@ pub(crate) struct WorkerProxyStream {
     pub(crate) first_message: WireMessage,
     pub(crate) negotiated: NegotiatedProtocol,
     pub(crate) connection_id: String,
-    pub(crate) connection: quinn::Connection,
+    pub(crate) connection: TransportConnection,
 }
 
 pub const DEFAULT_WORKER_IDLE_TIMEOUT_SECONDS: u64 = 10 * 60;
@@ -79,8 +80,8 @@ impl WorkerRouter {
     pub(crate) async fn proxy_stream(
         &self,
         account: &SystemAccount,
-        mut quic_send: quinn::SendStream,
-        mut quic_recv: quinn::RecvStream,
+        mut client_send: FramedSendStream,
+        mut client_recv: FramedRecvStream,
         request: WorkerProxyStream,
     ) -> Result<()> {
         let WorkerProxyStream {
@@ -103,12 +104,12 @@ impl WorkerRouter {
         .await?;
         write_message(&mut worker_send, &first_message).await?;
         let client_to_worker = async {
-            copy(&mut quic_recv, &mut worker_send).await?;
+            copy(&mut client_recv, &mut worker_send).await?;
             worker_send.shutdown().await?;
             Ok::<(), anyhow::Error>(())
         };
         let worker_to_client =
-            forward_worker_messages(&mut worker_recv, &mut quic_send, &connection);
+            forward_worker_messages(&mut worker_recv, &mut client_send, &connection);
         tokio::try_join!(client_to_worker, worker_to_client)?;
         Ok(())
     }
@@ -290,7 +291,7 @@ impl WorkerRouter {
 
 fn worker_datagram_payload_limit(
     negotiated: &NegotiatedProtocol,
-    connection: &quinn::Connection,
+    connection: &TransportConnection,
 ) -> Result<u32> {
     if !negotiated.has(CAPABILITY_DATAGRAM_STATE, 1) {
         return Ok(0);
@@ -305,7 +306,7 @@ fn worker_datagram_payload_limit(
 async fn forward_worker_messages<R, W>(
     worker_recv: &mut R,
     client_send: &mut W,
-    connection: &quinn::Connection,
+    connection: &TransportConnection,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -322,7 +323,7 @@ where
 async fn forward_worker_messages_inner<R, W>(
     worker_recv: &mut R,
     client_send: &mut W,
-    connection: &quinn::Connection,
+    connection: &TransportConnection,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -356,13 +357,7 @@ where
             if encoded.len() > maximum {
                 continue;
             }
-            match connection.send_datagram(encoded.into()) {
-                Ok(())
-                | Err(quinn::SendDatagramError::TooLarge)
-                | Err(quinn::SendDatagramError::UnsupportedByPeer)
-                | Err(quinn::SendDatagramError::Disabled) => {}
-                Err(quinn::SendDatagramError::ConnectionLost(error)) => return Err(error.into()),
-            }
+            connection.send_datagram(encoded.into())?;
         } else {
             write_message(client_send, &message).await?;
         }
@@ -672,6 +667,8 @@ mod tests {
             .context("server endpoint closed before accepting")?;
         let (client_connection, server_connection) =
             tokio::try_join!(client_connecting, server_incoming)?;
+        let server_connection =
+            crate::transport::QuinnTransport::new(server_connection).into_connection();
 
         let legacy = NegotiatedProtocol {
             version: crate::PROTOCOL_VERSION,
@@ -768,7 +765,7 @@ mod tests {
         );
 
         client_connection.close(0_u32.into(), b"test complete");
-        server_connection.close(0_u32.into(), b"test complete");
+        server_connection.close(0, b"test complete");
         Ok(())
     }
 

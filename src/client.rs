@@ -38,6 +38,7 @@ use crate::{
     terminal_streaming::{
         ApplyDisposition, HistoryPageAssembler, StreamingReplica, TerminalStateAssembler,
     },
+    transport::{FramedRecvStream, FramedSendStream, QuinnTransport, TransportConnection},
 };
 
 #[derive(Debug)]
@@ -147,7 +148,7 @@ impl rustls::client::danger::ServerCertVerifier for DeferredServerVerification {
 
 pub struct AstraClient {
     _endpoint: quinn::Endpoint,
-    connection: quinn::Connection,
+    connection: TransportConnection,
     reconnect: ReconnectConfig,
     negotiated: NegotiatedProtocol,
     datagrams: DatagramRouter,
@@ -187,7 +188,7 @@ enum DatagramDelivery {
 }
 
 impl DatagramRouter {
-    fn new(connection: quinn::Connection) -> Self {
+    fn new(connection: TransportConnection) -> Self {
         let routes = Arc::new(Mutex::new(HashMap::<DatagramRoute, DatagramMailbox>::new()));
         let task_routes = routes.clone();
         tokio::spawn(async move {
@@ -313,7 +314,7 @@ pub enum StreamingAttachmentEvent {
 pub struct StreamingAttachment {
     send: crate::queued_writer::QueuedWriter,
     writer_task: tokio::task::JoinHandle<Result<()>>,
-    recv: quinn::RecvStream,
+    recv: FramedRecvStream,
     reader: crate::protocol::MessageReader,
     terminal_id: String,
     attachment_id: String,
@@ -357,13 +358,13 @@ struct ReconnectConfig {
 
 impl Drop for AstraClient {
     fn drop(&mut self) {
-        self.connection.close(0_u32.into(), b"client done");
+        self.connection.close(0, b"client done");
     }
 }
 
 impl AstraClient {
     pub(crate) fn connection_lost(&self) -> bool {
-        self.connection.close_reason().is_some()
+        self.connection.is_closed()
     }
     pub async fn connect(
         remote: SocketAddr,
@@ -460,6 +461,7 @@ impl AstraClient {
             connection.close(1_u32.into(), b"host certificate rejected");
             return Err(error);
         }
+        let connection = QuinnTransport::new(connection).into_connection();
         let negotiated = authenticate(
             &connection,
             &reconnect.identity,
@@ -577,7 +579,7 @@ impl AstraClient {
         read_only: bool,
         takeover: bool,
         resume_token: String,
-    ) -> Result<(quinn::SendStream, quinn::RecvStream, AttachResponse)> {
+    ) -> Result<(FramedSendStream, FramedRecvStream, AttachResponse)> {
         let (mut send, mut recv) = self.connection.open_bi().await?;
         let request_id = uuid::Uuid::new_v4().to_string();
         write_message(
@@ -659,7 +661,7 @@ impl AstraClient {
     async fn attach_request(
         &self,
         request: AttachRequest,
-    ) -> Result<(quinn::SendStream, quinn::RecvStream, AttachResponse)> {
+    ) -> Result<(FramedSendStream, FramedRecvStream, AttachResponse)> {
         let (mut send, mut recv) = self.connection.open_bi().await?;
         let request_id = uuid::Uuid::new_v4().to_string();
         write_message(
@@ -885,7 +887,7 @@ impl AstraClient {
             })),
         )
         .await?;
-        send.finish()?;
+        send.finish().await?;
         require_response(&mut recv, &request_id).await
     }
 }
@@ -1244,7 +1246,7 @@ fn verify_connection_certificate(
 }
 
 async fn authenticate(
-    connection: &quinn::Connection,
+    connection: &TransportConnection,
     identity: &Path,
     username: &str,
     support: &ProtocolSupport,
@@ -1275,7 +1277,7 @@ async fn authenticate(
         )),
     )
     .await?;
-    send.finish()?;
+    send.finish().await?;
     match read_message(&mut recv).await? {
         Some(WireMessage {
             body: Some(wire_message::Body::AuthResult(result)),
@@ -1298,7 +1300,7 @@ async fn authenticate(
     }
 }
 
-async fn require_response(recv: &mut quinn::RecvStream, request_id: &str) -> Result<Response> {
+async fn require_response(recv: &mut FramedRecvStream, request_id: &str) -> Result<Response> {
     match read_message(recv).await? {
         Some(WireMessage {
             body: Some(wire_message::Body::Response(response)),
@@ -1578,7 +1580,7 @@ mod tests {
         // start from a reliable viewport and then return to datagram updates.
         client
             .connection
-            .close(0_u32.into(), b"integration test connection loss");
+            .close(0, b"integration test connection loss");
         let reconnected = client.reconnect().await?;
         let (mut resumed_attachment, resumed) = reconnected
             .attach_streaming(AttachRequest {
@@ -1724,7 +1726,7 @@ mod tests {
                     MAX_FILE_CHUNK_SIZE as u64
                 );
 
-                client.connection.close(0u32.into(), b"file resume test");
+                client.connection.close(0, b"file resume test");
                 let resumed = client.reconnect().await?;
                 drop(client);
                 assert_eq!(
@@ -1778,7 +1780,7 @@ mod tests {
                 assert!(!first.eof);
                 resumed
                     .connection
-                    .close(0u32.into(), b"download resume test");
+                    .close(0, b"download resume test");
                 let last = resumed.reconnect().await?;
                 drop(resumed);
                 let tail = last
@@ -1935,7 +1937,7 @@ mod tests {
         wait_live(&first, 1, "before-loss-one").await?;
         wait_live(&second, 1, "before-loss-two").await?;
         offline.store(true, Ordering::Release);
-        old_transport.close(0u32.into(), b"fault injection");
+        old_transport.close(0, b"fault injection");
         tokio::time::timeout(Duration::from_secs(2), async {
             while !matches!(first.connection_state(), ConnectionState::Recovering { .. }) {
                 tokio::task::yield_now().await;

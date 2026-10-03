@@ -976,7 +976,7 @@ async fn attach_terminal(
                                     }
                                     Some(terminal_event::Event::Exited(code)) => {
                                         eprintln!("\r\n[astra: terminal exited with status {code}]");
-                                        let _ = send.finish();
+                                        let _ = send.finish().await;
                                         let _ = read_message(&mut recv).await;
                                         return Ok(());
                                     }
@@ -1030,7 +1030,7 @@ async fn attach_terminal(
                                     command: Some(terminal_command::Command::Detach(true)),
                                 },
                             ).await;
-                            let _ = send.finish();
+                            let _ = send.finish().await;
                             return Ok(());
                         }
                         match send_terminal_command(
@@ -1156,8 +1156,8 @@ async fn reconnect_terminal(
     resume_token: &str,
 ) -> Result<(
     AstraClient,
-    quinn::SendStream,
-    quinn::RecvStream,
+    astra_shell::transport::FramedSendStream,
+    astra_shell::transport::FramedRecvStream,
     AttachResponse,
 )> {
     let mut delay = Duration::from_millis(250);
@@ -1199,7 +1199,7 @@ async fn reconnect_terminal(
 }
 
 async fn send_terminal_command(
-    send: &mut quinn::SendStream,
+    send: &mut astra_shell::transport::FramedSendStream,
     command: TerminalCommand,
 ) -> Result<()> {
     write_message(

@@ -47,6 +47,7 @@ use crate::{
     },
     terminal_streaming::{StreamingStateWindow, StreamingUpdate},
     terminal_sync::{AckDisposition, PreparedStateUpdate, StateSyncWindow},
+    transport::{FramedRecvStream, FramedSendStream, QuinnTransport, TransportConnection},
     worker::{WorkerProxyStream, WorkerRouter},
 };
 
@@ -134,7 +135,7 @@ const TERMINAL_DATAGRAM_REKEY_INTERVAL: std::time::Duration = std::time::Duratio
 
 #[derive(Clone)]
 enum TerminalDatagramTransport {
-    Direct(quinn::Connection),
+    Direct(TransportConnection),
     WorkerBridge { maximum_datagram_size: usize },
 }
 
@@ -392,6 +393,7 @@ fn validate_managed_gateway_state(_paths: &ServerPaths) -> Result<()> {
 async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Result<()> {
     let connection = incoming.await.context("QUIC handshake failed")?;
     let remote = connection.remote_address();
+    let connection = QuinnTransport::new(connection).into_connection();
     let (username, fingerprint, backend, negotiated, connection_resources, _connection_reservation) =
         match tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -401,7 +403,7 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
         {
             Ok(result) => result?,
             Err(_) => {
-                connection.close(0x101_u32.into(), b"authentication timeout");
+                connection.close(0x101, b"authentication timeout");
                 bail!("client authentication timed out")
             }
         };
@@ -417,9 +419,9 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
 
     loop {
         let (mut send, mut recv) = match connection.accept_bi().await {
-            Ok(stream) => stream,
-            Err(quinn::ConnectionError::ApplicationClosed { .. }) => return Ok(()),
-            Err(error) => return Err(error.into()),
+            Ok(Some(stream)) => stream,
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(error),
         };
         let backend = backend.clone();
         let negotiated = negotiated.clone();
@@ -491,7 +493,7 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
 
 async fn authenticate_connection(
     state: &ServerState,
-    connection: &quinn::Connection,
+    connection: &TransportConnection,
 ) -> Result<(
     String,
     String,
@@ -558,10 +560,10 @@ async fn authenticate_connection(
                 })),
             )
             .await;
-            let _ = auth_send.finish();
+            let _ = auth_send.finish().await;
             let _ =
                 tokio::time::timeout(std::time::Duration::from_secs(1), auth_send.stopped()).await;
-            connection.close(0x100_u32.into(), b"authentication failed");
+            connection.close(0x100, b"authentication failed");
             return Err(error.context("client authentication failed"));
         }
     };
@@ -581,10 +583,10 @@ async fn authenticate_connection(
                 )),
             )
             .await?;
-            auth_send.finish()?;
+            auth_send.finish().await?;
             let _ =
                 tokio::time::timeout(std::time::Duration::from_secs(1), auth_send.stopped()).await;
-            connection.close(0x102_u32.into(), b"connection quota exceeded");
+            connection.close(0x102, b"connection quota exceeded");
             return Err(error.into());
         }
     };
@@ -597,7 +599,7 @@ async fn authenticate_connection(
         })),
     )
     .await?;
-    auth_send.finish()?;
+    auth_send.finish().await?;
     Ok((
         username,
         fingerprint,
@@ -617,8 +619,8 @@ fn connection_quota_auth_result(error: &QuotaExceeded) -> AuthResult {
 }
 
 async fn accept_authentication_stream(
-    connection: &quinn::Connection,
-) -> Result<(quinn::SendStream, quinn::RecvStream, WireMessage)> {
+    connection: &TransportConnection,
+) -> Result<(FramedSendStream, FramedRecvStream, WireMessage)> {
     // Apple's NWConnectionGroup reserves an empty client-initiated bidi stream
     // for the group data flow, so the first application stream can have index
     // 1. Read a small bounded set concurrently and use the first stream that
@@ -630,8 +632,9 @@ async fn accept_authentication_stream(
         tokio::select! {
             accepted = connection.accept_bi(), if pending.len() < MAX_PENDING_STREAMS => {
                 let (send, mut recv) = accepted
+                    .context("authentication transport failed")?
                     .context("client did not open authentication stream")?;
-                trace!(stream_id = %recv.id(), "accepted authentication candidate stream");
+                trace!(stream_id = ?recv.diagnostic_id(), "accepted authentication candidate stream");
                 pending.spawn(async move {
                     let message = read_message(&mut recv).await;
                     (send, recv, message)
@@ -643,7 +646,7 @@ async fn accept_authentication_stream(
                     .context("authentication stream reader task failed")?;
                 match message? {
                     Some(message) => {
-                        trace!(stream_id = %recv.id(), "received first authentication stream frame");
+                        trace!(stream_id = ?recv.diagnostic_id(), "received first authentication stream frame");
                         // Keep unread reserved streams alive for the connection;
                         // dropping them here would reset a Network.framework
                         // group flow that the Apple client still owns.
@@ -1204,7 +1207,7 @@ fn is_file_request(message: &WireMessage) -> bool {
 }
 
 async fn reject_request_for_quota(
-    send: &mut quinn::SendStream,
+    send: &mut FramedSendStream,
     message: &WireMessage,
     error: QuotaExceeded,
 ) -> Result<()> {
@@ -2141,13 +2144,8 @@ where
                     // locally lost; retry/re-key provides bounded recovery.
                     return Ok(());
                 }
-                match connection.send_datagram(encoded.into()) {
-                    Ok(())
-                    | Err(quinn::SendDatagramError::TooLarge)
-                    | Err(quinn::SendDatagramError::UnsupportedByPeer)
-                    | Err(quinn::SendDatagramError::Disabled) => Ok(()),
-                    Err(quinn::SendDatagramError::ConnectionLost(error)) => Err(error.into()),
-                }
+                connection.send_datagram(encoded.into())?;
+                Ok(())
             }
             TerminalDatagramTransport::WorkerBridge { .. } => {
                 ensure!(
