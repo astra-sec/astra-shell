@@ -15,7 +15,7 @@ pub const MAX_DATA: usize = 32 * 1024;
 pub const MAX_WIRE: usize = MAX_DATA + 64;
 pub const BUFFER_RESERVATION: u64 = 256 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-// Each direction has an inactivity limit, including half-closed connections.
+// Bound stalled writes; an otherwise idle TCP session may remain connected.
 const IO_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub fn validate_open(open: &OpenTcpForwardRequest) -> Result<()> {
@@ -124,12 +124,9 @@ pub async fn serve<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
     let incoming = async {
         loop {
-            let wire = tokio::time::timeout(
-                IO_TIMEOUT,
-                protocol::read_message_limited(&mut recv, MAX_WIRE),
-            )
-            .await??
-            .context("forward ended without EOF")?;
+            let wire = protocol::read_message_limited(&mut recv, MAX_WIRE)
+                .await?
+                .context("forward ended without EOF")?;
             let Some(wire_message::Body::ForwardFrame(frame)) = wire.body else {
                 bail!("expected ForwardFrame")
             };
@@ -153,7 +150,7 @@ pub async fn serve<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     let outgoing = async {
         let mut buffer = vec![0; MAX_DATA];
         loop {
-            let count = tokio::time::timeout(IO_TIMEOUT, target_read.read(&mut buffer)).await??;
+            let count = target_read.read(&mut buffer).await?;
             let wire = WireMessage::new(wire_message::Body::ForwardFrame(ForwardFrame {
                 data: buffer[..count].to_vec(),
                 eof: count == 0,
@@ -163,7 +160,7 @@ pub async fn serve<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                 break;
             }
         }
-        tokio::time::timeout(IO_TIMEOUT, eof_rx).await??;
+        eof_rx.await?;
         Ok::<(), anyhow::Error>(())
     };
     tokio::select! { result = incoming => result?, result = outgoing => result? }
@@ -306,6 +303,22 @@ mod tests {
         }
         Ok(())
     }
+    #[tokio::test]
+    async fn oversized_frame_header_is_rejected_before_payload() -> Result<()> {
+        let resources = account();
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let (mut stream, bridge) = flow(listener.local_addr()?.port(), resources.clone()).await;
+        let (_target, _) = listener.accept().await?;
+        read_message(&mut stream).await?;
+        stream.write_u32((MAX_WIRE + 1) as u32).await?;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), bridge)
+                .await??
+                .is_err()
+        );
+        Ok(())
+    }
+
     #[test]
     fn rejects_invalid_targets_and_oversized_identifiers() {
         let mut open = OpenTcpForwardRequest {

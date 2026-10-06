@@ -96,6 +96,7 @@ pub struct ServerOptions {
 
 #[derive(Clone)]
 struct ServerState {
+    tcp_forwarding_enabled: bool,
     mode: ModeState,
     instance_id: String,
     resources: ResourceGovernor,
@@ -281,6 +282,9 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
         .trim()
         .to_owned();
     let state = ServerState {
+        tcp_forwarding_enabled: matches!(mode, ModeState::Rootless { .. })
+            && options.resource_policy.global.forward_connections > 0
+            && options.resource_policy.user.forward_connections > 0,
         mode,
         instance_id,
         resources,
@@ -543,7 +547,7 @@ async fn authenticate_connection(
         bail!("ClientHello has no target Unix username")
     }
     let mut support = ProtocolSupport::runtime();
-    if matches!(state.mode, ModeState::Managed { .. }) {
+    if !state.tcp_forwarding_enabled {
         support
             .capabilities
             .retain(|cap| cap.name != crate::negotiation::CAPABILITY_TCP_FORWARD);

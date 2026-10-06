@@ -545,14 +545,27 @@ mod tests {
     fn forwarding_requires_explicit_offer_and_stream_channels() {
         let support = ProtocolSupport::runtime();
         let mut old = support.clone();
-        old.capabilities.retain(|cap| cap.name != CAPABILITY_TCP_FORWARD);
+        old.capabilities
+            .retain(|cap| cap.name != CAPABILITY_TCP_FORWARD);
         for (client, server) in [(&old, &support), (&support, &old)] {
-            assert!(!negotiate_client_hello(&client_hello("user", client), server).unwrap().has(CAPABILITY_TCP_FORWARD, 1));
+            assert!(
+                !negotiate_client_hello(&client_hello("user", client), server)
+                    .unwrap()
+                    .has(CAPABILITY_TCP_FORWARD, 1)
+            );
         }
         let mut no_channels = support.clone();
-        no_channels.capabilities.retain(|cap| cap.name != CAPABILITY_STREAM_CHANNELS);
-        assert!(!negotiate_client_hello(&client_hello("user", &no_channels), &support).unwrap().has(CAPABILITY_TCP_FORWARD, 1));
-        assert!(validate_capability_dependencies(&[(CAPABILITY_TCP_FORWARD.into(), 1)].into()).is_err());
+        no_channels
+            .capabilities
+            .retain(|cap| cap.name != CAPABILITY_STREAM_CHANNELS);
+        assert!(
+            !negotiate_client_hello(&client_hello("user", &no_channels), &support)
+                .unwrap()
+                .has(CAPABILITY_TCP_FORWARD, 1)
+        );
+        assert!(
+            validate_capability_dependencies(&[(CAPABILITY_TCP_FORWARD.into(), 1)].into()).is_err()
+        );
     }
 
     #[test]
