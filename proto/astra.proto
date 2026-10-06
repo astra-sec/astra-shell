@@ -18,6 +18,7 @@ message WireMessage {
     WorkerStreamHello worker_stream_hello = 9;
     // First frame on post-authentication streams when transport.stream_channels v1 is selected.
     StreamHello stream_hello = 10;
+    ForwardFrame forward_frame = 11;
   }
 }
 
@@ -62,6 +63,7 @@ enum StreamChannelKind {
   STREAM_CHANNEL_KIND_CONTROL = 1;
   STREAM_CHANNEL_KIND_TERMINAL = 2;
   STREAM_CHANNEL_KIND_FILE = 3;
+  STREAM_CHANNEL_KIND_FORWARD = 4;
 }
 message StreamHello {
   uint32 version = 1;
@@ -114,6 +116,7 @@ message Request {
     DeleteWorkspaceRequest delete_workspace = 33;
     ListTerminalsRequest list_terminals = 34;
     ListAttachmentsRequest list_attachments = 35;
+    OpenTcpForwardRequest open_tcp_forward = 36;
   }
 }
 message ListRequest {}
@@ -570,4 +573,18 @@ message LeaseChanged {
   string reason = 2;
   string lease_id = 3;
   uint32 lease_ttl_ms = 4;
+}
+
+// forward.tcp v1, selected only with transport.stream_channels v1.
+message OpenTcpForwardRequest {
+  string mapping_id = 1;
+  string host = 2;
+  uint32 port = 3;
+}
+// Exactly one of nonempty data (<= 32768 bytes) or eof=true.
+// EOF closes only the target TCP write direction. Keep the stream open until
+// both directions finish; resetting it cancels the entire forwarding flow.
+message ForwardFrame {
+  bytes data = 1;
+  bool eof = 2;
 }

@@ -21,6 +21,8 @@ pub struct ResourceClaim {
     pub attachments: u64,
     pub terminal_memory_bytes: u64,
     pub history_bytes: u64,
+    pub forward_connections: u64,
+    pub forward_buffer_bytes: u64,
     pub file_handles: u64,
     pub uploads: u64,
     pub upload_bytes: u64,
@@ -89,6 +91,12 @@ impl ResourceClaim {
                 .terminal_memory_bytes
                 .checked_add(other.terminal_memory_bytes)?,
             history_bytes: self.history_bytes.checked_add(other.history_bytes)?,
+            forward_connections: self
+                .forward_connections
+                .checked_add(other.forward_connections)?,
+            forward_buffer_bytes: self
+                .forward_buffer_bytes
+                .checked_add(other.forward_buffer_bytes)?,
             file_handles: self.file_handles.checked_add(other.file_handles)?,
             uploads: self.uploads.checked_add(other.uploads)?,
             upload_bytes: self.upload_bytes.checked_add(other.upload_bytes)?,
@@ -106,13 +114,19 @@ impl ResourceClaim {
                 .terminal_memory_bytes
                 .checked_sub(other.terminal_memory_bytes)?,
             history_bytes: self.history_bytes.checked_sub(other.history_bytes)?,
+            forward_connections: self
+                .forward_connections
+                .checked_sub(other.forward_connections)?,
+            forward_buffer_bytes: self
+                .forward_buffer_bytes
+                .checked_sub(other.forward_buffer_bytes)?,
             file_handles: self.file_handles.checked_sub(other.file_handles)?,
             uploads: self.uploads.checked_sub(other.uploads)?,
             upload_bytes: self.upload_bytes.checked_sub(other.upload_bytes)?,
         })
     }
 
-    fn dimensions(self) -> [(&'static str, u64); 10] {
+    fn dimensions(self) -> [(&'static str, u64); 12] {
         [
             ("connections", self.connections),
             ("streams", self.streams),
@@ -121,6 +135,8 @@ impl ResourceClaim {
             ("attachments", self.attachments),
             ("terminal_memory_bytes", self.terminal_memory_bytes),
             ("history_bytes", self.history_bytes),
+            ("forward_connections", self.forward_connections),
+            ("forward_buffer_bytes", self.forward_buffer_bytes),
             ("file_handles", self.file_handles),
             ("uploads", self.uploads),
             ("upload_bytes", self.upload_bytes),
@@ -144,6 +160,8 @@ pub struct ResourceLimits {
     pub attachments: u64,
     pub terminal_memory_bytes: u64,
     pub history_bytes: u64,
+    pub forward_connections: u64,
+    pub forward_buffer_bytes: u64,
     pub file_handles: u64,
     pub uploads: u64,
     pub upload_bytes: u64,
@@ -159,6 +177,8 @@ impl ResourceLimits {
             attachments: 16_384,
             terminal_memory_bytes: 16 * GIB,
             history_bytes: 32 * GIB,
+            forward_connections: 256,
+            forward_buffer_bytes: 64 * MIB,
             file_handles: 16_384,
             uploads: 1_024,
             upload_bytes: 512 * GIB,
@@ -174,6 +194,8 @@ impl ResourceLimits {
             attachments: 256,
             terminal_memory_bytes: 256 * MIB,
             history_bytes: 512 * MIB,
+            forward_connections: 32,
+            forward_buffer_bytes: 8 * MIB,
             file_handles: 256,
             uploads: 16,
             upload_bytes: 8 * GIB,
@@ -189,6 +211,8 @@ impl ResourceLimits {
             attachments: self.attachments,
             terminal_memory_bytes: self.terminal_memory_bytes,
             history_bytes: self.history_bytes,
+            forward_connections: self.forward_connections,
+            forward_buffer_bytes: self.forward_buffer_bytes,
             file_handles: self.file_handles,
             uploads: self.uploads,
             upload_bytes: self.upload_bytes,
@@ -197,7 +221,10 @@ impl ResourceLimits {
 
     fn validate(self, scope: &str) -> Result<()> {
         for (resource, limit) in self.as_claim().dimensions() {
-            ensure!(limit > 0, "{scope} {resource} limit must be nonzero");
+            ensure!(
+                limit > 0 || resource.starts_with("forward_"),
+                "{scope} {resource} limit must be nonzero"
+            );
         }
         Ok(())
     }

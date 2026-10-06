@@ -25,7 +25,10 @@ pub const LOCALE_ENVIRONMENT_VARIABLES: &[&str] = &[
 
 #[derive(Clone, PartialEq, Message)]
 pub struct WireMessage {
-    #[prost(oneof = "wire_message::Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
+    #[prost(
+        oneof = "wire_message::Body",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    )]
     pub body: Option<wire_message::Body>,
 }
 
@@ -57,6 +60,8 @@ pub mod wire_message {
         WorkerStreamHello(WorkerStreamHello),
         #[prost(message, tag = "10")]
         StreamHello(StreamHello),
+        #[prost(message, tag = "11")]
+        ForwardFrame(ForwardFrame),
     }
 }
 
@@ -127,6 +132,7 @@ pub enum StreamChannelKind {
     Control = 1,
     Terminal = 2,
     File = 3,
+    Forward = 4,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -169,7 +175,7 @@ pub struct Request {
     pub request_id: String,
     #[prost(
         oneof = "request::Command",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36"
     )]
     pub command: Option<request::Command>,
 }
@@ -231,6 +237,8 @@ pub mod request {
         ListTerminals(ListTerminalsRequest),
         #[prost(message, tag = "35")]
         ListAttachments(ListAttachmentsRequest),
+        #[prost(message, tag = "36")]
+        OpenTcpForward(OpenTcpForwardRequest),
     }
 }
 
@@ -1853,4 +1861,21 @@ mod tests {
         assert_eq!(legacy.terminal_id, "terminal");
         assert!(legacy.event.is_none());
     }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct OpenTcpForwardRequest {
+    #[prost(string, tag = "1")]
+    pub mapping_id: String,
+    #[prost(string, tag = "2")]
+    pub host: String,
+    #[prost(uint32, tag = "3")]
+    pub port: u32,
+}
+#[derive(Clone, PartialEq, Message)]
+pub struct ForwardFrame {
+    #[prost(bytes = "vec", tag = "1")]
+    pub data: Vec<u8>,
+    #[prost(bool, tag = "2")]
+    pub eof: bool,
 }

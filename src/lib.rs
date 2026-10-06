@@ -3,6 +3,7 @@ pub mod auth;
 pub mod client;
 pub(crate) mod compression;
 pub mod files;
+pub mod forwarding;
 pub mod known_hosts;
 pub mod negotiation;
 pub(crate) mod process_lock;

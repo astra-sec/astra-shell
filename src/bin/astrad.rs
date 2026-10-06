@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use astra_shell::{
     resources::{DEFAULT_TERMINAL_HISTORY_ROWS, ResourceLimits, ResourcePolicy},
     server::{ServerMode, ServerOptions, ServerPaths, initialize_state, serve},
@@ -114,6 +114,9 @@ struct GlobalResourceArgs {
     max_global_history_mib: u64,
     #[arg(long, default_value_t = 16_384)]
     max_global_file_handles: u64,
+    /// Maximum TCP forwarding sockets, including pending connects; zero disables forwarding.
+    #[arg(long, default_value_t = 256)]
+    max_global_forward_connections: u64,
     #[arg(long, default_value_t = 1_024)]
     max_global_uploads: u64,
     #[arg(long, default_value_t = 524_288)]
@@ -134,6 +137,11 @@ impl GlobalResourceArgs {
             )?,
             history_bytes: to_bytes(self.max_global_history_mib, "global history")?,
             file_handles: self.max_global_file_handles,
+            forward_connections: self.max_global_forward_connections,
+            forward_buffer_bytes: self
+                .max_global_forward_connections
+                .checked_mul(256 * 1024)
+                .context("forward buffer quota overflow")?,
             uploads: self.max_global_uploads,
             upload_bytes: to_bytes(self.max_global_upload_mib, "global upload")?,
         })
@@ -156,6 +164,9 @@ struct UserResourceArgs {
     max_user_history_mib: u64,
     #[arg(long, default_value_t = 256)]
     max_user_file_handles: u64,
+    /// Maximum TCP forwarding sockets, including pending connects; zero disables forwarding.
+    #[arg(long, default_value_t = 32)]
+    max_user_forward_connections: u64,
     #[arg(long, default_value_t = 16)]
     max_user_uploads: u64,
     #[arg(long, default_value_t = 8_192)]
@@ -176,6 +187,11 @@ impl UserResourceArgs {
             )?,
             history_bytes: to_bytes(self.max_user_history_mib, "user history")?,
             file_handles: self.max_user_file_handles,
+            forward_connections: self.max_user_forward_connections,
+            forward_buffer_bytes: self
+                .max_user_forward_connections
+                .checked_mul(256 * 1024)
+                .context("forward buffer quota overflow")?,
             uploads: self.max_user_uploads,
             upload_bytes: to_bytes(self.max_user_upload_mib, "user upload")?,
         })

@@ -543,6 +543,11 @@ async fn authenticate_connection(
         bail!("ClientHello has no target Unix username")
     }
     let mut support = ProtocolSupport::runtime();
+    if matches!(state.mode, ModeState::Managed { .. }) {
+        support
+            .capabilities
+            .retain(|cap| cap.name != crate::negotiation::CAPABILITY_TCP_FORWARD);
+    }
     if connection.max_datagram_size().is_none() {
         support
             .capabilities
@@ -896,6 +901,17 @@ where
     let session_objects = context.negotiated.has(CAPABILITY_SESSION_OBJECTS, 1);
     let zstd = context.negotiated.has(CAPABILITY_PAYLOAD_ZSTD, 1);
     match request.command {
+        Some(request::Command::OpenTcpForward(open)) => {
+            return crate::forwarding::serve(
+                &mut send,
+                recv,
+                request_id,
+                open,
+                &context.negotiated,
+                &resource_account,
+            )
+            .await;
+        }
         Some(request::Command::List(_)) => {
             let terminals = manager.list_legacy_terminals();
             send_response(
@@ -1248,6 +1264,13 @@ fn validate_stream_request(
     let Some(wire_message::Body::Request(request)) = &message.body else {
         bail!("expected Request after stream preamble");
     };
+    if matches!(request.command, Some(request::Command::OpenTcpForward(_))) {
+        ensure!(
+            negotiated.has(crate::negotiation::CAPABILITY_TCP_FORWARD, 1)
+                && negotiated.has(CAPABILITY_STREAM_CHANNELS, 1),
+            "TCP forwarding was not negotiated"
+        );
+    }
     if negotiated.has(CAPABILITY_STREAM_CHANNELS, 1) {
         stream_channels::validate_request(
             hello.context("missing negotiated StreamHello")?,

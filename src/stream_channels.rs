@@ -20,7 +20,7 @@ impl StreamChannelKind {
         match self {
             Self::Control => 20,
             Self::Terminal => 10,
-            Self::File => -10,
+            Self::File | Self::Forward => -10,
             Self::Unspecified => 0,
         }
     }
@@ -31,6 +31,7 @@ pub fn request_channel(request: &Request) -> Result<(StreamChannelKind, &str)> {
     use request::Command;
     let command = request.command.as_ref().context("request has no command")?;
     Ok(match command {
+        Command::OpenTcpForward(open) => (StreamChannelKind::Forward, &open.mapping_id),
         Command::Attach(attach) => (Terminal, &attach.terminal_id),
         Command::BeginUpload(upload) => (File, &upload.transfer_id),
         Command::WriteFileChunk(chunk) => (File, &chunk.transfer_id),
@@ -94,7 +95,10 @@ pub fn validate_hello(hello: &StreamHello, expected_epoch: u64) -> Result<Stream
         "invalid stream handle length"
     );
     ensure!(
-        kind != StreamChannelKind::Terminal || !hello.handle.is_empty(),
+        !matches!(
+            kind,
+            StreamChannelKind::Terminal | StreamChannelKind::Forward
+        ) || !hello.handle.is_empty(),
         "missing terminal handle"
     );
     ensure!(

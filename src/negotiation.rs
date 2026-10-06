@@ -18,6 +18,7 @@ pub const CAPABILITY_CLIPBOARD_WRITE: &str = "terminal.clipboard_write";
 pub const CAPABILITY_SESSION_OBJECTS: &str = "session.objects";
 pub const CAPABILITY_INPUT_LEASE: &str = "terminal.input_lease";
 pub const CAPABILITY_PAYLOAD_ZSTD: &str = "payload.zstd";
+pub const CAPABILITY_TCP_FORWARD: &str = "forward.tcp";
 pub const CAPABILITY_STREAM_CHANNELS: &str = "transport.stream_channels";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +42,11 @@ impl ProtocolSupport {
             minimum_version: MINIMUM_PROTOCOL_VERSION,
             maximum_version: PROTOCOL_VERSION,
             capabilities: vec![
+                CapabilityRange {
+                    name: CAPABILITY_TCP_FORWARD,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
                 CapabilityRange {
                     name: CAPABILITY_STREAM_CHANNELS,
                     minimum_version: 1,
@@ -107,6 +113,11 @@ impl ProtocolSupport {
             minimum_version: MINIMUM_PROTOCOL_VERSION,
             maximum_version: PROTOCOL_VERSION,
             capabilities: vec![
+                CapabilityRange {
+                    name: CAPABILITY_TCP_FORWARD,
+                    minimum_version: 1,
+                    maximum_version: 1,
+                },
                 CapabilityRange {
                     name: CAPABILITY_STREAM_CHANNELS,
                     minimum_version: 1,
@@ -273,6 +284,9 @@ pub fn negotiate_client_hello(
         capabilities.remove(CAPABILITY_INPUT_LEASE);
     }
 
+    if !capabilities.contains_key(CAPABILITY_STREAM_CHANNELS) {
+        capabilities.remove(CAPABILITY_TCP_FORWARD);
+    }
     Ok(NegotiatedProtocol {
         version: maximum,
         capabilities,
@@ -470,6 +484,12 @@ fn validate_capability_name(name: &str) -> Result<()> {
 
 fn validate_capability_dependencies(capabilities: &BTreeMap<String, u32>) -> Result<()> {
     ensure!(
+        !capabilities.contains_key(CAPABILITY_TCP_FORWARD)
+            || capabilities.contains_key(CAPABILITY_STREAM_CHANNELS),
+        "forward.tcp requires transport.stream_channels v1"
+    );
+
+    ensure!(
         !capabilities.contains_key(CAPABILITY_CLIPBOARD_WRITE)
             || capabilities
                 .get(CAPABILITY_SEMANTIC_STATE)
@@ -520,6 +540,20 @@ mod tests {
     use prost::Message;
 
     use super::*;
+
+    #[test]
+    fn forwarding_requires_explicit_offer_and_stream_channels() {
+        let support = ProtocolSupport::runtime();
+        let mut old = support.clone();
+        old.capabilities.retain(|cap| cap.name != CAPABILITY_TCP_FORWARD);
+        for (client, server) in [(&old, &support), (&support, &old)] {
+            assert!(!negotiate_client_hello(&client_hello("user", client), server).unwrap().has(CAPABILITY_TCP_FORWARD, 1));
+        }
+        let mut no_channels = support.clone();
+        no_channels.capabilities.retain(|cap| cap.name != CAPABILITY_STREAM_CHANNELS);
+        assert!(!negotiate_client_hello(&client_hello("user", &no_channels), &support).unwrap().has(CAPABILITY_TCP_FORWARD, 1));
+        assert!(validate_capability_dependencies(&[(CAPABILITY_TCP_FORWARD.into(), 1)].into()).is_err());
+    }
 
     #[test]
     fn stream_channels_are_selected_only_when_both_peers_offer_them() {
