@@ -84,7 +84,22 @@ try:
     recovered = cli(users[0], 'list')
     assert terminals[0] not in recovered and identity(ids[0]) != before[0]
     assert terminals[1] in cli(users[1], 'list')
-    print(json.dumps({'result':'passed', 'concurrent_requests':24, 'uids':ids, 'worker_identity_before':before, 'gateway_restart_preserved_ptys':True, 'cross_uid_kill_isolated':True, 'artifacts':str(root)}))
+    # A root-owned fake peer with user-owned socket metadata is still the wrong UID.
+    victim_pid = identity(ids[0])[0]
+    os.kill(victim_pid, signal.SIGKILL)
+    wait_for(lambda: not pathlib.Path('/proc/%d' % victim_pid).exists())
+    sockpath = state / 'users' / str(ids[0]) / 'session.sock'
+    sockpath.unlink(missing_ok=True)
+    with socket.socket(socket.AF_UNIX) as fake:
+        fake.bind(str(sockpath)); fake.listen(); sockpath.chmod(0o600); os.chown(sockpath, ids[0], -1)
+        inode = sockpath.stat().st_ino
+        try: cli(users[0], 'list'); raise AssertionError('accepted wrong-UID peer')
+        except RuntimeError as error: assert 'worker' in str(error)
+        assert sockpath.stat().st_ino == inode
+    sockpath.unlink()
+    cli(users[0], 'list')
+    assert terminals[1] in cli(users[1], 'list')
+    print(json.dumps({'result':'passed', 'concurrent_requests':24, 'uids':ids, 'worker_identity_before':before, 'gateway_restart_preserved_ptys':True, 'cross_uid_kill_isolated':True, 'wrong_uid_peer_rejected_without_replacement':True, 'artifacts':str(root)}))
 finally:
     for user in users:
         try:

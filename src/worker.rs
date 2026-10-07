@@ -1,10 +1,10 @@
 use std::{
     collections::HashMap,
     fs,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -39,9 +39,37 @@ pub struct WorkerRouter {
     session_root_override: Option<PathBuf>,
     idle_timeout: Duration,
     start_lock: Mutex<()>,
+    discovery_locks: Mutex<HashMap<u32, Weak<Mutex<()>>>>,
     resources: ResourceGovernor,
     resource_policy: ResourcePolicy,
-    worker_capacities: Arc<Mutex<HashMap<u32, ResourceReservation>>>,
+    worker_capacities: Arc<Mutex<HashMap<u32, WorkerCapacity>>>,
+}
+
+struct WorkerCapacity {
+    _reservation: ResourceReservation,
+    identity: Option<crate::worker_identity::WorkerIdentity>,
+    peer_pid: Option<i32>,
+}
+
+fn validate_directory(path: &Path, uid: u32, forbidden: u32) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == uid
+            && metadata.mode() & forbidden == 0,
+        "unsafe worker directory {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn process_exists(pid: i32) -> bool {
+    // Signal 0 performs an existence/permission check and never sends a signal.
+    unsafe {
+        nix::libc::kill(pid, 0) == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(nix::libc::ESRCH)
+    }
 }
 
 pub(crate) struct WorkerProxyStream {
@@ -67,7 +95,13 @@ impl WorkerRouter {
     ) -> Result<Arc<Self>> {
         resource_policy.validate()?;
         let users_root = state_dir.join("users");
-        fs::create_dir_all(&users_root)?;
+        validate_directory(state_dir, effective_uid(), 0o022)?;
+        match fs::create_dir(&users_root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        validate_directory(&users_root, effective_uid(), 0o022)?;
         fs::set_permissions(state_dir, fs::Permissions::from_mode(0o711))?;
         fs::set_permissions(&users_root, fs::Permissions::from_mode(0o711))?;
         Ok(Arc::new(Self {
@@ -75,10 +109,37 @@ impl WorkerRouter {
             session_root_override,
             idle_timeout,
             start_lock: Mutex::new(()),
+            discovery_locks: Mutex::new(HashMap::new()),
             resources,
             resource_policy,
             worker_capacities: Arc::new(Mutex::new(HashMap::new())),
         }))
+    }
+
+    pub async fn recover_existing(&self) -> Result<()> {
+        for entry in fs::read_dir(&self.users_root)? {
+            let entry = entry?;
+            let Some(uid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else {
+                continue;
+            };
+            validate_directory(&entry.path(), uid, 0o077)?;
+            if let Some(mut stream) = self.connect_existing(uid).await? {
+                let user = nix::unistd::User::from_uid(Uid::from_raw(uid))?
+                    .context("active worker refers to an unknown Unix UID")?;
+                let account = SystemAccount::lookup(&user.name)?;
+                let peer = stream.peer_cred()?;
+                let identity = crate::worker_identity::discover(&mut stream, uid).await?;
+                if let Some(pid) = peer.pid() {
+                    ensure!(pid > 0 && pid as u32 == identity.pid, "worker peer PID mismatch");
+                }
+                self.ensure_worker_capacity(&account).await?;
+                let mut capacities = self.worker_capacities.lock().await;
+                let capacity = capacities.get_mut(&uid).context("missing worker reservation")?;
+                capacity.identity = Some(identity);
+                capacity.peer_pid = peer.pid();
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn proxy_stream(
@@ -145,46 +206,128 @@ impl WorkerRouter {
         &self,
         account: &SystemAccount,
     ) -> Result<(UnixStream, crate::worker_identity::WorkerIdentity)> {
+        // Serialize discovery/accounting per UID; failure or cancellation of one
+        // probe must not release a concurrent successful probe's reservation.
+        let gate = {
+            let mut locks = self.discovery_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(&account.uid).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(account.uid, Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let _discovery = gate.lock().await;
         self.ensure_worker_capacity(account).await?;
-        match self.connect_with_capacity(account).await {
-            Ok(mut stream) => {
-                let identity = crate::worker_identity::discover(&mut stream, account.uid).await?;
-                Ok((stream, identity))
+        let result = async {
+            let mut stream = self.connect_with_capacity(account).await?;
+            let peer = stream.peer_cred()?;
+            ensure!(peer.uid() == account.uid, "worker peer UID mismatch");
+            let identity = crate::worker_identity::discover(&mut stream, account.uid).await?;
+            if let Some(pid) = peer.pid() {
+                ensure!(
+                    pid > 0 && pid as u32 == identity.pid,
+                    "worker peer PID mismatch"
+                );
             }
-            Err(error) => {
-                self.worker_capacities.lock().await.remove(&account.uid);
-                Err(error)
+            if let Some(capacity) = self.worker_capacities.lock().await.get_mut(&account.uid) {
+                capacity.identity = Some(identity);
+                capacity.peer_pid = peer.pid();
             }
+            Ok((stream, identity))
+        }
+        .await;
+        if result.is_err() {
+            let mut capacities = self.worker_capacities.lock().await;
+            // A failed probe cannot release the reservation of an established worker.
+            if capacities
+                .get(&account.uid)
+                .is_some_and(|c| c.identity.is_none())
+            {
+                capacities.remove(&account.uid);
+            }
+        }
+        result
+    }
+
+    async fn connect_existing(&self, uid: u32) -> Result<Option<UnixStream>> {
+        let socket = self.socket_path(uid);
+        match fs::symlink_metadata(&socket) {
+            Ok(metadata) => ensure!(
+                metadata.file_type().is_socket()
+                    && metadata.uid() == uid
+                    && metadata.mode() & 0o077 == 0,
+                "unsafe worker socket {}",
+                socket.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        match UnixStream::connect(&socket).await {
+            Ok(stream) => {
+                ensure!(stream.peer_cred()?.uid() == uid, "worker peer UID mismatch");
+                Ok(Some(stream))
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
     async fn connect_with_capacity(&self, account: &SystemAccount) -> Result<UnixStream> {
-        let socket = self.socket_path(account.uid);
-        if let Ok(stream) = UnixStream::connect(&socket).await {
-            return Ok(stream);
-        }
-
-        let _guard = self.start_lock.lock().await;
-        if let Ok(stream) = UnixStream::connect(&socket).await {
-            return Ok(stream);
-        }
+        // Validate before even attempting the cached socket fast path.
         let user_state = self.prepare_user_state(account)?;
-        self.spawn_worker(account, &user_state, &socket)?;
-        let mut last_error = None;
+        if let Some(stream) = self.connect_existing(account.uid).await? {
+            return Ok(stream);
+        }
+        let _guard = self.start_lock.lock().await;
+        // Root-owned parent means the user cannot replace this arbitration inode.
+        let lock_path = self.users_root.join(format!(".{}.start.lock", account.uid));
+        let mut startup = None;
         for _ in 0..100 {
-            match UnixStream::connect(&socket).await {
-                Ok(stream) => return Ok(stream),
-                Err(error) => last_error = Some(error),
+            match ProcessLock::acquire(&lock_path) {
+                Ok(lock) => {
+                    startup = Some(lock);
+                    break;
+                }
+                Err(error) => {
+                    if let Some(stream) = self.connect_existing(account.uid).await? {
+                        return Ok(stream);
+                    }
+                    if !lock_path.exists() {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        }
+        let _startup = startup.context("worker startup arbitration timed out")?;
+        if let Some(stream) = self.connect_existing(account.uid).await? {
+            return Ok(stream);
+        }
+        self.spawn_worker(account, &user_state, &self.socket_path(account.uid))?;
+        for _ in 0..100 {
+            if let Some(stream) = self.connect_existing(account.uid).await? {
+                return Ok(stream);
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        Err(last_error
-            .context("user worker did not create its control socket")?
-            .into())
+        bail!("user worker did not create its control socket")
     }
 
     async fn ensure_worker_capacity(&self, account: &SystemAccount) -> Result<()> {
         let mut capacities = self.worker_capacities.lock().await;
+        // Reap only kernel-verified dead PIDs; never infer liveness from a PID file or missing socket.
+        capacities.retain(|_, capacity| capacity.peer_pid.is_none_or(process_exists));
         if capacities.contains_key(&account.uid) {
             return Ok(());
         }
@@ -192,7 +335,14 @@ impl WorkerRouter {
             .resources
             .account(&account.username)?
             .reserve(self.resource_policy.worker_capacity_claim())?;
-        capacities.insert(account.uid, reservation);
+        capacities.insert(
+            account.uid,
+            WorkerCapacity {
+                _reservation: reservation,
+                identity: None,
+                peer_pid: None,
+            },
+        );
         Ok(())
     }
 
@@ -201,6 +351,7 @@ impl WorkerRouter {
     }
 
     fn prepare_user_state(&self, account: &SystemAccount) -> Result<PathBuf> {
+        validate_directory(&self.users_root, effective_uid(), 0o022)?;
         let user_state = self.users_root.join(account.uid.to_string());
         match fs::symlink_metadata(&user_state) {
             Ok(metadata) => {
@@ -308,15 +459,14 @@ impl WorkerRouter {
             .spawn()
             .with_context(|| format!("failed to start worker for {}", account.username))?;
         let username = account.username.clone();
-        let uid = account.uid;
-        let worker_capacities = self.worker_capacities.clone();
         tokio::spawn(async move {
             match child.wait().await {
                 Ok(status) if status.success() => info!(%username, "user worker exited"),
                 Ok(status) => warn!(%username, %status, "user worker failed"),
                 Err(error) => warn!(%username, %error, "failed to wait for user worker"),
             }
-            worker_capacities.lock().await.remove(&uid);
+            // Capacity is reaped using the established kernel peer PID on the next admission.
+            // A losing or delayed child exit must never remove a replacement worker's reservation.
         });
         Ok(())
     }
@@ -483,6 +633,10 @@ pub async fn serve_worker(
     idle_timeout: Duration,
     resource_policy: ResourcePolicy,
 ) -> Result<()> {
+    // This entry point runs only in the dedicated worker process, before services start.
+    unsafe {
+        nix::libc::umask(0o077);
+    }
     let actual_uid = effective_uid();
     if actual_uid != expected_uid {
         bail!(
@@ -497,6 +651,7 @@ pub async fn serve_worker(
     resource_policy.validate()?;
     let resources =
         ResourceAccount::standalone(format!("worker UID {expected_uid}"), resource_policy.user)?;
+    let maximum_requests = usize::try_from(resource_policy.user.streams)?;
     let manager = crate::session::SessionManager::with_resources(
         session_root,
         state_dir.join("session-catalog.pb"),
@@ -520,6 +675,9 @@ pub async fn serve_worker(
             biased;
             accepted = listener.accept() => {
                 let (mut stream, _) = accepted?;
+                if requests.len() >= maximum_requests { continue; }
+                let peer_uid = stream.peer_cred()?.uid();
+                if peer_uid != 0 && peer_uid != expected_uid { continue; }
                 idle_state.mark_active();
                 let manager = manager.clone();
                 let files = files.clone();
@@ -668,6 +826,55 @@ mod tests {
                 .is_some()
         );
         assert_eq!(router.worker_capacities.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_unsafe_paths_before_reuse() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::tempdir()?;
+        let state = temporary.path().join("state");
+        fs::create_dir(&state)?;
+        let unsafe_root = temporary.path().join("elsewhere");
+        fs::create_dir(&unsafe_root)?;
+        symlink(&unsafe_root, state.join("users"))?;
+        let policy = ResourcePolicy::default();
+        assert!(
+            WorkerRouter::new(
+                &state,
+                None,
+                Duration::from_secs(60),
+                ResourceGovernor::new(&policy)?,
+                policy.clone()
+            )
+            .is_err()
+        );
+        fs::remove_file(state.join("users"))?;
+        let router = WorkerRouter::new(
+            &state,
+            None,
+            Duration::from_secs(60),
+            ResourceGovernor::new(&policy)?,
+            policy,
+        )?;
+        let account = SystemAccount::current()?;
+        let user_state = router.prepare_user_state(&account)?;
+        fs::set_permissions(&user_state, fs::Permissions::from_mode(0o777))?;
+        assert!(router.connect_with_capacity(&account).await.is_err());
+        fs::set_permissions(&user_state, fs::Permissions::from_mode(0o700))?;
+        let socket = router.socket_path(account.uid);
+        fs::write(&socket, "not a socket")?;
+        assert!(router.connect_existing(account.uid).await.is_err());
+        fs::remove_file(&socket)?;
+        let listener = UnixListener::bind(&socket)?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o666))?;
+        assert!(router.connect_existing(account.uid).await.is_err());
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+        assert!(router.connect_existing(account.uid).await?.is_some());
+        drop(listener);
+        fs::remove_file(&socket)?;
+        symlink(temporary.path().join("absent"), &socket)?;
+        assert!(router.connect_existing(account.uid).await.is_err());
+        Ok(())
     }
 
     #[tokio::test]

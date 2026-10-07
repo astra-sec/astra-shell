@@ -268,15 +268,16 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
             authorized_keys_directory,
             session_root_override,
             worker_idle_timeout,
-        } => ModeState::Managed {
-            router: WorkerRouter::new(
+        } => {
+            let router = WorkerRouter::new(
                 &options.paths.state_dir,
                 session_root_override,
                 worker_idle_timeout,
                 resources.clone(),
                 options.resource_policy.clone(),
-            )?,
-            authorized_keys_directory,
+            )?;
+            router.recover_existing().await?;
+            ModeState::Managed { router, authorized_keys_directory }
         },
     };
     let instance_id = fs::read_to_string(&options.paths.instance_id)?

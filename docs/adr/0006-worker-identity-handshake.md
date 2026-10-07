@@ -28,3 +28,12 @@ Managed forwarding will run in the authenticated user's worker, using that UID's
 network access (the same access already available to its Shell). No root-gateway
 target sockets. This changes no OS firewall or user access policy. Per-user and
 global capacity must include forwarding sockets/buffers before it is advertised.
+
+Gateway startup revalidates and reserves capacity for surviving workers before
+listening, including users who have not reauthenticated. Discovery/accounting is
+serialized per UID; a failed probe cannot release another successful probe's
+reservation. Dead kernel-verified PIDs are reaped on admission. Platforms without
+a kernel peer PID retain reservations conservatively until gateway restart.
+An unsafe or incompatible surviving worker makes startup fail explicitly; it is
+never killed or silently replaced. Changing worker resource limits requires a
+maintenance restart of workers (WORK-03 live policy changes are not implemented).
