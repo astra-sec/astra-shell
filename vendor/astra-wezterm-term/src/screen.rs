@@ -234,9 +234,7 @@ impl Screen {
         let mut logical_cursor_x: Option<usize> = None;
         let mut adjusted_cursor = (cursor_x, cursor_y);
 
-        for (phys_idx, (mut line, identity)) in
-            self.lines.drain(..).zip(identities).enumerate()
-        {
+        for (phys_idx, (mut line, identity)) in self.lines.drain(..).zip(identities).enumerate() {
             line.update_last_change_seqno(seqno);
             let was_wrapped = line.last_cell_was_wrapped();
 
@@ -294,7 +292,8 @@ impl Screen {
                 rewrapped.push_back(line);
                 rewrapped_identities.push_back(identity);
             } else {
-                for (fragment_index, line) in line.wrap(physical_cols, seqno).into_iter().enumerate()
+                for (fragment_index, line) in
+                    line.wrap(physical_cols, seqno).into_iter().enumerate()
                 {
                     rewrapped.push_back(line);
                     rewrapped_identities.push_back(AstraLineIdentity {
@@ -957,8 +956,7 @@ impl Screen {
                     self.line_identities.push_back(identity);
                 } else {
                     self.lines.insert(phys_scroll.end - 1, line);
-                    self.line_identities
-                        .insert(phys_scroll.end - 1, identity);
+                    self.line_identities.insert(phys_scroll.end - 1, identity);
                 }
             }
             // We may still have some lines to add at the bottom, so
@@ -1413,9 +1411,5 @@ impl Screen {
 fn phys_intersection(r1: &Range<PhysRowIndex>, r2: &Range<PhysRowIndex>) -> Range<PhysRowIndex> {
     let start = r1.start.max(r2.start);
     let end = r1.end.min(r2.end);
-    if end > start {
-        start..end
-    } else {
-        0..0
-    }
+    if end > start { start..end } else { 0..0 }
 }

@@ -1,7 +1,7 @@
-use crate::terminalstate::image::*;
 use crate::TerminalState;
-use ::image::imageops::FilterType;
+use crate::terminalstate::image::*;
 use ::image::ImageFormat;
+use ::image::imageops::FilterType;
 use log::error;
 use wezterm_cell::image::ImageDataType;
 use wezterm_escape_parser::osc::ITermFileData;

@@ -10,21 +10,21 @@ use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 #[cfg(feature = "graphics")]
 use std::num::NonZeroUsize;
-use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{Sender, channel};
 use terminfo::{Database, Value};
 use termwiz::input::KeyboardEncoding;
 use url::Url;
 use wezterm_bidi::ParagraphDirectionHint;
+use wezterm_cell::UnicodeVersion;
 #[cfg(feature = "graphics")]
 use wezterm_cell::image::ImageData;
-use wezterm_cell::UnicodeVersion;
 use wezterm_escape_parser::csi::{
     Cursor, CursorStyle, DecPrivateMode, DecPrivateModeCode, Device, Edit, EraseInDisplay,
     EraseInLine, Mode, Sgr, TabulationClear, TerminalMode, TerminalModeCode, Window, XtSmGraphics,
     XtSmGraphicsAction, XtSmGraphicsItem, XtSmGraphicsStatus, XtermKeyModifierResource,
 };
-use wezterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
+use wezterm_escape_parser::{CSI, OneBased, OperatingSystemCommand};
 use wezterm_surface::{CursorShape, CursorVisibility, SequenceNo};
 
 #[cfg(feature = "graphics")]
@@ -1878,9 +1878,7 @@ impl TerminalState {
                 self.decqrm_response(mode, true, self.focus_tracking);
             }
 
-            Mode::SetDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::AlternateScroll,
-            )) => {
+            Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::AlternateScroll)) => {
                 self.alternate_scroll = true;
             }
             Mode::ResetDecPrivateMode(DecPrivateMode::Code(
@@ -2092,11 +2090,7 @@ impl TerminalState {
         // on xterm, so, to prevent a lot of noise in esctest, treat them as spaces, at least when
         // asking for the checksum of a single cell (which is what esctest does).
         // See: https://github.com/wezterm/wezterm/pull/4565
-        if checksum == 0 {
-            32u16
-        } else {
-            checksum
-        }
+        if checksum == 0 { 32u16 } else { checksum }
     }
 
     fn perform_csi_window(&mut self, window: Window) {
@@ -2484,7 +2478,9 @@ impl TerminalState {
 
             Cursor::Left(_n) => {
                 // https://vt100.net/docs/vt510-rm/CUB.html
-                unreachable!("Actually handled in Performer::csi_dispatch by rewriting as ControlCode::Backspace");
+                unreachable!(
+                    "Actually handled in Performer::csi_dispatch by rewriting as ControlCode::Backspace"
+                );
             }
 
             Cursor::Right(n) => {

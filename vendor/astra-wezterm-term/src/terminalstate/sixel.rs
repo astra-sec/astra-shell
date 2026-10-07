@@ -1,6 +1,6 @@
-use crate::terminalstate::image::*;
-use crate::terminalstate::{default_color_map, ImageAttachParams};
 use crate::TerminalState;
+use crate::terminalstate::image::*;
+use crate::terminalstate::{ImageAttachParams, default_color_map};
 use ::image::RgbaImage;
 use wezterm_cell::color::RgbColor;
 use wezterm_cell::image::ImageDataType;

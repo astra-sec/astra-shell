@@ -567,10 +567,21 @@ mod tests {
         policy.global.forward_connections = policy.user.forward_connections * 2;
         policy.global.forward_buffer_bytes = policy.user.forward_buffer_bytes * 2;
         let governor = ResourceGovernor::new(&policy).unwrap();
-        let a = governor.account("a").unwrap().reserve(policy.worker_capacity_claim()).unwrap();
-        let _b = governor.account("b").unwrap().reserve(policy.worker_capacity_claim()).unwrap();
+        let a = governor
+            .account("a")
+            .unwrap()
+            .reserve(policy.worker_capacity_claim())
+            .unwrap();
+        let _b = governor
+            .account("b")
+            .unwrap()
+            .reserve(policy.worker_capacity_claim())
+            .unwrap();
         let c = governor.account("c").unwrap();
-        let error = c.reserve(policy.worker_capacity_claim()).err().expect("third worker must exceed global forwarding capacity");
+        let error = c
+            .reserve(policy.worker_capacity_claim())
+            .err()
+            .expect("third worker must exceed global forwarding capacity");
         assert_eq!(error.scope, "global");
         assert_eq!(error.resource, "forward_connections");
         drop(a);

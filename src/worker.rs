@@ -119,7 +119,11 @@ impl WorkerRouter {
     pub async fn recover_existing(&self) -> Result<()> {
         for entry in fs::read_dir(&self.users_root)? {
             let entry = entry?;
-            let Some(uid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            let Some(uid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
                 continue;
             };
             validate_directory(&entry.path(), uid, 0o077)?;
@@ -130,11 +134,16 @@ impl WorkerRouter {
                 let peer = stream.peer_cred()?;
                 let identity = crate::worker_identity::discover(&mut stream, uid).await?;
                 if let Some(pid) = peer.pid() {
-                    ensure!(pid > 0 && pid as u32 == identity.pid, "worker peer PID mismatch");
+                    ensure!(
+                        pid > 0 && pid as u32 == identity.pid,
+                        "worker peer PID mismatch"
+                    );
                 }
                 self.ensure_worker_capacity(&account).await?;
                 let mut capacities = self.worker_capacities.lock().await;
-                let capacity = capacities.get_mut(&uid).context("missing worker reservation")?;
+                let capacity = capacities
+                    .get_mut(&uid)
+                    .context("missing worker reservation")?;
                 capacity.identity = Some(identity);
                 capacity.peer_pid = peer.pid();
             }

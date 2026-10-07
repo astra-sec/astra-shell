@@ -1,8 +1,8 @@
 use crate::terminal::{Alert, Progress};
 use crate::terminalstate::{
-    default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
+    CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry, default_color_map,
 };
-use crate::{ClipboardSelection, Position, TerminalState, VisibleRowIndex, DCS, ST};
+use crate::{ClipboardSelection, DCS, Position, ST, TerminalState, VisibleRowIndex};
 use finl_unicode::grapheme_clusters::Graphemes;
 use log::{debug, error};
 use num_traits::FromPrimitive;
@@ -11,11 +11,11 @@ use std::fmt::Write;
 use std::io::Write as _;
 use std::ops::{Deref, DerefMut};
 use termwiz::input::KeyboardEncoding;
-use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
+use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 use url::Url;
 use wezterm_bidi::ParagraphDirectionHint;
 use wezterm_cell::{
-    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
+    Cell, CellAttributes, SemanticType, grapheme_column_width, is_white_space_grapheme,
 };
 use wezterm_escape_parser::csi::{
     CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
@@ -25,7 +25,7 @@ use wezterm_escape_parser::osc::{
     ITermUnicodeVersionOp, Selection,
 };
 use wezterm_escape_parser::{
-    Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
+    Action, CSI, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand,
 };
 
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing

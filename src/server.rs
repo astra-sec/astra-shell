@@ -277,8 +277,11 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
                 options.resource_policy.clone(),
             )?;
             router.recover_existing().await?;
-            ModeState::Managed { router, authorized_keys_directory }
-        },
+            ModeState::Managed {
+                router,
+                authorized_keys_directory,
+            }
+        }
     };
     let instance_id = fs::read_to_string(&options.paths.instance_id)?
         .trim()

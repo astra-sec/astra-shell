@@ -1,5 +1,5 @@
 use crate::color::ColorPalette;
-use downcast_rs::{impl_downcast, Downcast};
+use downcast_rs::{Downcast, impl_downcast};
 use wezterm_bidi::ParagraphDirectionHint;
 use wezterm_cell::UnicodeVersion;
 use wezterm_surface::{Line, SequenceNo};

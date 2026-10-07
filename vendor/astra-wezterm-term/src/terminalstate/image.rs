@@ -1,13 +1,13 @@
 use crate::{Position, StableRowIndex, TerminalState};
 use anyhow::Context;
-use humansize::{SizeFormatter, DECIMAL};
+use humansize::{DECIMAL, SizeFormatter};
 use num_traits::{One, Zero};
 use ordered_float::NotNan;
 use std::sync::Arc;
-use wezterm_cell::image::{ImageCell, ImageDataType};
 use wezterm_cell::Cell;
-use wezterm_surface::change::ImageData;
+use wezterm_cell::image::{ImageCell, ImageDataType};
 use wezterm_surface::TextureCoordinate;
+use wezterm_surface::change::ImageData;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlacementInfo {
@@ -340,9 +340,5 @@ pub(crate) fn dimensions(data: &[u8]) -> anyhow::Result<ImageInfo> {
 
 /// Returns `1` if `b` is true, else `0`,
 fn one_or_zero<T: Zero + One>(b: bool) -> T {
-    if b {
-        T::one()
-    } else {
-        T::zero()
-    }
+    if b { T::one() } else { T::zero() }
 }

@@ -327,15 +327,12 @@ fn screen_view<'a>(
         screen,
         kind,
         cursor,
-        saved_cursor: screen
-            .saved_cursor
-            .as_ref()
-            .map(|saved| {
-                cursor_view(
-                    saved.position,
-                    saved.wrap_next || saved.position.x >= screen.physical_cols,
-                )
-            }),
+        saved_cursor: screen.saved_cursor.as_ref().map(|saved| {
+            cursor_view(
+                saved.position,
+                saved.wrap_next || saved.position.x >= screen.physical_cols,
+            )
+        }),
         scroll_margin_top: state.top_and_bottom_margins.start.max(0) as usize,
         scroll_margin_bottom: state.top_and_bottom_margins.end.max(0) as usize,
         scroll_margin_left: state.left_and_right_margins.start,
