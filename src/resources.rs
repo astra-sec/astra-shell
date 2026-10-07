@@ -304,6 +304,8 @@ impl ResourcePolicy {
             file_handles: self.user.file_handles,
             uploads: self.user.uploads,
             upload_bytes: self.user.upload_bytes,
+            forward_connections: self.user.forward_connections,
+            forward_buffer_bytes: self.user.forward_buffer_bytes,
             ..ResourceClaim::default()
         }
     }
@@ -560,12 +562,30 @@ mod tests {
     }
 
     #[test]
+    fn managed_forward_capacity_is_globally_bounded_and_reclaimed() {
+        let mut policy = ResourcePolicy::default();
+        policy.global.forward_connections = policy.user.forward_connections * 2;
+        policy.global.forward_buffer_bytes = policy.user.forward_buffer_bytes * 2;
+        let governor = ResourceGovernor::new(&policy).unwrap();
+        let a = governor.account("a").unwrap().reserve(policy.worker_capacity_claim()).unwrap();
+        let _b = governor.account("b").unwrap().reserve(policy.worker_capacity_claim()).unwrap();
+        let c = governor.account("c").unwrap();
+        let error = c.reserve(policy.worker_capacity_claim()).err().expect("third worker must exceed global forwarding capacity");
+        assert_eq!(error.scope, "global");
+        assert_eq!(error.resource, "forward_connections");
+        drop(a);
+        assert!(c.reserve(policy.worker_capacity_claim()).is_ok());
+    }
+
+    #[test]
     fn worker_bundle_reserves_the_complete_user_capacity() {
         let policy = ResourcePolicy::default();
         let claim = policy.worker_capacity_claim();
         assert_eq!(claim.workers, 1);
         assert_eq!(claim.terminals, policy.user.terminals);
         assert_eq!(claim.history_bytes, policy.user.history_bytes);
+        assert_eq!(claim.forward_connections, policy.user.forward_connections);
+        assert_eq!(claim.forward_buffer_bytes, policy.user.forward_buffer_bytes);
         assert_eq!(claim.connections, 0);
         assert_eq!(claim.streams, 0);
     }

@@ -284,8 +284,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
         .trim()
         .to_owned();
     let state = ServerState {
-        tcp_forwarding_enabled: matches!(mode, ModeState::Rootless { .. })
-            && options.resource_policy.global.forward_connections > 0
+        tcp_forwarding_enabled: options.resource_policy.global.forward_connections > 0
             && options.resource_policy.user.forward_connections > 0,
         mode,
         instance_id,

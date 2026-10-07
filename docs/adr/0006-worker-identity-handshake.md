@@ -24,7 +24,7 @@ explicit maintenance operation once their sessions are empty. This is a fail-
 closed migration, not a legacy adapter. WORK-03 rolling N/N-1 worker upgrades and
 forced generation replacement remain separate work; no PTY migration is claimed.
 
-Managed forwarding will run in the authenticated user's worker, using that UID's
+Managed forwarding runs in the authenticated user's worker, using that UID's
 network access (the same access already available to its Shell). No root-gateway
 target sockets. This changes no OS firewall or user access policy. Per-user and
 global capacity must include forwarding sockets/buffers before it is advertised.
@@ -37,3 +37,10 @@ a kernel peer PID retain reservations conservatively until gateway restart.
 An unsafe or incompatible surviving worker makes startup fail explicitly; it is
 never killed or silently replaced. Changing worker resource limits requires a
 maintenance restart of workers (WORK-03 live policy changes are not implemented).
+
+FWD-02 forwards the dedicated channel as bounded raw bytes through the gateway;
+only the worker decodes forwarding frames and owns target sockets. It bypasses
+the terminal datagram/queued-writer adapter. Worker capacity claims and spawned
+worker arguments include forwarding limits. The isolated Linux fixture verifies
+actual kernel TCP socket UIDs, independent quotas, cancellation/reuse, gateway
+restart with PTY preservation, and stale-epoch rejection after a worker kill.

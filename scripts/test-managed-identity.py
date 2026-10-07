@@ -30,7 +30,7 @@ def wait_for(check, seconds=10):
 
 def start_gateway():
     log = open(root / ('gateway-%s.log' % len(children)), 'w+')
-    p = subprocess.Popen([str(binary / 'astrad'), 'serve', '--managed', '--listen', '127.0.0.1:0', '--state-dir', str(state), '--authorized-keys-dir', str(auth), '--session-root', str(demo), '--worker-idle-timeout-seconds', '600'], stdout=log, stderr=log, env=env)
+    p = subprocess.Popen([str(binary / 'astrad'), 'serve', '--managed', '--listen', '127.0.0.1:0', '--state-dir', str(state), '--authorized-keys-dir', str(auth), '--session-root', str(demo), '--worker-idle-timeout-seconds', '600', '--max-user-forward-connections', '2', '--max-global-forward-connections', '4'], stdout=log, stderr=log, env=env)
     children.append(p)
     def listen():
         log.seek(0)
@@ -99,7 +99,14 @@ try:
     sockpath.unlink()
     cli(users[0], 'list')
     assert terminals[1] in cli(users[1], 'list')
-    print(json.dumps({'result':'passed', 'concurrent_requests':24, 'uids':ids, 'worker_identity_before':before, 'gateway_restart_preserved_ptys':True, 'cross_uid_kill_isolated':True, 'wrong_uid_peer_rejected_without_replacement':True, 'artifacts':str(root)}))
+    if os.environ.get('ASTRA_TEST_MANAGED_FORWARD') == '1':
+        fixture = '|'.join([str(root), port, *users, *map(str, ids)])
+        checked = subprocess.run(['cargo', 'test', '--lib', 'managed_uid_quota_and_lifecycle', '--', '--ignored', '--nocapture'],
+            env=dict(os.environ, ASTRA_MANAGED_FORWARD_FIXTURE=fixture), text=True, capture_output=True, timeout=180)
+        (root / 'forwarding.log').write_text(checked.stdout + checked.stderr)
+        assert checked.returncode == 0, checked.stdout + checked.stderr
+        print(checked.stdout)
+    print(json.dumps({'result':'passed' , 'concurrent_requests':24, 'uids':ids, 'worker_identity_before':before, 'gateway_restart_preserved_ptys':True, 'cross_uid_kill_isolated':True, 'wrong_uid_peer_rejected_without_replacement':True, 'artifacts':str(root)}))
 finally:
     for user in users:
         try:

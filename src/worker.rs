@@ -177,6 +177,9 @@ impl WorkerRouter {
             );
             return Err(error);
         }
+        let is_forward = matches!(&first_message.body,
+            Some(wire_message::Body::Request(request))
+                if matches!(request.command, Some(crate::protocol::request::Command::OpenTcpForward(_))));
         let (mut worker_recv, mut worker_send) = worker.into_split();
         write_message(
             &mut worker_send,
@@ -196,8 +199,17 @@ impl WorkerRouter {
             worker_send.shutdown().await?;
             Ok::<(), anyhow::Error>(())
         };
-        let worker_to_client =
-            forward_worker_messages(&mut worker_recv, &mut client_send, &connection);
+        let worker_to_client = async {
+            if is_forward {
+                // Forwarding has no datagrams. Preserve backpressure with the small
+                // copy buffer instead of allocating terminal frame/queue capacity.
+                copy(&mut worker_recv, &mut client_send).await?;
+                client_send.shutdown().await?;
+                Ok(())
+            } else {
+                forward_worker_messages(&mut worker_recv, &mut client_send, &connection).await
+            }
+        };
         tokio::try_join!(client_to_worker, worker_to_client)?;
         Ok(())
     }
@@ -554,6 +566,8 @@ fn append_worker_resource_policy(command: &mut Command, policy: &ResourcePolicy)
     command
         .arg("--max-user-connections")
         .arg(policy.user.connections.to_string())
+        .arg("--max-user-forward-connections")
+        .arg(policy.user.forward_connections.to_string())
         .arg("--max-user-streams")
         .arg(policy.user.streams.to_string())
         .arg("--max-user-terminals")

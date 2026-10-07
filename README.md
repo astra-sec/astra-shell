@@ -97,7 +97,31 @@ Rootless 与 managed 模式使用同一套分层 `ResourceGovernor`。默认每�
   --terminal-history-mib 16
 ```
 
-多个维度同时生效，实际可创建数量由最先耗尽的维度决定。0 不表示无限，零值或 global 无法容纳一个完整 user capacity 的配置会在 daemon 启动前失败。单 Terminal 的服务端硬上限是 1,000,000 行和 1 GiB；提高行数但不提高字节数不会绕过 byte trim。超限返回稳定的 `quota` 错误，只拒绝新资源，不结束已经运行的 Terminal。managed gateway 按 UID 预留完整 user worker capacity，root gateway 不解析 Terminal 内容；内部 worker 不能接受客户端自报或提高的配额。资源所有权见 [`docs/adr/0003-resource-quota-model.md`](docs/adr/0003-resource-quota-model.md)，历史计量与 trim 规则见 [`docs/adr/0004-history-capacity-accounting.md`](docs/adr/0004-history-capacity-accounting.md)。
+多个维度同时生效，实际可创建数量由最先耗尽的维度决定。0 不表示无限；除 TCP 转发的零值表示关闭外，其它零值或 global 无法容纳一个完整 user capacity 的配置会在 daemon 启动前失败。单 Terminal 的服务端硬上限是 1,000,000 行和 1 GiB；提高行数但不提高字节数不会绕过 byte trim。超限返回稳定的 `quota` 错误，只拒绝新资源，不结束已经运行的 Terminal。managed gateway 按 UID 预留完整 user worker capacity，root gateway 不解析 Terminal 内容；内部 worker 不能接受客户端自报或提高的配额。资源所有权见 [`docs/adr/0003-resource-quota-model.md`](docs/adr/0003-resource-quota-model.md)，历史计量与 trim 规则见 [`docs/adr/0004-history-capacity-accounting.md`](docs/adr/0004-history-capacity-accounting.md)。
+
+### macOS TCP 端口映射
+
+macOS 客户端的每个 Astra 主机概览提供 Shell、Files 和端口映射三类卡片。
+手动添加目标地址/端口后启动，浏览器访问本机 loopback 地址即可。每次本机连接都
+重新连接远端地址，不绑定 PID；目标进程在同一端口重启后，新请求可直接恢复。
+已有 TCP 会话不能跨进程重启续传。关闭详情标签不停止映射，停止按钮会关闭活动流。
+不提供自动发现、iOS、SSH、反向或 UDP 转发。
+
+Rootless 使用 daemon 的 UID；managed 使用认证用户的非特权 worker，root gateway
+不创建目标 TCP socket。目标地址可达性遵循该用户已有的 OS 网络权限，与 Shell
+一致；不是额外的目标地址 ACL。默认每用户 32 个转发连接、全局 256 个，每流预留
+256 KiB 应用缓冲容量；`--max-user-forward-connections` 和
+`--max-global-forward-connections` 可配置，二者都设为 0 可禁用能力。
+managed 按完整用户容量预留（包括空闲 worker），因此默认转发容量可容纳最多
+8 个 worker；其它资源维度仍可先耗尽。网关重启在接受连接前重新计入存活 worker。
+数据帧最大 32 KiB，连接目标期限 10 秒，阻塞写期限 5 分钟，正常空闲连接不因无数据退出。
+
+managed worker 现在使用 v2 身份握手和连接 epoch 固定。旧无版本 worker 不会被
+静默替换；发现旧 worker 时新网关明确拒绝启动。升级前先让该用户的所有终端和
+请求结束，再维护重启 worker，或保留旧网关直到维护窗口。只重启网关可以复用
+**兼容 v2** 的存活 worker/PTY；改变 worker 配额也需要维护重启 worker。
+不要为了启用转发强制杀掉仍有会话的生产 worker。细节见
+[`ADR 0006`](docs/adr/0006-worker-identity-handshake.md)。
 
 ### 启动客户端
 
