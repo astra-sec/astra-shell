@@ -203,11 +203,7 @@ impl WorkerRouter {
         )
         .await?;
         write_message(&mut worker_send, &first_message).await?;
-        let client_to_worker = async {
-            copy(&mut client_recv, &mut worker_send).await?;
-            worker_send.shutdown().await?;
-            Ok::<(), anyhow::Error>(())
-        };
+        let client_to_worker = relay_worker_input(&mut client_recv, &mut worker_send);
         let worker_to_client = async {
             if is_forward {
                 // Forwarding has no datagrams. Preserve backpressure with the small
@@ -505,6 +501,22 @@ fn worker_datagram_payload_limit(
         .map(u32::try_from)
         .transpose()?
         .context("terminal datagrams were negotiated without QUIC transport support")
+}
+
+async fn relay_worker_input<R, W>(client_recv: &mut R, worker_send: &mut W) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    copy(client_recv, worker_send).await?;
+    match worker_send.shutdown().await {
+        // The worker can reply and close before we observe the client's FIN.
+        // Darwin then reports ENOTCONN for shutdown, even with unread response
+        // bytes. Do not let try_join cancel the response drain in that case.
+        // Actual copy/write failures above still abort both directions.
+        Err(error) if error.kind() == std::io::ErrorKind::NotConnected => Ok(()),
+        result => Ok(result?),
+    }
 }
 
 async fn forward_worker_messages<R, W>(
@@ -849,6 +861,36 @@ mod tests {
                 .is_some()
         );
         assert_eq!(router.worker_capacities.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn peer_close_after_reply_does_not_cancel_reply_drain() -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        let (gateway, mut worker) = UnixStream::pair()?;
+        worker.write_all(b"complete worker response").await?;
+        drop(worker); // Worker replied and closed before the gateway handles client FIN.
+        let (mut recv, mut send) = gateway.into_split();
+        let mut client_fin = tokio::io::empty();
+        let response = async {
+            // Deliberately leave reply bytes unread until the FIN side is polled.
+            tokio::task::yield_now().await;
+            let mut data = Vec::new();
+            recv.read_to_end(&mut data).await?;
+            Ok::<_, anyhow::Error>(data)
+        };
+        let (_, response) =
+            tokio::try_join!(relay_worker_input(&mut client_fin, &mut send), response)?;
+        assert_eq!(response, b"complete worker response");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closed_worker_still_rejects_unsent_request_bytes() -> Result<()> {
+        let (mut gateway, worker) = UnixStream::pair()?;
+        drop(worker);
+        let mut input = b"unsent request bytes".as_slice();
+        assert!(relay_worker_input(&mut input, &mut gateway).await.is_err());
+        Ok(())
     }
 
     #[tokio::test]
