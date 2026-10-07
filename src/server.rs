@@ -127,6 +127,7 @@ enum ConnectionBackend {
     Worker {
         router: Arc<WorkerRouter>,
         account: SystemAccount,
+        worker_identity: Arc<tokio::sync::Mutex<Option<crate::worker_identity::WorkerIdentity>>>,
     },
 }
 
@@ -496,7 +497,11 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
                         )
                         .await
                     }
-                    ConnectionBackend::Worker { router, account } => {
+                    ConnectionBackend::Worker {
+                        router,
+                        account,
+                        worker_identity,
+                    } => {
                         router
                             .proxy_stream(
                                 &account,
@@ -509,6 +514,7 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
                                     stream_hello,
                                     connection_id,
                                     connection: request_connection,
+                                    worker_identity,
                                 },
                             )
                             .await
@@ -758,6 +764,7 @@ fn authenticate_user(
                 ConnectionBackend::Worker {
                     router: router.clone(),
                     account,
+                    worker_identity: Arc::new(tokio::sync::Mutex::new(None)),
                 },
             ))
         }

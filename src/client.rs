@@ -365,6 +365,18 @@ impl Drop for AstraClient {
 }
 
 impl AstraClient {
+    /// Keep the runtime alive long enough to deliver CONNECTION_CLOSE before a CLI exits.
+    /// Drop alone schedules the packet but cannot flush it after Tokio has shut down.
+    pub fn finish_connection(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let connection = self.connection.clone();
+        let endpoint = self._endpoint.clone();
+        async move {
+            connection.close(0, b"client done");
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle()).await;
+        }
+    }
+
     pub(crate) fn connection_lost(&self) -> bool {
         self.connection.is_closed()
     }

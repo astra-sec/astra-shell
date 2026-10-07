@@ -27,3 +27,5 @@ pub const LEGACY_CLIENT_HELLO_VERSION: u32 = 1;
 pub const MINIMUM_PROTOCOL_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const SSHSIG_NAMESPACE: &str = "astra-shell-auth-v1";
+
+pub(crate) mod worker_identity;

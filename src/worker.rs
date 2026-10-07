@@ -51,6 +51,7 @@ pub(crate) struct WorkerProxyStream {
     pub(crate) stream_hello: Option<StreamHello>,
     pub(crate) connection_id: String,
     pub(crate) connection: TransportConnection,
+    pub(crate) worker_identity: Arc<Mutex<Option<crate::worker_identity::WorkerIdentity>>>,
 }
 
 pub const DEFAULT_WORKER_IDLE_TIMEOUT_SECONDS: u64 = 10 * 60;
@@ -94,8 +95,27 @@ impl WorkerRouter {
             stream_hello,
             connection_id,
             connection,
+            worker_identity,
         } = request;
-        let worker = self.connect(account).await?;
+        let (worker, identity) = match self.connect(account).await {
+            Ok(worker) => worker,
+            Err(error) => {
+                connection.close(
+                    0x105,
+                    b"worker unavailable or incompatible; reconnect required",
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) =
+            crate::worker_identity::pin(&mut *worker_identity.lock().await, identity)
+        {
+            connection.close(
+                0x105,
+                b"worker epoch invalidated; reconnect and enumerate sessions",
+            );
+            return Err(error);
+        }
         let (mut worker_recv, mut worker_send) = worker.into_split();
         write_message(
             &mut worker_send,
@@ -121,10 +141,16 @@ impl WorkerRouter {
         Ok(())
     }
 
-    async fn connect(&self, account: &SystemAccount) -> Result<UnixStream> {
+    async fn connect(
+        &self,
+        account: &SystemAccount,
+    ) -> Result<(UnixStream, crate::worker_identity::WorkerIdentity)> {
         self.ensure_worker_capacity(account).await?;
         match self.connect_with_capacity(account).await {
-            Ok(stream) => Ok(stream),
+            Ok(mut stream) => {
+                let identity = crate::worker_identity::discover(&mut stream, account.uid).await?;
+                Ok((stream, identity))
+            }
             Err(error) => {
                 self.worker_capacities.lock().await.remove(&account.uid);
                 Err(error)
@@ -464,6 +490,7 @@ pub async fn serve_worker(
         )
     }
     let _worker_lock = ProcessLock::acquire(&state_dir.join("worker.lock"))?;
+    let identity = crate::worker_identity::WorkerIdentity::new(expected_uid);
     let pid_file = state_dir.join("worker.pid");
     fs::write(&pid_file, format!("{}\n", std::process::id()))?;
     fs::set_permissions(&pid_file, fs::Permissions::from_mode(0o600))?;
@@ -492,11 +519,12 @@ pub async fn serve_worker(
         tokio::select! {
             biased;
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let (mut stream, _) = accepted?;
                 idle_state.mark_active();
                 let manager = manager.clone();
                 let files = files.clone();
                 requests.spawn(async move {
+                    crate::worker_identity::introduce(&mut stream, identity).await?;
                     let (recv, send) = stream.into_split();
                     handle_worker_request(manager, files, send, recv).await
                 });

@@ -206,7 +206,18 @@ async fn run() -> Result<()> {
     } else {
         AstraClient::connect(address, &server_name, &trust, &identity, &username).await?
     };
-    let workspace_id = if cli.streaming {
+    let finish = client.finish_connection();
+    let result = run_connected(client, cli.streaming, cli.command).await;
+    finish.await;
+    result
+}
+
+async fn run_connected(
+    client: AstraClient,
+    streaming: bool,
+    command: Option<Command>,
+) -> Result<()> {
+    let workspace_id = if streaming {
         if !client
             .negotiated_protocol()
             .has(astra_shell::negotiation::CAPABILITY_DATAGRAM_STATE, 2)
@@ -225,7 +236,7 @@ async fn run() -> Result<()> {
     } else {
         String::new()
     };
-    match cli.command {
+    match command {
         None => {
             let terminal = client
                 .spawn(SpawnRequest {
@@ -239,7 +250,7 @@ async fn run() -> Result<()> {
                     workspace_id: workspace_id.clone(),
                 })
                 .await?;
-            if cli.streaming {
+            if streaming {
                 attach_streaming_terminal(client, workspace_id, terminal.id, false, false).await?;
             } else {
                 attach_terminal(client, terminal.id, false, false).await?;
@@ -293,7 +304,7 @@ async fn run() -> Result<()> {
                 .await?;
             println!("{}", terminal_reference(&terminal));
             if attach {
-                if cli.streaming {
+                if streaming {
                     attach_streaming_terminal(client, workspace_id, terminal.id, false, false)
                         .await?;
                 } else {
@@ -303,7 +314,7 @@ async fn run() -> Result<()> {
         }
         Some(Command::Attach(arguments)) => {
             let terminal_id = resolve_terminal_uuid(&client, &arguments.terminal_id).await?;
-            if cli.streaming {
+            if streaming {
                 attach_streaming_terminal(
                     client,
                     workspace_id,
@@ -318,14 +329,12 @@ async fn run() -> Result<()> {
         }
         Some(Command::Close { terminal_id }) => {
             let terminal_id = resolve_terminal_uuid(&client, &terminal_id).await?;
-            if cli.streaming {
+            if streaming {
                 // Formal session-object peers require the workspace alongside
                 // the canonical terminal UUID.
                 println!(
                     "{}",
-                    client
-                        .close_in_workspace(workspace_id, terminal_id)
-                        .await?
+                    client.close_in_workspace(workspace_id, terminal_id).await?
                 )
             } else {
                 println!("{}", client.close(terminal_id).await?)
