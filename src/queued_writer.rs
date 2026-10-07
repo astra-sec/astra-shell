@@ -89,19 +89,28 @@ impl AsyncWrite for QueuedWriter {
         if bytes.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        if self
-            .queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                n.checked_add(bytes.len())
-                    .filter(|n| *n <= MAX_QUEUED_BYTES)
-            })
-            .is_err()
-        {
-            // Excessive reliable control/history traffic must not consume
-            // unbounded memory or suspend the lease/control task indefinitely.
-            return Poll::Ready(Err(io::Error::other(
-                "reliable attachment output budget exceeded",
-            )));
+        // Use the stable CAS primitive across toolchains that spell the update
+        // helper differently; preserve the same checked limit and memory ordering.
+        let mut current = self.queued.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current
+                .checked_add(bytes.len())
+                .filter(|n| *n <= MAX_QUEUED_BYTES)
+            else {
+                // Reject excess traffic instead of blocking input/ACK/lease work.
+                return Poll::Ready(Err(io::Error::other(
+                    "reliable attachment output budget exceeded",
+                )));
+            };
+            match self.queued.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
         }
         if sender.try_send(bytes.to_vec()).is_err() {
             self.queued.fetch_sub(bytes.len(), Ordering::AcqRel);
@@ -128,6 +137,26 @@ impl AsyncWrite for QueuedWriter {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn exact_byte_budget_rejects_excess_and_releases_after_drain() {
+        let mut sink = tokio::io::sink();
+        let (mut producer, drain) = queued_writer(&mut sink);
+        let usage = producer.queued.clone();
+        producer
+            .write_all(&vec![0; MAX_QUEUED_BYTES])
+            .await
+            .unwrap();
+        let error = producer.write_all(&[1]).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "reliable attachment output budget exceeded"
+        );
+        assert_eq!(usage.load(Ordering::Acquire), MAX_QUEUED_BYTES);
+        producer.shutdown().await.unwrap();
+        drain.await.unwrap();
+        assert_eq!(usage.load(Ordering::Acquire), 0);
+    }
 
     #[tokio::test]
     async fn a_blocked_sink_does_not_block_producer_and_drains_in_order() {
