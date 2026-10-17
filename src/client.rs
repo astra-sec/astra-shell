@@ -601,6 +601,7 @@ impl AstraClient {
             takeover,
             resume_token,
             workspace_id: String::new(),
+            client_instance_id: String::new(),
         })
         .await
     }
@@ -1518,12 +1519,14 @@ mod tests {
         let first = client.spawn(spawn("first")).await?;
         let second = client.spawn(spawn("second")).await?;
         let first_terminal_id = first.id.clone();
+        let device = uuid::Uuid::new_v4().to_string();
         let attach = |terminal_id: String| AttachRequest {
             terminal_id,
             read_only: false,
             takeover: false,
             resume_token: String::new(),
             workspace_id: workspace.id.clone(),
+            client_instance_id: device.clone(),
         };
         let (mut first_attachment, first_attached) =
             client.attach_streaming(attach(first.id)).await?;
@@ -1601,6 +1604,7 @@ mod tests {
                 takeover: false,
                 resume_token: first_attached.resume_token,
                 workspace_id: workspace.id,
+                client_instance_id: device.clone(),
             })
             .await?;
         assert!(!resumed.lease_id.is_empty());

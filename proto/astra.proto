@@ -145,6 +145,8 @@ message AttachRequest {
   // release the new attachment.
   string resume_token = 4;
   string workspace_id = 5;
+  // terminal.input_resume v1: device-local canonical UUID, never an ownership proof alone.
+  string client_instance_id = 6;
 }
 message CloseRequest {
   string terminal_id = 1;
@@ -337,6 +339,8 @@ message AttachResponse {
   AttachmentInfo attachment = 7;
   // Non-zero only for a writable attachment that negotiated terminal.input_lease v1.
   uint32 lease_ttl_ms = 8;
+  // Server-assigned authority generation; required for input_resume v2 controllers.
+  uint64 recovery_generation = 9;
 }
 message AckResponse { string message = 1; }
 message ErrorResponse {

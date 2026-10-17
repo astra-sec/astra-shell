@@ -16,6 +16,7 @@ pub const CAPABILITY_STATE_ACK: &str = "terminal.state_ack";
 pub const CAPABILITY_SEMANTIC_DIFF: &str = "terminal.semantic_diff";
 pub const CAPABILITY_CLIPBOARD_WRITE: &str = "terminal.clipboard_write";
 pub const CAPABILITY_SESSION_OBJECTS: &str = "session.objects";
+pub const CAPABILITY_INPUT_RESUME: &str = "terminal.input_resume";
 pub const CAPABILITY_INPUT_LEASE: &str = "terminal.input_lease";
 pub const CAPABILITY_PAYLOAD_ZSTD: &str = "payload.zstd";
 pub const CAPABILITY_TCP_FORWARD: &str = "forward.tcp";
@@ -96,6 +97,11 @@ impl ProtocolSupport {
                     name: CAPABILITY_SESSION_OBJECTS,
                     minimum_version: 1,
                     maximum_version: 1,
+                },
+                CapabilityRange {
+                    name: CAPABILITY_INPUT_RESUME,
+                    minimum_version: 2,
+                    maximum_version: 2,
                 },
                 CapabilityRange {
                     name: CAPABILITY_INPUT_LEASE,
@@ -284,6 +290,9 @@ pub fn negotiate_client_hello(
         capabilities.remove(CAPABILITY_INPUT_LEASE);
     }
 
+    if !capabilities.contains_key(CAPABILITY_INPUT_LEASE) {
+        capabilities.remove(CAPABILITY_INPUT_RESUME);
+    }
     if !capabilities.contains_key(CAPABILITY_STREAM_CHANNELS) {
         capabilities.remove(CAPABILITY_TCP_FORWARD);
     }
@@ -531,6 +540,11 @@ fn validate_capability_dependencies(capabilities: &BTreeMap<String, u32>) -> Res
         !capabilities.contains_key(CAPABILITY_INPUT_LEASE)
             || capabilities.contains_key(CAPABILITY_SESSION_OBJECTS),
         "terminal.input_lease requires session.objects v1"
+    );
+    ensure!(
+        !capabilities.contains_key(CAPABILITY_INPUT_RESUME)
+            || capabilities.contains_key(CAPABILITY_INPUT_LEASE),
+        "terminal.input_resume requires terminal.input_lease v1"
     );
     Ok(())
 }

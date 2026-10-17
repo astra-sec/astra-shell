@@ -275,6 +275,8 @@ pub struct EnvironmentVariable {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct AttachRequest {
+    #[prost(string, tag = "6")]
+    pub client_instance_id: String,
     #[prost(string, tag = "1")]
     pub terminal_id: String,
     #[prost(bool, tag = "2")]
@@ -837,6 +839,8 @@ pub struct AttachResponse {
     pub attachment: Option<AttachmentInfo>,
     #[prost(uint32, tag = "8")]
     pub lease_ttl_ms: u32,
+    #[prost(uint64, tag = "9")]
+    pub recovery_generation: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]

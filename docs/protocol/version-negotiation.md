@@ -29,6 +29,7 @@
 | `terminal.state_ack` | 客户端只在验证、应用并渲染完整 generation 后回 ACK；每个 attachment 最多一代在途 | 是（Apple client/server v1） | 必须同时选择 `terminal.semantic_state` v2；CLI 不 offer |
 | `terminal.semantic_diff` | 从已 ACK generation 到最新 generation 的累计行级 diff；中间输出可合并 | 是（Apple client/server v1） | 必须同时选择 `terminal.state_ack` v1 与 `terminal.semantic_state` v2；CLI 不 offer |
 | `session.objects` | Workspace CRUD、Terminal 归属和 Attachment 身份 | 是（Apple client/server v1） | 与 renderer capability 独立；CLI 保留 N-1 默认 Workspace 适配 |
+| `terminal.input_resume` | 设备本地凭证恢复；EOF/TTL保留资格，takeover/RELEASE/7天到期失效 | server/Apple v2 | 依赖 terminal.input_lease v1；服务端代次 fencing，见 `input-resume-v2.md` |
 | `terminal.input_lease` | controller lease TTL、renew/release 与 controller-only resize owner | 是（server v1；Apple 完成 SESS-02 后启用） | 依赖 `session.objects` v1；未协商客户端保留 Stream 生命周期 lease |
 | `terminal.datagram_state` | live viewport 的 sparse cell patch 走 QUIC DATAGRAM，可靠 keyframe/repair 保证最终收敛 | 是（Rust 实验分支 v2；CLI 通过 `--streaming` offer；Apple 尚未 offer） | 依赖 `terminal.semantic_state` v2、`terminal.state_ack` v1、`session.objects` v1 以及连接可用 DATAGRAM；不与已撤回的实验 v1 互通 |
 

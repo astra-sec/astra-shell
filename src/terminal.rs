@@ -3,14 +3,17 @@ use std::{
     ffi::CString,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 #[cfg(target_os = "linux")]
 use std::fs;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use astra_wezterm_term::{Clipboard, ClipboardSelection as EngineClipboardSelection};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::broadcast;
@@ -81,9 +84,19 @@ struct Lease {
     expires_at: Option<Instant>,
 }
 
+// One bounded record per live Terminal; protected under lease -> recovery lock order.
+struct InputRecovery {
+    client_id: String,
+    token: String,
+    expires_at: Instant,
+}
+
+pub const INPUT_RESUME_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 pub struct LeaseGrant {
     pub lease_id: String,
     pub resume_token: String,
+    pub recovery_generation: u64,
     pub ttl: Option<Duration>,
 }
 
@@ -98,6 +111,8 @@ pub struct Terminal {
     events: broadcast::Sender<PtyEvent>,
     lease_events: broadcast::Sender<LeaseEvent>,
     lease: Mutex<Option<Lease>>,
+    recovery: Mutex<Option<InputRecovery>>,
+    recovery_generation: AtomicU64,
 }
 
 impl Terminal {
@@ -190,63 +205,129 @@ impl Terminal {
         resume_token: &str,
         ttl: Option<Duration>,
     ) -> Result<LeaseGrant> {
+        self.acquire_resumable_lease(read_only, takeover, resume_token, ttl, None)
+    }
+
+    pub fn acquire_resumable_lease(
+        &self,
+        read_only: bool,
+        takeover: bool,
+        resume_token: &str,
+        ttl: Option<Duration>,
+        client_id: Option<&str>,
+    ) -> Result<LeaseGrant> {
+        self.acquire_resumable_lease_at(
+            read_only,
+            takeover,
+            resume_token,
+            ttl,
+            client_id,
+            Instant::now,
+        )
+    }
+
+    fn acquire_resumable_lease_at(
+        &self,
+        read_only: bool,
+        takeover: bool,
+        resume_token: &str,
+        ttl: Option<Duration>,
+        client_id: Option<&str>,
+        clock: impl FnOnce() -> Instant,
+    ) -> Result<LeaseGrant> {
+        ensure!(resume_token.len() <= 128, "invalid resume credential");
+        if let Some(id) = client_id {
+            ensure!(
+                Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id),
+                "invalid client instance ID"
+            );
+        }
         if read_only {
             return Ok(LeaseGrant {
                 lease_id: String::new(),
                 resume_token: String::new(),
+                recovery_generation: 0,
                 ttl: None,
             });
         }
         let mut lease = self.lease.lock().expect("terminal lease poisoned");
-        let revoked_lease_id = lease.as_ref().map(|lease| lease.id.clone());
-        if !resume_token.is_empty()
-            && lease
-                .as_ref()
-                .is_some_and(|current| current.resume_token == resume_token)
+        let mut recovery = self.recovery.lock().expect("terminal recovery poisoned");
+        let now = clock();
+        if recovery
+            .as_ref()
+            .is_some_and(|record| record.expires_at <= now)
         {
-            let lease_id = Uuid::new_v4().to_string();
-            *lease = Some(Lease {
-                id: lease_id.clone(),
-                resume_token: resume_token.to_owned(),
-                last_sequence: 0,
-                expires_at: ttl.map(|duration| Instant::now() + duration),
-            });
-            if let Some(revoked_lease_id) = revoked_lease_id {
-                let _ = self.lease_events.send(LeaseEvent {
-                    revoked_lease_id,
-                    reason: LeaseRevocationReason::TakenOver,
-                });
-            }
-            return Ok(LeaseGrant {
-                lease_id,
-                resume_token: resume_token.to_owned(),
-                ttl,
+            *recovery = None;
+        }
+        if lease
+            .as_ref()
+            .is_some_and(|current| current.expires_at.is_some_and(|deadline| deadline <= now))
+        {
+            let expired = lease.take().unwrap();
+            let _ = self.lease_events.send(LeaseEvent {
+                revoked_lease_id: expired.id,
+                reason: LeaseRevocationReason::Expired,
             });
         }
-        if lease.is_some() && !takeover {
+        let resuming = !takeover && !resume_token.is_empty();
+        if resuming {
+            let authorized = match client_id {
+                Some(id) => recovery
+                    .as_ref()
+                    .is_some_and(|record| record.client_id == id && record.token == resume_token),
+                // N-1 cannot use a durable record, nor resurrect an expired/detached token.
+                None => {
+                    recovery.is_none()
+                        && lease
+                            .as_ref()
+                            .is_some_and(|current| current.resume_token == resume_token)
+                }
+            };
+            ensure!(authorized, "input recovery eligibility expired or revoked");
+        } else if lease.is_some() && !takeover {
             bail!("terminal already has an input lease owner; use --read-only or --takeover")
         }
-        let lease_id = Uuid::new_v4().to_string();
-        let resume_token = if lease.is_none() && !resume_token.is_empty() {
+        // Assigned under the lease lock, never inferred from request/response order.
+        // Terminal UUIDs are never reused, so a counter cannot cross worker lifetimes.
+        let generation = if resuming {
+            self.recovery_generation.load(Ordering::Relaxed)
+        } else {
+            let next = self
+                .recovery_generation
+                .load(Ordering::Relaxed)
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("input recovery generation exhausted"))?;
+            self.recovery_generation.store(next, Ordering::Relaxed);
+            next
+        };
+        let token = if resuming {
             resume_token.to_owned()
         } else {
             Uuid::new_v4().to_string()
         };
-        *lease = Some(Lease {
-            id: lease_id.clone(),
-            resume_token: resume_token.clone(),
-            last_sequence: 0,
-            expires_at: ttl.map(|duration| Instant::now() + duration),
+        // Every new grant/takeover, even N-1, revokes the previous authority generation.
+        *recovery = client_id.map(|id| InputRecovery {
+            client_id: id.to_owned(),
+            token: token.clone(),
+            expires_at: now + INPUT_RESUME_WINDOW,
         });
-        if let Some(revoked_lease_id) = revoked_lease_id {
+        let lease_id = Uuid::new_v4().to_string();
+        let old = lease.replace(Lease {
+            id: lease_id.clone(),
+            resume_token: token.clone(),
+            last_sequence: 0,
+            expires_at: ttl.map(|duration| now + duration),
+        });
+        if let Some(old) = old {
             let _ = self.lease_events.send(LeaseEvent {
-                revoked_lease_id,
+                revoked_lease_id: old.id,
                 reason: LeaseRevocationReason::TakenOver,
             });
         }
         Ok(LeaseGrant {
             lease_id,
-            resume_token,
+            resume_token: token,
+            recovery_generation: if client_id.is_some() { generation } else { 0 },
             ttl,
         })
     }
@@ -273,16 +354,36 @@ impl Terminal {
     }
 
     pub fn renew_lease(&self, lease_id: &str, sequence: u64, ttl: Duration) -> Result<()> {
-        let mut lease = self.validate_lease(lease_id, sequence)?;
+        self.renew_lease_at(lease_id, sequence, ttl, Instant::now)
+    }
+
+    fn renew_lease_at(
+        &self,
+        lease_id: &str,
+        sequence: u64,
+        ttl: Duration,
+        clock: impl Fn() -> Instant,
+    ) -> Result<()> {
+        let mut lease = self.validate_lease_at(lease_id, sequence, clock())?;
+        let now = clock();
         let current = lease.as_mut().expect("validated lease disappeared");
-        current.expires_at = Some(Instant::now() + ttl);
+        current.expires_at = Some(now + ttl);
         current.last_sequence = sequence;
+        if let Some(record) = self
+            .recovery
+            .lock()
+            .expect("terminal recovery poisoned")
+            .as_mut()
+        {
+            record.expires_at = now + INPUT_RESUME_WINDOW;
+        }
         Ok(())
     }
 
     pub fn release_lease_command(&self, lease_id: &str, sequence: u64) -> Result<()> {
         let mut lease = self.validate_lease(lease_id, sequence)?;
         *lease = None;
+        *self.recovery.lock().expect("terminal recovery poisoned") = None;
         let _ = self.lease_events.send(LeaseEvent {
             revoked_lease_id: lease_id.to_owned(),
             reason: LeaseRevocationReason::Released,
@@ -291,12 +392,13 @@ impl Terminal {
     }
 
     pub fn expire_lease_if_due(&self, lease_id: &str) -> bool {
+        self.expire_lease_if_due_at(lease_id, Instant::now())
+    }
+
+    fn expire_lease_if_due_at(&self, lease_id: &str, now: Instant) -> bool {
         let mut lease = self.lease.lock().expect("terminal lease poisoned");
         let expired = lease.as_ref().is_some_and(|current| {
-            current.id == lease_id
-                && current
-                    .expires_at
-                    .is_some_and(|deadline| deadline <= Instant::now())
+            current.id == lease_id && current.expires_at.is_some_and(|deadline| deadline <= now)
         });
         if expired {
             *lease = None;
@@ -381,7 +483,16 @@ impl Terminal {
         lease_id: &str,
         sequence: u64,
     ) -> Result<std::sync::MutexGuard<'_, Option<Lease>>> {
-        self.expire_lease_if_due(lease_id);
+        self.validate_lease_at(lease_id, sequence, Instant::now())
+    }
+
+    fn validate_lease_at(
+        &self,
+        lease_id: &str,
+        sequence: u64,
+        now: Instant,
+    ) -> Result<std::sync::MutexGuard<'_, Option<Lease>>> {
+        self.expire_lease_if_due_at(lease_id, now);
         let lease = self.lease.lock().expect("terminal lease poisoned");
         let current = lease
             .as_ref()
@@ -600,6 +711,8 @@ impl TerminalManager {
             events,
             lease_events,
             lease: Mutex::new(None),
+            recovery: Mutex::new(None),
+            recovery_generation: AtomicU64::new(0),
         });
         self.terminals
             .write()
@@ -1335,6 +1448,286 @@ mod tests {
         );
         terminal.release_lease(&grant.lease_id);
         assert!(!terminal.owns_lease(&expiring.lease_id));
+        terminal.kill().unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_survives_eof_ttl_but_not_release_takeover_or_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager::new(directory.path().to_path_buf()).unwrap();
+        let terminal = manager
+            .spawn(SpawnRequest {
+                argv: vec!["/bin/cat".into()],
+                rows: 24,
+                cols: 80,
+                term: "xterm-256color".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let a = Uuid::new_v4().to_string();
+        let b = Uuid::new_v4().to_string();
+        let grant = terminal
+            .acquire_resumable_lease(false, false, "", Some(Duration::ZERO), Some(&a))
+            .unwrap();
+        assert!(terminal.expire_lease_if_due(&grant.lease_id));
+        assert!(
+            terminal
+                .acquire_resumable_lease(
+                    false,
+                    false,
+                    &grant.resume_token,
+                    Some(INPUT_LEASE_TTL),
+                    Some(&b)
+                )
+                .is_err()
+        );
+        let resumed = terminal
+            .acquire_resumable_lease(
+                false,
+                false,
+                &grant.resume_token,
+                Some(INPUT_LEASE_TTL),
+                Some(&a),
+            )
+            .unwrap();
+        assert_ne!(grant.lease_id, resumed.lease_id);
+        assert!(grant.recovery_generation > 0);
+        assert_eq!(grant.recovery_generation, resumed.recovery_generation);
+        terminal.release_lease(&grant.lease_id); // delayed old cleanup
+        assert!(terminal.owns_lease(&resumed.lease_id));
+        assert!(terminal.write_input(&grant.lease_id, 1, b"stale").is_err());
+        assert!(terminal.resize(&grant.lease_id, 2, 30, 90, 0, 0).is_err());
+        assert!(
+            terminal
+                .renew_lease(&grant.lease_id, 3, INPUT_LEASE_TTL)
+                .is_err()
+        );
+        assert!(terminal.release_lease_command(&grant.lease_id, 4).is_err());
+        terminal.release_lease(&resumed.lease_id); // EOF keeps credential
+        let after_eof = terminal
+            .acquire_resumable_lease(
+                false,
+                false,
+                &grant.resume_token,
+                Some(INPUT_LEASE_TTL),
+                Some(&a),
+            )
+            .unwrap();
+        let takeover = terminal
+            .acquire_resumable_lease(false, true, "", Some(INPUT_LEASE_TTL), Some(&b))
+            .unwrap();
+        assert!(takeover.recovery_generation > after_eof.recovery_generation);
+        terminal.release_lease(&takeover.lease_id);
+        assert!(
+            terminal
+                .acquire_resumable_lease(
+                    false,
+                    false,
+                    &after_eof.resume_token,
+                    Some(INPUT_LEASE_TTL),
+                    Some(&a)
+                )
+                .is_err()
+        );
+        assert!(
+            terminal
+                .acquire_lease(false, false, &after_eof.resume_token, None)
+                .is_err()
+        );
+        let b_resumed = terminal
+            .acquire_resumable_lease(
+                false,
+                false,
+                &takeover.resume_token,
+                Some(INPUT_LEASE_TTL),
+                Some(&b),
+            )
+            .unwrap();
+        terminal
+            .release_lease_command(&b_resumed.lease_id, 1)
+            .unwrap();
+        assert!(
+            terminal
+                .acquire_resumable_lease(
+                    false,
+                    false,
+                    &b_resumed.resume_token,
+                    Some(INPUT_LEASE_TTL),
+                    Some(&b)
+                )
+                .is_err()
+        );
+        let expiring = terminal
+            .acquire_resumable_lease(false, false, "", Some(INPUT_LEASE_TTL), Some(&a))
+            .unwrap();
+        terminal
+            .recovery
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .expires_at = Instant::now();
+        assert!(
+            terminal
+                .acquire_resumable_lease(
+                    false,
+                    false,
+                    &expiring.resume_token,
+                    Some(INPUT_LEASE_TTL),
+                    Some(&a)
+                )
+                .is_err()
+        );
+        // N-1 explicit takeover must also revoke durable authority.
+        terminal.acquire_lease(false, true, "", None).unwrap();
+        assert!(
+            terminal
+                .acquire_resumable_lease(
+                    false,
+                    false,
+                    &expiring.resume_token,
+                    Some(INPUT_LEASE_TTL),
+                    Some(&a)
+                )
+                .is_err()
+        );
+        terminal.kill().unwrap();
+    }
+
+    #[tokio::test]
+    async fn acknowledged_renewals_keep_recovery_after_eight_days_but_sent_or_stale_ones_do_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager::new(directory.path().to_path_buf()).unwrap();
+        let terminal = manager
+            .spawn(SpawnRequest {
+                argv: vec!["/bin/cat".into()],
+                rows: 24,
+                cols: 80,
+                term: "xterm-256color".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let device = Uuid::new_v4().to_string();
+        let start = Instant::now();
+        let grant = terminal
+            .acquire_resumable_lease_at(
+                false,
+                false,
+                "",
+                Some(INPUT_LEASE_TTL),
+                Some(&device),
+                || start,
+            )
+            .unwrap();
+        // A controllable monotonic clock exercises the production renewal/eligibility paths.
+        for sequence in 1..=8 * 8640 {
+            terminal
+                .renew_lease_at(&grant.lease_id, sequence, INPUT_LEASE_TTL, || {
+                    start + Duration::from_secs(sequence * 10)
+                })
+                .unwrap();
+        }
+        terminal.release_lease(&grant.lease_id);
+        let day_eight = start + Duration::from_secs(8 * 86400 + 20);
+        let resumed = terminal
+            .acquire_resumable_lease_at(
+                false,
+                false,
+                &grant.resume_token,
+                Some(INPUT_LEASE_TTL),
+                Some(&device),
+                || day_eight,
+            )
+            .unwrap();
+        assert_eq!(resumed.recovery_generation, grant.recovery_generation);
+        let deadline = terminal
+            .recovery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .expires_at;
+        assert!(
+            terminal
+                .renew_lease_at(&grant.lease_id, 999999, INPUT_LEASE_TTL, || day_eight)
+                .is_err()
+        );
+        assert_eq!(
+            terminal
+                .recovery
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .expires_at,
+            deadline
+        );
+        // No processed renewals (regardless of what a client sent) means the server window expires.
+        terminal.release_lease(&resumed.lease_id);
+        assert!(
+            terminal
+                .acquire_resumable_lease_at(
+                    false,
+                    false,
+                    &resumed.resume_token,
+                    Some(INPUT_LEASE_TTL),
+                    Some(&device),
+                    || deadline + Duration::from_secs(1)
+                )
+                .is_err()
+        );
+        terminal.kill().unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_resume_and_takeover_never_restore_old_authority_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TerminalManager::new(directory.path().to_path_buf()).unwrap();
+        let terminal = manager
+            .spawn(SpawnRequest {
+                argv: vec!["/bin/cat".into()],
+                rows: 24,
+                cols: 80,
+                term: "xterm-256color".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let a = Uuid::new_v4().to_string();
+        let b = Uuid::new_v4().to_string();
+        for _ in 0..32 {
+            let first = terminal
+                .acquire_resumable_lease(false, true, "", Some(INPUT_LEASE_TTL), Some(&a))
+                .unwrap();
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let _ = terminal.acquire_resumable_lease(
+                        false,
+                        false,
+                        &first.resume_token,
+                        Some(INPUT_LEASE_TTL),
+                        Some(&a),
+                    );
+                });
+                barrier.wait();
+                let next = terminal
+                    .acquire_resumable_lease(false, true, "", Some(INPUT_LEASE_TTL), Some(&b))
+                    .unwrap();
+                terminal.release_lease(&next.lease_id);
+            });
+            assert!(
+                terminal
+                    .acquire_resumable_lease(
+                        false,
+                        false,
+                        &first.resume_token,
+                        Some(INPUT_LEASE_TTL),
+                        Some(&a)
+                    )
+                    .is_err()
+            );
+        }
         terminal.kill().unwrap();
     }
 

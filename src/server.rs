@@ -21,10 +21,10 @@ use crate::{
     files::{FileResult, FileService},
     negotiation::{
         CAPABILITY_CLIPBOARD_WRITE, CAPABILITY_DATAGRAM_STATE, CAPABILITY_HISTORY_PAGING,
-        CAPABILITY_INPUT_LEASE, CAPABILITY_PAYLOAD_ZSTD, CAPABILITY_SEMANTIC_DIFF,
-        CAPABILITY_SEMANTIC_STATE, CAPABILITY_SESSION_OBJECTS, CAPABILITY_STATE_ACK,
-        CAPABILITY_STREAM_CHANNELS, NegotiatedProtocol, ProtocolSupport, negotiate_client_hello,
-        selections, validate_worker_selection,
+        CAPABILITY_INPUT_LEASE, CAPABILITY_INPUT_RESUME, CAPABILITY_PAYLOAD_ZSTD,
+        CAPABILITY_SEMANTIC_DIFF, CAPABILITY_SEMANTIC_STATE, CAPABILITY_SESSION_OBJECTS,
+        CAPABILITY_STATE_ACK, CAPABILITY_STREAM_CHANNELS, NegotiatedProtocol, ProtocolSupport,
+        negotiate_client_hello, selections, validate_worker_selection,
     },
     process_lock::ProcessLock,
     protocol::{
@@ -1430,11 +1430,35 @@ where
     } = context;
     let mut lease_events = terminal.subscribe_to_leases();
     let input_lease = negotiated.has(CAPABILITY_INPUT_LEASE, 1);
-    let lease = match terminal.acquire_lease(
+    if !request.client_instance_id.is_empty() && !negotiated.has(CAPABILITY_INPUT_RESUME, 2) {
+        send_error(
+            &mut send,
+            request_id,
+            "capability",
+            anyhow!("input resume capability required"),
+        )
+        .await?;
+        send.shutdown().await?;
+        return Ok(());
+    }
+    // Reserve attachment capacity before mutating control authority. A failed admission
+    // must not revoke an existing controller or create an undeliverable recovery grant.
+    let info = terminal.info();
+    let mut attachment = match manager.register_attachment(&connection_id, &info, request.read_only)
+    {
+        Ok(attachment) => attachment,
+        Err(error) => {
+            send_domain_error(&mut send, request_id, "attachment", error).await?;
+            send.shutdown().await?;
+            return Ok(());
+        }
+    };
+    let lease = match terminal.acquire_resumable_lease(
         request.read_only,
         request.takeover,
         &request.resume_token,
         input_lease.then_some(INPUT_LEASE_TTL),
+        (!request.client_instance_id.is_empty()).then_some(request.client_instance_id.as_str()),
     ) {
         Ok(lease) => lease,
         Err(error) => {
@@ -1452,17 +1476,6 @@ where
         }
     }
     let _release_lease = ReleaseLease(terminal.clone(), lease.lease_id.clone());
-    let info = terminal.info();
-    let mut attachment = match manager.register_attachment(&connection_id, &info, request.read_only)
-    {
-        Ok(attachment) => attachment,
-        Err(error) => {
-            terminal.release_lease(&lease.lease_id);
-            send_domain_error(&mut send, request_id, "attachment", error).await?;
-            send.shutdown().await?;
-            return Ok(());
-        }
-    };
     attachment.set_state(crate::protocol::AttachmentState::Snapshotting)?;
     let attachment_info = attachment.info();
     let semantic = negotiated.has(CAPABILITY_SEMANTIC_STATE, 2);
@@ -1507,6 +1520,7 @@ where
             read_only: request.read_only,
             history: Vec::new(),
             resume_token: lease.resume_token.clone(),
+            recovery_generation: lease.recovery_generation,
             snapshot,
             attachment: Some(attachment_info.clone()),
             lease_ttl_ms: lease

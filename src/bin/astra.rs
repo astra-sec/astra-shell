@@ -822,6 +822,7 @@ async fn attach_streaming_terminal(
             read_only,
             takeover,
             resume_token: String::new(),
+            client_instance_id: String::new(),
         })
         .await?;
     let interactive = std::io::stdin().is_terminal();
