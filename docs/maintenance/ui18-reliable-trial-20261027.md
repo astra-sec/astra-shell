@@ -27,7 +27,7 @@ that issue. Reliable full-history coverage above was 1,025 primary rows; history
 paging beyond a bounded full State still requires separate repair. Do not market
 this configuration as general DATAGRAM/history acceptance.
 
-Planned trial (not activated by this documentation): bind only Icelake's existing
+Activated private trial on2026-10-27: binds only Icelake's existing
 private Tailscale address `100.125.87.101:4435`, run rootless as xy/UID1000, with a
 new 0700 state directory, independent certificate/catalog, and only xy's existing
 public authorized SSH keys. Do not bind wildcard/public addresses, alter firewall
@@ -64,3 +64,29 @@ Only the empty, owned private trial instance may be switched to the final build.
 Actual build hashes, process/certificate preservation and final candidate results
 are recorded in the Apple residual evidence directory. GUI profile creation and
 physical input remain pending while native desktop input is unavailable.
+
+
+## Final artifact receipt
+
+Product source `6ce700e3e7cfd3bd1d7b1a8781f7d4f41010a68d`, Linux SHA-256
+`2da53fb86b5a110de9d911b1d0adc3af5db8bdb97a8045cbd0456566f37242f3`, runs with
+explicit reliable delivery and UDP offload disabled. Actual private-network final
+primary fixture consumed all128 directional inputs and imported count128, with
+555.099/483.963ms input-end tails. This is import timing, not physical GUI draw.
+The trial has no remaining owned child PTYs and stays active for the user. Original
+gateway/xy/mimi workers, registered mimi PTYs and the signed Mac app retain exact
+process start identities. No public listener or firewall change was introduced.
+
+The new GUI Host has not been saved because native desktop input is unavailable.
+After unlock, add `Icelake · 滚动修复验证` for xy at100.125.87.101:4435 with existing
+My Apple Device identity; certificate SHA256 is
+`B1Eyu1kYBILaEwrdCvfJ3O2oVDcS1w2gkakAqBhDs8A`. Do not overwrite the old profile.
+Stop only this empty trial with `systemctl --user stop astra-ui18-reliable-trial.service`;
+account for user-created trial terminals before any later stop. No boot autostart
+or original-PTY migration is configured.
+
+The unchanged original33eb4b0 binary with GSO enabled passed Linux loopback rich
+initial State + ACK: primary136ms and alternate135ms, each one compressed chunk.
+Both loopback test PTYs and server attempts were cleaned up. Combined with the
+private no-GSO control this supports a path/offload problem, without asserting
+which tunnel component is faulty. Source defaults remain unchanged.
