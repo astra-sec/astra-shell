@@ -1165,6 +1165,60 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    if !negotiated.has(CAPABILITY_SEMANTIC_STATE, 2) {
+        return handle_attach_inner(
+            manager,
+            terminal,
+            request_id,
+            read_only,
+            takeover,
+            resume_token,
+            send,
+            recv,
+            negotiated,
+            connection_id,
+            None,
+        )
+        .await;
+    }
+    let (queued, drain) = crate::queued_writer::queued_writer(&mut send);
+    let gate = queued.drain_gate();
+    crate::queued_writer::run_with_drain(
+        handle_attach_inner(
+            manager,
+            terminal,
+            request_id,
+            read_only,
+            takeover,
+            resume_token,
+            queued,
+            recv,
+            negotiated,
+            connection_id,
+            Some(gate),
+        ),
+        drain,
+    )
+    .await
+}
+
+async fn handle_attach_inner<W, R>(
+    manager: SessionManager,
+    terminal: Arc<Terminal>,
+    request_id: String,
+    read_only: bool,
+    takeover: bool,
+    resume_token: String,
+    mut send: W,
+    mut recv: R,
+    negotiated: NegotiatedProtocol,
+    connection_id: String,
+    output_gate: Option<crate::queued_writer::DrainGate>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
     let mut lease_events = terminal.subscribe_to_leases();
     let input_lease = negotiated.has(CAPABILITY_INPUT_LEASE, 1);
     let lease = match terminal.acquire_lease(
@@ -1180,6 +1234,14 @@ where
             return Ok(());
         }
     };
+    // Independent output failure may cancel the handler at an await.
+    struct ReleaseLease(Arc<Terminal>, String);
+    impl Drop for ReleaseLease {
+        fn drop(&mut self) {
+            self.0.release_lease(&self.1);
+        }
+    }
+    let _release = ReleaseLease(terminal.clone(), lease.lease_id.clone());
     let info = terminal.info();
     let mut attachment = match manager.register_attachment(&connection_id, &info, read_only) {
         Ok(attachment) => attachment,
@@ -1221,7 +1283,9 @@ where
         }),
     )
     .await?;
+    let mut revision = (Vec::new(), 0);
     if let Some(state) = initial_state {
+        revision = (state.epoch.clone(), state.generation);
         write_terminal_state(&mut send, &info.id, &attachment_info.id, &state).await?;
     }
     attachment.set_state(crate::protocol::AttachmentState::Live)?;
@@ -1239,6 +1303,9 @@ where
         return Ok(());
     }
 
+    let mut dirty = false;
+    let mut sampled = tokio::time::Instant::now();
+    let mut reader = crate::message_reader::MessageReader::default();
     let result: Result<()> = async {
         loop {
             let lease_deadline = terminal.lease_deadline(&lease.lease_id);
@@ -1249,8 +1316,14 @@ where
                     std::future::pending::<()>().await;
                 }
             };
+            let wait_for_state = async {
+                if semantic && dirty {
+                    tokio::time::sleep_until(sampled + std::time::Duration::from_millis(16)).await;
+                    if let Some(gate) = &output_gate { gate.wait_until_drained().await; }
+                } else { std::future::pending::<()>().await; }
+            };
             tokio::select! {
-                incoming = read_message(&mut recv) => {
+                incoming = reader.read(&mut recv) => {
                     match incoming? {
                         Some(WireMessage { body: Some(wire_message::Body::TerminalCommand(command)) }) => {
                             validate_terminal_command_target(
@@ -1272,6 +1345,7 @@ where
                                         size.pixel_width,
                                         size.pixel_height,
                                     )?;
+                                    if semantic { dirty = true; }
                                 }
                                 Some(terminal_command::Command::HistoryPage(request)) => {
                                     if !history_paging {
@@ -1337,17 +1411,19 @@ where
                 _ = wait_for_lease_expiry, if input_lease && !lease.lease_id.is_empty() => {
                     terminal.expire_lease_if_due(&lease.lease_id);
                 }
+                _ = wait_for_state, if semantic && dirty => {
+                    sampled = tokio::time::Instant::now();
+                    dirty = false;
+                    if let Some(state) = terminal.semantic_state_after(&revision)? {
+                        write_terminal_state(&mut send, &info.id, &attachment_info.id, &state).await?;
+                        revision = (state.epoch, state.generation);
+                    }
+                }
                 event = events.recv() => {
                     match event {
                         Ok(PtyEvent::Output(bytes)) => {
                             if semantic {
-                                let state = terminal.semantic_state()?;
-                                write_terminal_state(
-                                    &mut send,
-                                    &info.id,
-                                    &attachment_info.id,
-                                    &state,
-                                ).await?;
+                                dirty = true;
                             } else {
                                 write_terminal_event(
                                     &mut send,
@@ -1358,6 +1434,10 @@ where
                             }
                         }
                         Ok(PtyEvent::Exited(code)) => {
+                            if semantic {
+                                let state = terminal.semantic_state()?;
+                                write_terminal_state(&mut send, &info.id, &attachment_info.id, &state).await?;
+                            }
                             write_terminal_event(
                                 &mut send,
                                 &info.id,
@@ -1408,14 +1488,7 @@ where
                             // in the byte stream.
                             attachment.set_state(crate::protocol::AttachmentState::Snapshotting)?;
                             if semantic {
-                                let (state, replacement) = terminal.semantic_state_and_subscribe()?;
-                                events = replacement;
-                                write_terminal_state(
-                                    &mut send,
-                                    &info.id,
-                                    &attachment_info.id,
-                                    &state,
-                                ).await?;
+                                dirty = true; // retain pending controls/exit in this receiver
                             } else {
                                 let (snapshot, replacement) = terminal.snapshot_and_subscribe()?;
                                 events = replacement;

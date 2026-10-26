@@ -146,6 +146,13 @@ impl Terminal {
         Ok((engine.semantic_state()?, receiver))
     }
 
+    pub fn semantic_state_after(&self, previous: &(Vec<u8>, u64)) -> Result<Option<State>> {
+        self.engine
+            .lock()
+            .expect("terminal engine poisoned")
+            .semantic_state_after(previous)
+    }
+
     pub fn semantic_state(&self) -> Result<State> {
         self.engine
             .lock()

@@ -179,6 +179,17 @@ impl TerminalEngine {
         view.title_was_set.then_some(view.title)
     }
 
+    /// Skip redundant output notifications before traversing history. The caller
+    /// holds the engine lock through this revision check and export.
+    pub fn semantic_state_after(&mut self, previous: &(Vec<u8>, u64)) -> Result<Option<State>> {
+        self.refresh_identity_epoch();
+        let revision = generation(&self.terminal.astra_view(), self.epoch_sequence_start)?;
+        if self.epoch.as_slice() == previous.0.as_slice() && revision == previous.1 {
+            return Ok(None);
+        }
+        self.semantic_state().map(Some)
+    }
+
     pub fn semantic_state(&mut self) -> Result<State> {
         self.refresh_identity_epoch();
         let view = self.terminal.astra_view();
