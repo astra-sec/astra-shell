@@ -92,11 +92,14 @@ pub struct ServerOptions {
     pub paths: ServerPaths,
     pub mode: ServerMode,
     pub resource_policy: ResourcePolicy,
+    /// Advertise terminal DATAGRAM delivery. False keeps reliable ACK/diff/zstd.
+    pub terminal_datagrams: bool,
 }
 
 #[derive(Clone)]
 struct ServerState {
     tcp_forwarding_enabled: bool,
+    terminal_datagrams_enabled: bool,
     mode: ModeState,
     instance_id: String,
     resources: ResourceGovernor,
@@ -287,6 +290,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
         .trim()
         .to_owned();
     let state = ServerState {
+        terminal_datagrams_enabled: options.terminal_datagrams,
         tcp_forwarding_enabled: options.resource_policy.global.forward_connections > 0
             && options.resource_policy.user.forward_connections > 0,
         mode,
@@ -532,6 +536,15 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
     }
 }
 
+fn server_protocol_support(tcp_forwarding: bool, terminal_datagrams: bool) -> ProtocolSupport {
+    let mut support = ProtocolSupport::runtime();
+    support.capabilities.retain(|capability| {
+        (tcp_forwarding || capability.name != crate::negotiation::CAPABILITY_TCP_FORWARD)
+            && (terminal_datagrams || capability.name != CAPABILITY_DATAGRAM_STATE)
+    });
+    support
+}
+
 async fn authenticate_connection(
     state: &ServerState,
     connection: &TransportConnection,
@@ -555,17 +568,10 @@ async fn authenticate_connection(
     if hello.username.is_empty() {
         bail!("ClientHello has no target Unix username")
     }
-    let mut support = ProtocolSupport::runtime();
-    if !state.tcp_forwarding_enabled {
-        support
-            .capabilities
-            .retain(|cap| cap.name != crate::negotiation::CAPABILITY_TCP_FORWARD);
-    }
-    if connection.max_datagram_size().is_none() {
-        support
-            .capabilities
-            .retain(|capability| capability.name != CAPABILITY_DATAGRAM_STATE);
-    }
+    let support = server_protocol_support(
+        state.tcp_forwarding_enabled,
+        state.terminal_datagrams_enabled && connection.max_datagram_size().is_some(),
+    );
     let negotiated = negotiate_client_hello(&hello, &support)?;
     let username = hello.username;
 
@@ -2329,6 +2335,27 @@ mod tests {
     use crate::protocol::{FileCapabilitiesRequest, ListRequest, Request};
     use crate::resources::ResourceAccount;
     use crate::terminal_engine::TerminalEngine;
+
+    #[test]
+    fn reliable_delivery_policy_negotiates_ack_diff_and_compression_with_automatic_client() {
+        let client = crate::negotiation::client_hello("xy", &ProtocolSupport::runtime());
+        let support = server_protocol_support(true, false);
+        let selected = negotiate_client_hello(&client, &support).unwrap();
+        assert!(!selected.has(CAPABILITY_DATAGRAM_STATE, 2));
+        for name in [
+            CAPABILITY_STATE_ACK,
+            CAPABILITY_SEMANTIC_DIFF,
+            CAPABILITY_PAYLOAD_ZSTD,
+            CAPABILITY_HISTORY_PAGING,
+            CAPABILITY_STREAM_CHANNELS,
+        ] {
+            assert!(selected.has(name, 1), "reliable policy removed {name}");
+        }
+        assert_eq!(
+            server_protocol_support(true, true),
+            ProtocolSupport::runtime()
+        );
+    }
 
     #[test]
     fn gateway_and_worker_reject_missing_unnegotiated_and_mismatched_preambles() {

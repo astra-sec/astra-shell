@@ -1470,6 +1470,7 @@ mod tests {
         let listen = reservation.local_addr()?;
         drop(reservation);
         let server = tokio::spawn(serve(ServerOptions {
+            terminal_datagrams: true,
             listen,
             paths: paths.clone(),
             mode: ServerMode::Rootless {
@@ -1661,6 +1662,7 @@ mod tests {
         let listen = reservation.local_addr()?;
         drop(reservation);
         let _server = Stop(tokio::spawn(serve(ServerOptions {
+            terminal_datagrams: true,
             listen,
             paths: paths.clone(),
             mode: ServerMode::Rootless {
@@ -1913,6 +1915,7 @@ mod tests {
         let listen = reservation.local_addr()?;
         drop(reservation);
         let _server = Stop(tokio::spawn(serve(ServerOptions {
+            terminal_datagrams: true,
             listen,
             paths: paths.clone(),
             mode: ServerMode::Rootless {
@@ -2075,6 +2078,7 @@ mod tests {
         let listen = reservation.local_addr()?;
         drop(reservation);
         let server = tokio::spawn(serve(ServerOptions {
+            terminal_datagrams: true,
             listen,
             paths: paths.clone(),
             mode: ServerMode::Rootless { session_root },

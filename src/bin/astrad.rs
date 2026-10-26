@@ -6,7 +6,7 @@ use astra_shell::{
     server::{ServerMode, ServerOptions, ServerPaths, initialize_state, serve},
     worker::{DEFAULT_WORKER_IDLE_TIMEOUT_SECONDS, serve_worker},
 };
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -15,6 +15,13 @@ const MIB: u64 = 1024 * 1024;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, Eq)]
+enum TerminalDelivery {
+    #[default]
+    Automatic,
+    Reliable,
 }
 
 #[derive(Debug, Subcommand)]
@@ -28,6 +35,9 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:4433")]
         listen: SocketAddr,
+        /// Terminal transport selection; reliable preserves semantic ACK/diff and compression.
+        #[arg(long, value_enum, default_value_t = TerminalDelivery::Automatic)]
+        terminal_delivery: TerminalDelivery,
         #[arg(long, default_value = "state")]
         state_dir: PathBuf,
         /// Enable system-account routing and one unprivileged worker per UID.
@@ -260,6 +270,7 @@ async fn run() -> Result<()> {
         }
         Command::Serve {
             listen,
+            terminal_delivery,
             state_dir,
             managed,
             authorized_keys_dir,
@@ -281,6 +292,7 @@ async fn run() -> Result<()> {
             };
             serve(ServerOptions {
                 listen,
+                terminal_datagrams: terminal_delivery == TerminalDelivery::Automatic,
                 paths: ServerPaths::new(state_dir),
                 mode,
                 resource_policy,
@@ -313,6 +325,26 @@ async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_delivery_defaults_to_automatic_and_accepts_explicit_reliable() {
+        for (args, expected) in [
+            (vec!["astrad", "serve"], TerminalDelivery::Automatic),
+            (
+                vec!["astrad", "serve", "--terminal-delivery", "reliable"],
+                TerminalDelivery::Reliable,
+            ),
+        ] {
+            let Command::Serve {
+                terminal_delivery, ..
+            } = Cli::try_parse_from(args).unwrap().command
+            else {
+                unreachable!()
+            };
+            assert_eq!(terminal_delivery, expected);
+        }
+        assert!(Cli::try_parse_from(["astrad", "serve", "--terminal-delivery", "bogus"]).is_err());
+    }
 
     #[test]
     fn serve_rejects_zero_or_inverted_resource_policy() {
