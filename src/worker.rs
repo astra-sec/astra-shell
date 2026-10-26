@@ -212,7 +212,14 @@ impl WorkerRouter {
                 client_send.shutdown().await?;
                 Ok(())
             } else {
-                forward_worker_messages(&mut worker_recv, &mut client_send, &connection).await
+                forward_worker_messages(
+                    &mut worker_recv,
+                    &mut client_send,
+                    &connection,
+                    negotiated.has(crate::negotiation::CAPABILITY_SEMANTIC_STATE, 2)
+                        && !negotiated.has(crate::negotiation::CAPABILITY_STATE_ACK, 1),
+                )
+                .await
             }
         };
         tokio::try_join!(client_to_worker, worker_to_client)?;
@@ -523,6 +530,7 @@ async fn forward_worker_messages<R, W>(
     worker_recv: &mut R,
     client_send: &mut W,
     connection: &TransportConnection,
+    independent_full_states: bool,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -530,20 +538,28 @@ where
 {
     let (mut queued, drain) = crate::queued_writer::queued_writer(client_send);
     crate::queued_writer::run_with_drain(
-        async move { forward_worker_messages_inner(worker_recv, &mut queued, connection).await },
+        async move {
+            forward_worker_messages_inner(
+                worker_recv,
+                &mut queued,
+                connection,
+                independent_full_states,
+            )
+            .await
+        },
         drain,
     )
     .await
 }
 
-async fn forward_worker_messages_inner<R, W>(
+async fn forward_worker_messages_inner<R>(
     worker_recv: &mut R,
-    client_send: &mut W,
+    client_send: &mut crate::queued_writer::QueuedWriter,
     connection: &TransportConnection,
+    independent_full_states: bool,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
 {
     while let Some(message) = read_message(worker_recv).await? {
         let datagram = match &message.body {
@@ -576,6 +592,11 @@ where
             connection.send_datagram(encoded.into())?;
         } else {
             write_message(client_send, &message).await?;
+            // Propagate reliable backpressure to the worker socket. The client
+            // input relay is an independent future and continues while this waits.
+            if independent_full_states {
+                client_send.wait_until_drained().await;
+            }
         }
     }
     client_send.shutdown().await?;
@@ -1049,8 +1070,12 @@ mod tests {
             worker_writer.shutdown().await?;
             Ok::<(), anyhow::Error>(())
         };
-        let forwarding =
-            forward_worker_messages(&mut worker_reader, &mut reliable_writer, &server_connection);
+        let forwarding = forward_worker_messages(
+            &mut worker_reader,
+            &mut reliable_writer,
+            &server_connection,
+            false,
+        );
         let (producer_result, forwarding_result) = tokio::join!(producer, forwarding);
         producer_result?;
         forwarding_result?;
@@ -1072,6 +1097,71 @@ mod tests {
                 .is_err(),
             "oversized worker viewport unexpectedly reached QUIC"
         );
+
+        // Exercise the managed no-ACK branch with more than the entire output
+        // quota over time, a blocked/slow sink, and concurrent reverse input.
+        let (mut source, mut worker_output) = tokio::io::duplex(1024);
+        let (mut destination, mut client_output) = tokio::io::duplex(1024);
+        let (mut client_input, mut input_reader) = tokio::io::duplex(16);
+        let (mut input_writer, mut worker_input) = tokio::io::duplex(16);
+        let (input_seen, wait_input) = tokio::sync::oneshot::channel();
+        let produce = async {
+            for index in 0..96 {
+                let frame = WireMessage::new(wire_message::Body::AuthResult(AuthResult {
+                    ok: true,
+                    message: format!("{index:03}{}", "x".repeat(256 * 1024)),
+                    ..Default::default()
+                }));
+                write_message(&mut source, &frame).await?;
+            }
+            source.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        let consume = async {
+            wait_input.await?; // The sink stays blocked until reverse input succeeds.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for index in 0..96 {
+                let frame = read_message(&mut destination)
+                    .await?
+                    .context("truncated frame")?;
+                let Some(wire_message::Body::AuthResult(frame)) = frame.body else {
+                    bail!("wrong frame")
+                };
+                assert_eq!(
+                    frame.message,
+                    format!("{index:03}{}", "x".repeat(256 * 1024))
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(read_message(&mut destination).await?.is_none());
+            Ok::<(), anyhow::Error>(())
+        };
+        let inputs = async {
+            use tokio::io::AsyncReadExt;
+            client_input.write_all(b"input").await?;
+            client_input.shutdown().await?;
+            let mut bytes = [0; 5];
+            worker_input.read_exact(&mut bytes).await?;
+            assert_eq!(&bytes, b"input");
+            input_seen.send(()).unwrap();
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::try_join!(
+                produce,
+                consume,
+                inputs,
+                relay_worker_input(&mut input_reader, &mut input_writer),
+                forward_worker_messages(
+                    &mut worker_output,
+                    &mut client_output,
+                    &server_connection,
+                    true
+                )
+            )
+        })
+        .await
+        .context("managed no-ACK backpressure timed out")??;
 
         client_connection.close(0_u32.into(), b"test complete");
         server_connection.close(0, b"test complete");

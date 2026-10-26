@@ -13,7 +13,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
-    sync::mpsc,
+    sync::{Notify, mpsc},
 };
 
 // One maximum state, one final state at exit, and bounded control/history data.
@@ -35,6 +35,21 @@ pub(crate) async fn run_with_drain(
 pub(crate) struct QueuedWriter {
     sender: Option<mpsc::Sender<Vec<u8>>>,
     queued: Arc<AtomicUsize>,
+    drained: Arc<Notify>,
+}
+
+impl QueuedWriter {
+    /// Wait outside the input handler branches; this is transport backpressure,
+    /// not a terminal ACK or another state buffer.
+    pub(crate) async fn wait_until_drained(&self) {
+        loop {
+            let notified = self.drained.notified();
+            if self.queued.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 pub(crate) fn queued_writer<W: AsyncWrite + Unpin>(
@@ -42,14 +57,18 @@ pub(crate) fn queued_writer<W: AsyncWrite + Unpin>(
 ) -> (QueuedWriter, impl Future<Output = anyhow::Result<()>> + '_) {
     let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(1024);
     let queued = Arc::new(AtomicUsize::new(0));
+    let drained = Arc::new(Notify::new());
     let producer = QueuedWriter {
         sender: Some(sender),
         queued: queued.clone(),
+        drained: drained.clone(),
     };
     let drain = async move {
         while let Some(bytes) = receiver.recv().await {
             writer.write_all(&bytes).await?;
-            queued.fetch_sub(bytes.len(), Ordering::AcqRel);
+            if queued.fetch_sub(bytes.len(), Ordering::AcqRel) == bytes.len() {
+                drained.notify_one();
+            }
         }
         writer.shutdown().await?;
         Ok(())
@@ -62,14 +81,18 @@ pub(crate) fn owned_writer<W: AsyncWrite + Unpin + Send + 'static>(
 ) -> (QueuedWriter, tokio::task::JoinHandle<anyhow::Result<()>>) {
     let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(1024);
     let queued = Arc::new(AtomicUsize::new(0));
+    let drained = Arc::new(Notify::new());
     let producer = QueuedWriter {
         sender: Some(sender),
         queued: queued.clone(),
+        drained: drained.clone(),
     };
     let task = tokio::spawn(async move {
         while let Some(bytes) = receiver.recv().await {
             writer.write_all(&bytes).await?;
-            queued.fetch_sub(bytes.len(), Ordering::AcqRel);
+            if queued.fetch_sub(bytes.len(), Ordering::AcqRel) == bytes.len() {
+                drained.notify_one();
+            }
         }
         writer.shutdown().await?;
         Ok(())
@@ -137,6 +160,38 @@ impl AsyncWrite for QueuedWriter {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn drain_gate_is_cancel_safe_and_does_not_claim_peer_acknowledgment() {
+        let (mut sink, mut peer) = tokio::io::duplex(1);
+        let (mut producer, drain) = queued_writer(&mut sink);
+        producer.write_all(b"frame").await.unwrap();
+        // Cancelling this scheduling wait leaves the input handler free to run.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                producer.wait_until_drained()
+            )
+            .await
+            .is_err()
+        );
+        let handler = async {
+            producer.wait_until_drained().await;
+            assert_eq!(producer.queued.load(Ordering::Acquire), 0);
+            producer.shutdown().await.unwrap();
+        };
+        let receive = async {
+            let mut bytes = Vec::new();
+            peer.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, b"frame");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let (result, (), ()) = tokio::join!(drain, handler, receive);
+            result.unwrap();
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn exact_byte_budget_rejects_excess_and_releases_after_drain() {

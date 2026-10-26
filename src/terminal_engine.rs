@@ -187,6 +187,17 @@ impl TerminalEngine {
         self.export_state(false)
     }
 
+    /// Skip redundant output notifications before traversing history. The caller
+    /// holds the engine lock through this revision check and export.
+    pub fn semantic_state_after(&mut self, previous: &(Vec<u8>, u64)) -> Result<Option<State>> {
+        self.refresh_identity_epoch();
+        let revision = generation(&self.terminal.astra_view(), self.epoch_sequence_start)?;
+        if self.epoch.as_slice() == previous.0.as_slice() && revision == previous.1 {
+            return Ok(None);
+        }
+        self.semantic_state().map(Some)
+    }
+
     /// Live updates never traverse or construct scrollback. History is exported
     /// only by the legacy snapshot or explicit history-page paths.
     pub fn semantic_viewport(&mut self) -> Result<State> {
@@ -1097,6 +1108,30 @@ mod tests {
     use crate::resources::ResourcePolicy;
 
     use super::*;
+
+    #[test]
+    fn independent_snapshot_skips_duplicate_revision_but_keeps_epoch_and_resize() {
+        let mut engine = TerminalEngine::new(8, 40, 128, Box::new(std::io::sink())).unwrap();
+        engine.advance(b"history\r\ntext");
+        let first = engine.semantic_state().unwrap();
+        let revision = (first.epoch.clone(), first.generation);
+        for _ in 0..100 {
+            assert!(engine.semantic_state_after(&revision).unwrap().is_none());
+        }
+        engine.advance(b"tail");
+        let next = engine.semantic_state_after(&revision).unwrap().unwrap();
+        assert!(next.generation > first.generation);
+        let revision = (next.epoch, next.generation);
+        engine.resize(9, 41, 0, 0).unwrap();
+        assert!(engine.semantic_state_after(&revision).unwrap().is_some());
+        let current = engine.semantic_state().unwrap();
+        assert!(
+            engine
+                .semantic_state_after(&(vec![0; 16], current.generation))
+                .unwrap()
+                .is_some()
+        );
+    }
 
     #[test]
     fn streaming_renderer_preserves_grid_and_cursor_across_tui_modes() {

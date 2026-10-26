@@ -1409,17 +1409,16 @@ where
     .await
 }
 
-async fn handle_attach_inner<W, R>(
+async fn handle_attach_inner<R>(
     manager: SessionManager,
     terminal: Arc<Terminal>,
     request_id: String,
     request: crate::protocol::AttachRequest,
-    mut send: W,
+    mut send: crate::queued_writer::QueuedWriter,
     mut recv: R,
     context: WorkerMessageContext,
 ) -> Result<()>
 where
-    W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
     let WorkerMessageContext {
@@ -1500,6 +1499,8 @@ where
     let mut state_sync = StateSyncWindow::default();
     let mut streaming_sync = None;
     let mut streaming_dirty = false;
+    let mut independent_dirty = false;
+    let mut independent_revision = (Vec::new(), 0);
     let (snapshot, initial_state, mut events) = if semantic {
         let (state, events) = if datagram_state {
             terminal.semantic_viewport_and_subscribe()?
@@ -1531,6 +1532,7 @@ where
     )
     .await?;
     if let Some(state) = initial_state {
+        independent_revision = (state.epoch.clone(), state.generation);
         write_terminal_state(&mut send, &info.id, &attachment_info.id, &state, zstd).await?;
         if datagram_state {
             streaming_sync = Some(StreamingStateWindow::with_route(
@@ -1575,11 +1577,12 @@ where
             let should_send_state = if datagram_state {
                 streaming_dirty
             } else {
-                state_ack && state_sync.needs_update()
+                if state_ack { state_sync.needs_update() } else { semantic && independent_dirty }
             };
             let wait_for_state_update = async {
                 if should_send_state {
                     tokio::time::sleep_until(state_deadline).await;
+                    if !state_ack { send.wait_until_drained().await; }
                 } else {
                     std::future::pending::<()>().await;
                 }
@@ -1639,14 +1642,7 @@ where
                                         } else if state_ack {
                                             state_sync.mark_dirty();
                                         } else {
-                                            let state = terminal.semantic_state()?;
-                                            write_terminal_state(
-                                                &mut send,
-                                                &info.id,
-                                                &attachment_info.id,
-                                                &state,
-                                                zstd,
-                                            ).await?;
+                                            independent_dirty = true;
                                         }
                                     }
                                 }
@@ -1801,6 +1797,13 @@ where
                                 last_streaming_rekey = last_state_sent;
                             }
                         }
+                    } else if !state_ack {
+                        independent_dirty = false;
+                        if let Some(latest) = terminal.semantic_state_after(&independent_revision)? {
+                            write_terminal_state(&mut send, &info.id, &attachment_info.id, &latest, zstd).await?;
+                            independent_revision = (latest.epoch, latest.generation);
+                            last_state_sent = tokio::time::Instant::now();
+                        }
                     } else {
                         let latest = terminal.semantic_state()?;
                         if let Some(update) = state_sync.prepare_update(latest, semantic_diff)? {
@@ -1862,14 +1865,7 @@ where
                                 } else if state_ack {
                                     state_sync.mark_dirty();
                                 } else {
-                                    let state = terminal.semantic_state()?;
-                                    write_terminal_state(
-                                        &mut send,
-                                        &info.id,
-                                        &attachment_info.id,
-                                        &state,
-                                        zstd,
-                                    ).await?;
+                                    independent_dirty = true;
                                 }
                             } else {
                                 write_terminal_event(
@@ -1957,15 +1953,9 @@ where
                                 attachment.set_state(crate::protocol::AttachmentState::Snapshotting)?;
                             }
                             if semantic && !state_ack {
-                                let (state, replacement) = terminal.semantic_state_and_subscribe()?;
-                                events = replacement;
-                                write_terminal_state(
-                                    &mut send,
-                                    &info.id,
-                                    &attachment_info.id,
-                                    &state,
-                                    zstd,
-                                ).await?;
+                                // Keep the receiver: retained control and exit events must
+                                // not be discarded when output notifications lag.
+                                independent_dirty = true;
                             } else if !semantic {
                                 let (snapshot, replacement) = terminal.snapshot_and_subscribe()?;
                                 events = replacement;

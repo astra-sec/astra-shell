@@ -168,6 +168,13 @@ impl Terminal {
             .semantic_state()
     }
 
+    pub fn semantic_state_after(&self, previous: &(Vec<u8>, u64)) -> Result<Option<State>> {
+        self.engine
+            .lock()
+            .expect("terminal engine poisoned")
+            .semantic_state_after(previous)
+    }
+
     pub fn semantic_viewport_and_subscribe(
         &self,
     ) -> Result<(State, broadcast::Receiver<PtyEvent>)> {
