@@ -1157,7 +1157,7 @@ async fn handle_attach<W, R>(
     takeover: bool,
     resume_token: String,
     mut send: W,
-    mut recv: R,
+    recv: R,
     negotiated: NegotiatedProtocol,
     connection_id: String,
 ) -> Result<()>
@@ -1435,6 +1435,9 @@ where
                         }
                         Ok(PtyEvent::Exited(code)) => {
                             if semantic {
+                                // The PTY has exited; drain prior history/control/state
+                                // before reserving its final frame, without raising limits.
+                                if let Some(gate) = &output_gate { gate.wait_until_drained().await; }
                                 let state = terminal.semantic_state()?;
                                 write_terminal_state(&mut send, &info.id, &attachment_info.id, &state).await?;
                             }
