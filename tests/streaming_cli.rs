@@ -95,6 +95,7 @@ async fn streaming_cli_is_interactive_and_propagates_window_size() -> Result<()>
     drop(reservation);
     let server = tokio::spawn(serve(ServerOptions {
         terminal_datagrams: true,
+        udp_segmentation_offload: true,
         listen,
         paths: paths.clone(),
         mode: ServerMode::Rootless { session_root: home },

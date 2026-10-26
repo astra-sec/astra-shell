@@ -1471,6 +1471,7 @@ mod tests {
         drop(reservation);
         let server = tokio::spawn(serve(ServerOptions {
             terminal_datagrams: true,
+            udp_segmentation_offload: true,
             listen,
             paths: paths.clone(),
             mode: ServerMode::Rootless {
@@ -1663,6 +1664,7 @@ mod tests {
         drop(reservation);
         let _server = Stop(tokio::spawn(serve(ServerOptions {
             terminal_datagrams: true,
+            udp_segmentation_offload: true,
             listen,
             paths: paths.clone(),
             mode: ServerMode::Rootless {
@@ -1916,6 +1918,7 @@ mod tests {
         drop(reservation);
         let _server = Stop(tokio::spawn(serve(ServerOptions {
             terminal_datagrams: true,
+            udp_segmentation_offload: true,
             listen,
             paths: paths.clone(),
             mode: ServerMode::Rootless {
@@ -2079,6 +2082,7 @@ mod tests {
         drop(reservation);
         let server = tokio::spawn(serve(ServerOptions {
             terminal_datagrams: true,
+            udp_segmentation_offload: true,
             listen,
             paths: paths.clone(),
             mode: ServerMode::Rootless { session_root },

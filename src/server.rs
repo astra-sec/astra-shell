@@ -94,6 +94,8 @@ pub struct ServerOptions {
     pub resource_policy: ResourcePolicy,
     /// Advertise terminal DATAGRAM delivery. False keeps reliable ACK/diff/zstd.
     pub terminal_datagrams: bool,
+    /// Disable only for network paths whose UDP offload handling is incompatible.
+    pub udp_segmentation_offload: bool,
 }
 
 #[derive(Clone)]
@@ -308,6 +310,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     let transport = Arc::get_mut(&mut server_config.transport)
         .context("server transport configuration is unexpectedly shared")?;
+    transport.enable_segmentation_offload(options.udp_segmentation_offload);
     transport.max_concurrent_bidi_streams(128_u32.into());
     transport.max_concurrent_uni_streams(0_u8.into());
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));

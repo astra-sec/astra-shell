@@ -38,6 +38,9 @@ enum Command {
         /// Terminal transport selection; reliable preserves semantic ACK/diff and compression.
         #[arg(long, value_enum, default_value_t = TerminalDelivery::Automatic)]
         terminal_delivery: TerminalDelivery,
+        /// Disable UDP segmentation offload for incompatible network paths.
+        #[arg(long)]
+        disable_udp_segmentation_offload: bool,
         #[arg(long, default_value = "state")]
         state_dir: PathBuf,
         /// Enable system-account routing and one unprivileged worker per UID.
@@ -271,6 +274,7 @@ async fn run() -> Result<()> {
         Command::Serve {
             listen,
             terminal_delivery,
+            disable_udp_segmentation_offload,
             state_dir,
             managed,
             authorized_keys_dir,
@@ -293,6 +297,7 @@ async fn run() -> Result<()> {
             serve(ServerOptions {
                 listen,
                 terminal_datagrams: terminal_delivery == TerminalDelivery::Automatic,
+                udp_segmentation_offload: !disable_udp_segmentation_offload,
                 paths: ServerPaths::new(state_dir),
                 mode,
                 resource_policy,
@@ -344,6 +349,26 @@ mod tests {
             assert_eq!(terminal_delivery, expected);
         }
         assert!(Cli::try_parse_from(["astrad", "serve", "--terminal-delivery", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn udp_segmentation_offload_requires_explicit_disable() {
+        for (args, expected) in [
+            (vec!["astrad", "serve"], false),
+            (
+                vec!["astrad", "serve", "--disable-udp-segmentation-offload"],
+                true,
+            ),
+        ] {
+            let Command::Serve {
+                disable_udp_segmentation_offload,
+                ..
+            } = Cli::try_parse_from(args).unwrap().command
+            else {
+                unreachable!()
+            };
+            assert_eq!(disable_udp_segmentation_offload, expected);
+        }
     }
 
     #[test]
