@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, io::Write, sync::Arc};
 
 use anyhow::{Context, Result, bail, ensure};
-use astra_wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
+use astra_wezterm_term::color::{ColorAttribute, ColorPalette, RgbColor, SrgbaTuple};
 use astra_wezterm_term::{
     AstraCellView, AstraCursorShape, AstraCursorView, AstraKeyboardEncoding, AstraModesView,
     AstraMouseEncoding, AstraMouseTracking, AstraRowView, AstraScreenKind, AstraScreenView,
@@ -33,12 +33,42 @@ impl TerminalConfiguration for AstraTerminalConfiguration {
     }
 
     fn color_palette(&self) -> ColorPalette {
-        ColorPalette::default()
+        astra_color_palette()
     }
 
     fn enable_kitty_keyboard(&self) -> bool {
         true
     }
+}
+
+/// Astra's canonical server-side palette for VT parsing, OSC queries and semantic state. Clients
+/// may independently map its default and base ANSI colors to a local display theme.
+fn astra_color_palette() -> ColorPalette {
+    let mut palette = ColorPalette::default();
+    let ansi = [
+        0x000000, 0xc23621, 0x25bc24, 0xadad27, 0x492ee1, 0xd338d3, 0x33bbc8, 0xcbcccd, 0x818383,
+        0xfc391f, 0x31e722, 0xeaec23, 0x5833ff, 0xf935f8, 0x14f0f0, 0xe9ebeb,
+    ];
+    for (slot, rgb) in palette.colors.0[..16].iter_mut().zip(ansi) {
+        *slot = rgb_color(rgb);
+    }
+    palette.foreground = rgb_color(0xd4e0f2);
+    palette.background = rgb_color(0x090e17);
+    palette.cursor_fg = rgb_color(0x090e17);
+    palette.cursor_bg = rgb_color(0x35d3a1);
+    palette.cursor_border = rgb_color(0x35d3a1);
+    palette.selection_fg = rgb_color(0xd4e0f2);
+    palette.selection_bg = rgb_color(0x24445a);
+    palette
+}
+
+fn rgb_color(rgb: u32) -> SrgbaTuple {
+    RgbColor::new_8bpc(
+        ((rgb >> 16) & 0xff) as u8,
+        ((rgb >> 8) & 0xff) as u8,
+        (rgb & 0xff) as u8,
+    )
+    .into()
 }
 
 /// The one authoritative VT model for an Astra PTY. It owns engine state and
@@ -992,6 +1022,26 @@ mod tests {
     }
 
     #[test]
+    fn semantic_state_starts_with_the_astra_palette() {
+        let mut engine = TerminalEngine::new(3, 12, 32, Box::new(ReplySink::default())).unwrap();
+        let palette = engine.semantic_state().unwrap().palette.unwrap();
+
+        assert_eq!(palette.foreground_rgb, 0xd4e0f2);
+        assert_eq!(palette.background_rgb, 0x090e17);
+        assert_eq!(palette.cursor_fg_rgb, 0x090e17);
+        assert_eq!(palette.cursor_bg_rgb, 0x35d3a1);
+        assert_eq!(palette.selection_fg_rgb, 0xd4e0f2);
+        assert_eq!(palette.selection_bg_rgb, 0x24445a);
+        assert_eq!(
+            &palette.indexed_rgb[..16],
+            &[
+                0x000000, 0xc23621, 0x25bc24, 0xadad27, 0x492ee1, 0xd338d3, 0x33bbc8, 0xcbcccd,
+                0x818383, 0xfc391f, 0x31e722, 0xeaec23, 0x5833ff, 0xf935f8, 0x14f0f0, 0xe9ebeb,
+            ]
+        );
+    }
+
+    #[test]
     fn exports_both_screens_styles_modes_and_hyperlinks_without_ansi() {
         let sink = ReplySink::default();
         let mut engine = TerminalEngine::new(3, 12, 32, Box::new(sink)).unwrap();
@@ -1076,7 +1126,8 @@ mod tests {
 
     #[test]
     fn exported_state_remains_valid_after_realistic_window_growth_and_shrink() {
-        let mut engine = TerminalEngine::new(24, 80, 10_000, Box::new(ReplySink::default())).unwrap();
+        let mut engine =
+            TerminalEngine::new(24, 80, 10_000, Box::new(ReplySink::default())).unwrap();
         engine.advance(
             b"Welcome to Ubuntu 24.04.4 LTS\r\n$ printf 'ASTRA_LEASE_INPUT_OK\\n'\r\nASTRA_LEASE_INPUT_OK\r\n$ stty size\r\n24 80\r\n$ ",
         );
