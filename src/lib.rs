@@ -18,6 +18,7 @@ pub mod terminal;
 pub mod terminal_engine;
 pub mod terminal_state_v2;
 pub mod terminal_streaming;
+pub(crate) mod terminal_datagram_v3;
 pub(crate) mod terminal_sync;
 pub mod transport;
 pub mod worker;

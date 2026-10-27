@@ -48,7 +48,10 @@ use crate::{
     },
     terminal_streaming::{StreamingStateWindow, StreamingUpdate},
     terminal_sync::{AckDisposition, PreparedStateUpdate, StateSyncWindow},
-    transport::{FramedRecvStream, FramedSendStream, QuinnTransport, TransportConnection},
+    transport::{
+        DatagramDisposition, FramedRecvStream, FramedSendStream, QuinnTransport,
+        TransportConnection,
+    },
     worker::{WorkerProxyStream, WorkerRouter},
 };
 
@@ -539,8 +542,21 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
     }
 }
 
-fn server_protocol_support(tcp_forwarding: bool, terminal_datagrams: bool) -> ProtocolSupport {
+fn server_protocol_support(
+    tcp_forwarding: bool,
+    terminal_datagrams: bool,
+    rootless: bool,
+) -> ProtocolSupport {
     let mut support = ProtocolSupport::runtime();
+    // Existing workers and the Rust receiver remain v2. Only the direct
+    // rootless data plane implements v3; do not advertise it across a bridge.
+    if rootless {
+        for capability in &mut support.capabilities {
+            if capability.name == CAPABILITY_DATAGRAM_STATE {
+                capability.maximum_version = 3;
+            }
+        }
+    }
     support.capabilities.retain(|capability| {
         (tcp_forwarding || capability.name != crate::negotiation::CAPABILITY_TCP_FORWARD)
             && (terminal_datagrams || capability.name != CAPABILITY_DATAGRAM_STATE)
@@ -574,6 +590,7 @@ async fn authenticate_connection(
     let support = server_protocol_support(
         state.tcp_forwarding_enabled,
         state.terminal_datagrams_enabled && connection.max_datagram_size().is_some(),
+        matches!(&state.mode, ModeState::Rootless { .. }),
     );
     let negotiated = negotiate_client_hello(&hello, &support)?;
     let username = hello.username;
@@ -1544,10 +1561,15 @@ where
         independent_revision = (state.epoch.clone(), state.generation);
         write_terminal_state(&mut send, &info.id, &attachment_info.id, &state, zstd).await?;
         if datagram_state {
-            streaming_sync = Some(StreamingStateWindow::with_route(
+            streaming_sync = Some(StreamingStateWindow::with_route_version(
                 state,
                 info.id.clone(),
                 attachment_info.id.clone(),
+                negotiated
+                    .capabilities
+                    .get(CAPABILITY_DATAGRAM_STATE)
+                    .copied()
+                    .unwrap_or(0),
             )?);
         } else if state_ack {
             state_sync.begin_initial(state)?;
@@ -1831,7 +1853,7 @@ where
                     if let Some(update) = streaming_sync
                         .as_mut()
                         .context("terminal streaming state is missing")?
-                        .retry_latest(datagram_payload_budget)?
+                        .retry_latest(datagram_transport.as_ref().and_then(TerminalDatagramTransport::maximum_datagram_size).unwrap_or(0))?
                     {
                         write_streaming_update(
                             &mut send,
@@ -2261,6 +2283,30 @@ where
         StreamingUpdate::ReliableKeyframe(state) => {
             write_terminal_state(send, terminal_id, attachment_id, state, zstd).await
         }
+        StreamingUpdate::FragmentedDelta(transfer) => {
+            let TerminalDatagramTransport::Direct(connection) = transport else {
+                bail!("fragmented viewport delivery is unavailable to workers");
+            };
+            ensure!(
+                transfer.route() == (terminal_id, attachment_id),
+                "fragmented viewport route is inconsistent"
+            );
+            for index in 0..transfer.count() {
+                let packet = transfer.packet(index).encode_to_vec();
+                // A current path limit is checked for every fragment. A lost
+                // burst is still repaired by the existing latest/rekey timers.
+                if connection
+                    .max_datagram_size()
+                    .is_none_or(|maximum| packet.len() > maximum)
+                {
+                    break;
+                }
+                if connection.send_datagram(packet.into())? == DatagramDisposition::Dropped {
+                    break;
+                }
+            }
+            Ok(())
+        }
         StreamingUpdate::DatagramDelta(datagram) => match transport {
             TerminalDatagramTransport::Direct(connection) => {
                 ensure!(
@@ -2340,9 +2386,186 @@ mod tests {
     use crate::terminal_engine::TerminalEngine;
 
     #[test]
+    fn v3_negotiation_is_rootless_only_and_v2_remains_compatible() {
+        let mut newest = ProtocolSupport::runtime();
+        newest
+            .capabilities
+            .iter_mut()
+            .find(|cap| cap.name == CAPABILITY_DATAGRAM_STATE)
+            .unwrap()
+            .maximum_version = 3;
+        let hello = crate::negotiation::client_hello("test", &newest);
+        let selected =
+            negotiate_client_hello(&hello, &server_protocol_support(true, true, true)).unwrap();
+        assert_eq!(
+            selected.capabilities.get(CAPABILITY_DATAGRAM_STATE),
+            Some(&3)
+        );
+        let managed =
+            negotiate_client_hello(&hello, &server_protocol_support(true, true, false)).unwrap();
+        assert_eq!(
+            managed.capabilities.get(CAPABILITY_DATAGRAM_STATE),
+            Some(&2)
+        );
+        let old_server = negotiate_client_hello(&hello, &ProtocolSupport::runtime()).unwrap();
+        assert_eq!(
+            old_server.capabilities.get(CAPABILITY_DATAGRAM_STATE),
+            Some(&2)
+        );
+        let old_hello =
+            crate::negotiation::client_hello("test", &ProtocolSupport::rust_semantic_client());
+        let old_client =
+            negotiate_client_hello(&old_hello, &server_protocol_support(true, true, true)).unwrap();
+        assert_eq!(
+            old_client.capabilities.get(CAPABILITY_DATAGRAM_STATE),
+            Some(&2)
+        );
+        assert!(
+            validate_worker_selection(
+                selected.version,
+                &selections(&selected),
+                &ProtocolSupport::runtime()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_worker_selection(
+                managed.version,
+                &selections(&managed),
+                &ProtocolSupport::runtime()
+            )
+            .is_ok()
+        );
+        let reliable =
+            negotiate_client_hello(&hello, &server_protocol_support(true, false, true)).unwrap();
+        assert!(!reliable.has(CAPABILITY_DATAGRAM_STATE, 1));
+        // v3 authorizes its own codec even without the independent reliable
+        // State/file payload.zstd capability.
+        let mut no_payload_codec = hello.clone();
+        no_payload_codec
+            .capabilities
+            .retain(|cap| cap.name != CAPABILITY_PAYLOAD_ZSTD);
+        let standalone_codec = negotiate_client_hello(
+            &no_payload_codec,
+            &server_protocol_support(true, true, true),
+        )
+        .unwrap();
+        assert_eq!(
+            standalone_codec.capabilities.get(CAPABILITY_DATAGRAM_STATE),
+            Some(&3)
+        );
+        assert!(!standalone_codec.has(CAPABILITY_PAYLOAD_ZSTD, 1));
+        let mut no_ack = hello;
+        no_ack
+            .capabilities
+            .retain(|cap| cap.name != CAPABILITY_STATE_ACK);
+        let missing_dependency =
+            negotiate_client_hello(&no_ack, &server_protocol_support(true, true, true)).unwrap();
+        assert!(!missing_dependency.has(CAPABILITY_DATAGRAM_STATE, 1));
+    }
+
+    struct ShrinkingDatagramTransport {
+        budget: std::sync::atomic::AtomicUsize,
+        packets: std::sync::Mutex<Vec<Vec<u8>>>,
+        drop_first: bool,
+    }
+
+    impl crate::transport::FramedTransport for ShrinkingDatagramTransport {
+        fn open_bi(
+            &self,
+        ) -> crate::transport::TransportFuture<'_, crate::transport::BidirectionalStream> {
+            Box::pin(async { bail!("unused test stream") })
+        }
+        fn accept_bi(
+            &self,
+        ) -> crate::transport::TransportFuture<'_, Option<crate::transport::BidirectionalStream>>
+        {
+            Box::pin(async { bail!("unused test stream") })
+        }
+        fn read_datagram(&self) -> crate::transport::TransportFuture<'_, prost::bytes::Bytes> {
+            Box::pin(async { bail!("unused test read") })
+        }
+        fn send_datagram(&self, payload: prost::bytes::Bytes) -> Result<DatagramDisposition> {
+            assert!(payload.len() <= self.budget.load(std::sync::atomic::Ordering::SeqCst));
+            self.packets.lock().unwrap().push(payload.to_vec());
+            if self.drop_first {
+                Ok(DatagramDisposition::Dropped)
+            } else {
+                self.budget.store(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(DatagramDisposition::Queued)
+            }
+        }
+        fn max_datagram_size(&self) -> Option<usize> {
+            Some(self.budget.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        fn close(&self, _: u32, _: &[u8]) {}
+        fn is_closed(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn fragmented_sender_rechecks_pmtu_and_stops_dropped_bursts() {
+        let delta = crate::protocol::TerminalViewportDatagram {
+            terminal_id: "11111111-1111-4111-8111-111111111111".into(),
+            attachment_id: "22222222-2222-4222-8222-222222222222".into(),
+            diff: Some(TerminalStateDiff {
+                epoch: vec![7; 16],
+                base_generation: 1,
+                target_generation: 2,
+                target_metadata: Some(State {
+                    title: "a".repeat(500),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let transfer =
+            crate::terminal_datagram_v3::ViewportTransfer::prepare(delta.clone(), 256, usize::MAX)
+                .unwrap()
+                .unwrap();
+        assert!(transfer.count() > 1);
+        let update = StreamingUpdate::FragmentedDelta(transfer);
+        for drop_first in [false, true] {
+            let observed = Arc::new(ShrinkingDatagramTransport {
+                budget: std::sync::atomic::AtomicUsize::new(256),
+                packets: std::sync::Mutex::new(Vec::new()),
+                drop_first,
+            });
+            let connection: TransportConnection = observed.clone();
+            write_streaming_update(
+                &mut tokio::io::sink(),
+                &TerminalDatagramTransport::Direct(connection),
+                &delta.terminal_id,
+                &delta.attachment_id,
+                &update,
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(observed.packets.lock().unwrap().len(), 1);
+        }
+        assert!(
+            write_streaming_update(
+                &mut tokio::io::sink(),
+                &TerminalDatagramTransport::WorkerBridge {
+                    maximum_datagram_size: 1200
+                },
+                &delta.terminal_id,
+                &delta.attachment_id,
+                &update,
+                true
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
     fn reliable_delivery_policy_negotiates_ack_diff_and_compression_with_automatic_client() {
         let client = crate::negotiation::client_hello("xy", &ProtocolSupport::runtime());
-        let support = server_protocol_support(true, false);
+        let support = server_protocol_support(true, false, true);
         let selected = negotiate_client_hello(&client, &support).unwrap();
         assert!(!selected.has(CAPABILITY_DATAGRAM_STATE, 2));
         for name in [
@@ -2355,7 +2578,7 @@ mod tests {
             assert!(selected.has(name, 1), "reliable policy removed {name}");
         }
         assert_eq!(
-            server_protocol_support(true, true),
+            server_protocol_support(true, true, false),
             ProtocolSupport::runtime()
         );
     }

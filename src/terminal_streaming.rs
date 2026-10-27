@@ -19,6 +19,7 @@ use crate::{
         HistoryPageChunk, TerminalStateAck, TerminalStateChunk, TerminalStateDiff,
         TerminalStateRepairRequest, TerminalViewportDatagram, TerminalViewportRowPatch,
     },
+    terminal_datagram_v3::ViewportTransfer,
     terminal_state_v2::{self, HistoryPage, Row, State},
     terminal_sync::{AckDisposition, apply_terminal_state_diff, state_metadata},
 };
@@ -57,6 +58,7 @@ impl TerminalViewportDatagram {
 pub(crate) enum StreamingUpdate {
     ReliableKeyframe(State),
     DatagramDelta(TerminalViewportDatagram),
+    FragmentedDelta(ViewportTransfer),
 }
 
 #[derive(Default)]
@@ -294,6 +296,7 @@ impl StreamingUpdate {
             Self::DatagramDelta(delta) => delta
                 .target_generation()
                 .expect("constructed viewport delta has a semantic diff"),
+            Self::FragmentedDelta(transfer) => transfer.target_generation(),
         }
     }
 }
@@ -378,9 +381,25 @@ pub(crate) struct StreamingStateWindow {
     latest_target: Option<State>,
     retained_generations: usize,
     retired_epochs: VecDeque<Vec<u8>>,
+    datagram_version: u32,
 }
 
 impl StreamingStateWindow {
+    pub(crate) fn with_route_version(
+        initial_keyframe: State,
+        terminal_id: String,
+        attachment_id: String,
+        version: u32,
+    ) -> Result<Self> {
+        ensure!(
+            matches!(version, 2 | 3),
+            "unsupported terminal datagram version"
+        );
+        let mut window = Self::with_route(initial_keyframe, terminal_id, attachment_id)?;
+        window.datagram_version = version;
+        Ok(window)
+    }
+
     pub(crate) fn with_route(
         initial_keyframe: State,
         terminal_id: String,
@@ -420,6 +439,7 @@ impl StreamingStateWindow {
             latest_target: None,
             retained_generations,
             retired_epochs: VecDeque::new(),
+            datagram_version: 2,
         })
     }
 
@@ -617,6 +637,18 @@ impl StreamingStateWindow {
         }
         let delta =
             compact_viewport_datagram(&self.terminal_id, &self.attachment_id, &self.base, latest)?;
+        if self.datagram_version == 3 {
+            return Ok(
+                match ViewportTransfer::prepare(
+                    delta,
+                    datagram_payload_budget,
+                    latest.encoded_len(),
+                )? {
+                    Some(transfer) => StreamingUpdate::FragmentedDelta(transfer),
+                    None => StreamingUpdate::ReliableKeyframe(latest.clone()),
+                },
+            );
+        }
         if delta.encoded_len() <= datagram_payload_budget
             && delta.encoded_len() < latest.encoded_len()
         {
@@ -725,6 +757,9 @@ impl StreamingReplica {
         match update {
             StreamingUpdate::ReliableKeyframe(state) => self.apply_keyframe(state.clone()),
             StreamingUpdate::DatagramDelta(delta) => self.apply_datagram(delta),
+            StreamingUpdate::FragmentedDelta(transfer) => {
+                self.apply_datagram(&transfer.decode_for_test()?)
+            }
         }
     }
 
@@ -784,6 +819,10 @@ impl StreamingReplica {
     }
 
     pub fn apply_datagram(&mut self, delta: &TerminalViewportDatagram) -> Result<ApplyDisposition> {
+        ensure!(
+            delta.fragment.is_none(),
+            "v3 fragment must be reassembled before replica application"
+        );
         ensure!(
             delta.terminal_id == self.terminal_id && delta.attachment_id == self.attachment_id,
             "terminal viewport datagram targets the wrong attachment"
@@ -915,6 +954,7 @@ fn compact_viewport_datagram(
         sparse_rows: true,
         primary_patches,
         alternate_patches,
+        fragment: None,
     })
 }
 
@@ -1178,6 +1218,187 @@ mod tests {
                 uncompressed_size: 0,
             })
             .collect()
+    }
+
+    fn rich_fixture(alternate: bool) -> TerminalEngine {
+        let mut engine = TerminalEngine::new(40, 120, 2000, Box::new(std::io::sink())).unwrap();
+        // Seed exactly the primary viewport left by the Review fixture
+        // after its 1024 historical rows. History depth is independent of
+        // this data plane and is exercised by real Review/history tests.
+        let mut history = String::new();
+        for index in 1024..1063 {
+            history.push_str(&format!(
+                "\x1b[38;5;{}mhistory {index:04} {}\x1b[0m\r\n",
+                16 + index % 216,
+                "x".repeat(90)
+            ));
+        }
+        engine.advance(history.as_bytes());
+        if alternate {
+            engine.advance(b"\x1b[?1049h");
+        }
+        engine.advance(b"\x1b[?1002h\x1b[?1006h");
+        paint_rich_fixture(&mut engine, 0);
+        engine
+    }
+
+    fn paint_rich_fixture(engine: &mut TerminalEngine, count: u32) {
+        let mut bytes = String::from("\x1b[?2026h");
+        for row in 0..38 {
+            bytes.push_str(&format!("\x1b[{};1H\x1b[38;5;{}m\x1b]8;;https://example.invalid/fixture/{count}/{row}\x07{count:03} {row:03} UTF8 中文 · styled source diff and scrolling rows {}\x1b]8;;\x07\x1b[0m\x1b[K", row + 1, (count * 3 + row) % 216 + 16, " abcdef".repeat(5)));
+        }
+        let down = count.min(120);
+        let up = count.saturating_sub(120);
+        bytes.push_str(&format!(
+            "\x1b]2;scroll:{count}:{down}:{up}:{}:0\x07\x1b[?2026l",
+            down - up
+        ));
+        engine.advance(bytes.as_bytes());
+    }
+
+    #[test]
+    fn v3_dense_targets_do_not_wait_for_intermediate_ack() {
+        for alternate in [false, true] {
+            for budget in [512, 1200] {
+                let mut engine = rich_fixture(alternate);
+                let initial = engine.semantic_viewport().unwrap();
+                let terminal = "11111111-1111-4111-8111-111111111111".to_owned();
+                let attachment = "22222222-2222-4222-8222-222222222222".to_owned();
+                let mut sender = StreamingStateWindow::with_route_version(
+                    initial.clone(),
+                    terminal.clone(),
+                    attachment.clone(),
+                    3,
+                )
+                .unwrap();
+                let mut receiver = StreamingReplica::for_route(terminal, attachment).unwrap();
+                receiver.apply_keyframe(initial.clone()).unwrap();
+                // Initial reliable commit is still mandatory for v3.
+                paint_rich_fixture(&mut engine, 1);
+                let first = engine.semantic_viewport().unwrap();
+                assert!(
+                    sender
+                        .prepare_update(first.clone(), budget)
+                        .unwrap()
+                        .is_none()
+                );
+                sender
+                    .acknowledge(&TerminalStateAck {
+                        epoch: initial.epoch.clone(),
+                        generation: initial.generation,
+                    })
+                    .unwrap();
+                let first_update = sender.retry_latest(budget).unwrap().unwrap();
+                assert!(matches!(first_update, StreamingUpdate::FragmentedDelta(_)));
+                // All first-target fragments are lost. A new cumulative target
+                // must be generated without any ACK for that target.
+                paint_rich_fixture(&mut engine, 120);
+                let latest = engine.semantic_viewport().unwrap();
+                let update = sender
+                    .prepare_update(latest.clone(), budget)
+                    .unwrap()
+                    .unwrap();
+                let StreamingUpdate::FragmentedDelta(transfer) = &update else {
+                    panic!("dense v3 target became keyframe")
+                };
+                for index in 0..transfer.count() {
+                    assert!(transfer.packet(index).encoded_len() <= budget);
+                }
+                assert!(sender.base_is_acknowledged());
+                assert_eq!(receiver.apply(&update).unwrap(), ApplyDisposition::Applied);
+                assert_eq!(receiver.current(), Some(&latest));
+                sender.acknowledge(&receiver.state_ack().unwrap()).unwrap();
+                paint_rich_fixture(&mut engine, 128);
+                let reverse = engine.semantic_viewport().unwrap();
+                let reverse_update = sender
+                    .prepare_update(reverse.clone(), budget)
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    reverse_update,
+                    StreamingUpdate::FragmentedDelta(_)
+                ));
+                assert_eq!(
+                    receiver.apply(&reverse_update).unwrap(),
+                    ApplyDisposition::Applied
+                );
+                assert_eq!(receiver.current(), Some(&reverse));
+                // A quiet retry keeps the final logical target recoverable;
+                // bounded reliable promotion remains available after loss.
+                assert_eq!(
+                    sender
+                        .retry_latest(budget)
+                        .unwrap()
+                        .unwrap()
+                        .target_generation(),
+                    reverse.generation
+                );
+                assert_eq!(
+                    sender.rekey_latest().unwrap().unwrap().target_generation(),
+                    reverse.generation
+                );
+                assert!(!sender.base_is_acknowledged());
+                assert!(sender.retry_latest(budget).unwrap().is_none());
+                assert!(sender.sent.len() <= DEFAULT_RETAINED_GENERATIONS);
+            }
+        }
+    }
+
+    #[test]
+    fn v3_shared_raw_and_zstd_golden_vectors() {
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+        let mut vectors = Vec::new();
+        for dense in [false, true] {
+            let mut engine = if dense {
+                rich_fixture(true)
+            } else {
+                let mut value = TerminalEngine::new(4, 20, 64, Box::new(std::io::sink())).unwrap();
+                value.advance(b"base");
+                value
+            };
+            let mut initial = engine.semantic_viewport().unwrap();
+            if dense {
+                paint_rich_fixture(&mut engine, 120);
+            } else {
+                engine.advance(b"-next");
+            }
+            let mut target = engine.semantic_viewport().unwrap();
+            initial.epoch = vec![17; 16];
+            target.epoch = initial.epoch.clone();
+            let delta = compact_viewport_datagram(
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+                &initial,
+                &target,
+            )
+            .unwrap();
+            let transfer = ViewportTransfer::prepare(delta.clone(), 512, usize::MAX)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                apply_compact_viewport_delta(&initial, &transfer.decode_for_test().unwrap())
+                    .unwrap(),
+                target
+            );
+            let first = transfer.packet(0).fragment.unwrap();
+            assert_eq!(first.encoding, if dense { 1 } else { 0 });
+            let fragments = (0..transfer.count())
+                .map(|index| format!("\"{}\"", hex(&transfer.packet(index).encode_to_vec())))
+                .collect::<Vec<_>>()
+                .join(",");
+            vectors.push(format!(r#"{{"name":"{}","path_budget":512,"encoding":{},"count":{},"raw_length":{},"total_encoded":{},"sha256_hex":"{}","transfer_id_hex":"{}","initial_state_hex":"{}","target_state_hex":"{}","inner_datagram_hex":"{}","fragments_hex":[{}]}}"#,
+                if dense {"zstd-dense-alternate"} else {"raw-small-primary"},first.encoding,first.count,first.raw_length,first.total_encoded,
+                hex(&first.sha256),hex(&first.transfer_id),hex(&initial.encode_to_vec()),hex(&target.encode_to_vec()),hex(&delta.encode_to_vec()),fragments));
+        }
+        if let Ok(path) = std::env::var("ASTRA_SYNC05_GOLDEN_PATH") {
+            std::fs::write(
+                path,
+                format!("{{\"version\":3,\"vectors\":[{}]}}\n", vectors.join(",")),
+            )
+            .unwrap();
+        }
     }
 
     #[test]

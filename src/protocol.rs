@@ -1068,6 +1068,43 @@ pub struct TerminalViewportDatagram {
     pub primary_patches: Vec<TerminalViewportRowPatch>,
     #[prost(message, repeated, tag = "7")]
     pub alternate_patches: Vec<TerminalViewportRowPatch>,
+    /// Explicitly negotiated v3 envelope; never combined with a v2 diff.
+    #[prost(message, optional, boxed, tag = "8")]
+    pub fragment: Option<Box<TerminalViewportFragment>>,
+}
+
+/// v3 codec selection is independent of payload.zstd v1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum TerminalViewportFragmentEncoding {
+    Raw = 0,
+    Zstd = 1,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TerminalViewportFragment {
+    #[prost(bytes = "vec", tag = "1")]
+    pub epoch: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub base_generation: u64,
+    #[prost(uint64, tag = "3")]
+    pub target_generation: u64,
+    #[prost(bytes = "vec", tag = "4")]
+    pub transfer_id: Vec<u8>,
+    #[prost(uint32, tag = "5")]
+    pub index: u32,
+    #[prost(uint32, tag = "6")]
+    pub count: u32,
+    #[prost(uint32, tag = "7")]
+    pub total_encoded: u32,
+    #[prost(uint32, tag = "8")]
+    pub raw_length: u32,
+    #[prost(enumeration = "TerminalViewportFragmentEncoding", tag = "9")]
+    pub encoding: i32,
+    #[prost(bytes = "vec", tag = "10")]
+    pub sha256: Vec<u8>,
+    #[prost(bytes = "vec", tag = "11")]
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1882,4 +1919,74 @@ pub struct ForwardFrame {
     pub data: Vec<u8>,
     #[prost(bool, tag = "2")]
     pub eof: bool,
+}
+
+#[cfg(test)]
+mod viewport_fragment_schema_tests {
+    use super::*;
+
+    #[derive(Clone, PartialEq, Message)]
+    struct V2Viewport {
+        #[prost(string, tag = "1")]
+        terminal_id: String,
+        #[prost(string, tag = "2")]
+        attachment_id: String,
+        #[prost(message, optional, tag = "3")]
+        diff: Option<TerminalStateDiff>,
+        #[prost(uint32, tag = "4")]
+        inherited_fields: u32,
+        #[prost(bool, tag = "5")]
+        sparse_rows: bool,
+    }
+
+    #[test]
+    fn v3_fragment_field_preserves_v2_wire_and_is_not_a_v2_delta() {
+        let old = V2Viewport {
+            terminal_id: "t".into(),
+            attachment_id: "a".into(),
+            diff: Some(TerminalStateDiff {
+                epoch: vec![7; 16],
+                base_generation: 1,
+                target_generation: 2,
+                ..Default::default()
+            }),
+            inherited_fields: 63,
+            sparse_rows: true,
+        };
+        let current = TerminalViewportDatagram::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert!(current.fragment.is_none());
+        assert_eq!(current.encode_to_vec(), old.encode_to_vec());
+        let mut expected = vec![0x0a, 1, b't', 0x12, 1, b'a', 0x1a, 22, 0x0a, 16];
+        expected.extend([7; 16]);
+        expected.extend([0x10, 1, 0x18, 2, 0x20, 63, 0x28, 1]);
+        assert_eq!(current.encode_to_vec(), expected);
+        let envelope = TerminalViewportDatagram {
+            terminal_id: "t".into(),
+            attachment_id: "a".into(),
+            fragment: Some(Box::new(TerminalViewportFragment {
+                epoch: vec![7; 16],
+                base_generation: 1,
+                target_generation: 2,
+                transfer_id: vec![3; 16],
+                count: 1,
+                total_encoded: 1,
+                raw_length: 1,
+                sha256: vec![4; 32],
+                data: vec![0],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let encoded = envelope.encode_to_vec();
+        assert_eq!(
+            TerminalViewportDatagram::decode(encoded.as_slice()).unwrap(),
+            envelope
+        );
+        let legacy = V2Viewport::decode(encoded.as_slice()).unwrap();
+        assert_eq!(legacy.terminal_id, "t");
+        assert!(
+            legacy.diff.is_none(),
+            "v2 ingress must not see the envelope as a delta"
+        );
+    }
 }

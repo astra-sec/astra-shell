@@ -537,6 +537,29 @@ message TerminalViewportDatagram {
   bool sparse_rows = 5;
   repeated TerminalViewportRowPatch primary_patches = 6;
   repeated TerminalViewportRowPatch alternate_patches = 7;
+  // v3 only: outer packets contain route plus fragment, never a v2 diff.
+  TerminalViewportFragment fragment = 8;
+}
+// Authorized by terminal.datagram_state v3, independently of payload.zstd v1.
+enum TerminalViewportFragmentEncoding {
+  TERMINAL_VIEWPORT_FRAGMENT_ENCODING_RAW = 0;
+  TERMINAL_VIEWPORT_FRAGMENT_ENCODING_ZSTD = 1;
+}
+// One bounded fragment of a complete encoded v2 TerminalViewportDatagram.
+// R + 2*E + 1 <= 65535, count <=128. Intervals are floor(i*E/count)..
+// floor((i+1)*E/count); all metadata must match and SHA256 covers raw bytes.
+message TerminalViewportFragment {
+  bytes epoch = 1;
+  uint64 base_generation = 2;
+  uint64 target_generation = 3;
+  bytes transfer_id = 4;
+  uint32 index = 5;
+  uint32 count = 6;
+  uint32 total_encoded = 7;
+  uint32 raw_length = 8;
+  TerminalViewportFragmentEncoding encoding = 9;
+  bytes sha256 = 10;
+  bytes data = 11;
 }
 message TerminalViewportRowPatch {
   uint32 index = 1;
