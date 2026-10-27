@@ -45,13 +45,13 @@ def cli(user, *args):
 def identity(uid):
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(3); s.connect(str(state / 'users' / str(uid) / 'session.sock'))
-        challenge = uuid.uuid4().bytes; s.sendall(b'ASTRAWK2' + challenge)
+        challenge = uuid.uuid4().bytes; s.sendall(b'ASTRAWK3' + challenge)
         data = b''
         while len(data) < 60:
             part = s.recv(60-len(data)); assert part; data += part
-        assert data[:8] == b'ASTRAWK2' and data[44:] == challenge
+        assert data[:8] == b'ASTRAWK3' and data[44:] == challenge
         version, reported_uid, pid = struct.unpack('!III', data[8:20])
-        assert version == 2 and reported_uid == uid
+        assert version == 3 and reported_uid == uid
         credentials = struct.unpack('3i', s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         assert credentials[0] == pid and credentials[1] == uid
         return (pid, data[20:36].hex())

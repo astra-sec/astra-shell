@@ -545,16 +545,14 @@ async fn handle_connection(state: ServerState, incoming: quinn::Incoming) -> Res
 fn server_protocol_support(
     tcp_forwarding: bool,
     terminal_datagrams: bool,
-    rootless: bool,
+    _rootless: bool,
 ) -> ProtocolSupport {
     let mut support = ProtocolSupport::runtime();
-    // Existing workers and the Rust receiver remain v2. Only the direct
-    // rootless data plane implements v3; do not advertise it across a bridge.
-    if rootless {
-        for capability in &mut support.capabilities {
-            if capability.name == CAPABILITY_DATAGRAM_STATE {
-                capability.maximum_version = 3;
-            }
+    // Internal worker v3 is fail-closed at discovery before the gateway listens.
+    // The Rust CLI receiver continues to offer v2 independently.
+    for capability in &mut support.capabilities {
+        if capability.name == CAPABILITY_DATAGRAM_STATE {
+            capability.maximum_version = 3;
         }
     }
     support.capabilities.retain(|capability| {
@@ -829,7 +827,7 @@ where
             validate_worker_selection(
                 protocol_version,
                 &capabilities,
-                &ProtocolSupport::runtime(),
+                &server_protocol_support(true, true, false),
             )?,
             connection_id,
             maximum_datagram_size,
@@ -2284,25 +2282,41 @@ where
             write_terminal_state(send, terminal_id, attachment_id, state, zstd).await
         }
         StreamingUpdate::FragmentedDelta(transfer) => {
-            let TerminalDatagramTransport::Direct(connection) = transport else {
-                bail!("fragmented viewport delivery is unavailable to workers");
-            };
             ensure!(
                 transfer.route() == (terminal_id, attachment_id),
                 "fragmented viewport route is inconsistent"
             );
             for index in 0..transfer.count() {
-                let packet = transfer.packet(index).encode_to_vec();
-                // A current path limit is checked for every fragment. A lost
-                // burst is still repaired by the existing latest/rekey timers.
-                if connection
-                    .max_datagram_size()
-                    .is_none_or(|maximum| packet.len() > maximum)
-                {
-                    break;
-                }
-                if connection.send_datagram(packet.into())? == DatagramDisposition::Dropped {
-                    break;
+                let datagram = transfer.packet(index);
+                match transport {
+                    TerminalDatagramTransport::Direct(connection) => {
+                        let packet = datagram.encode_to_vec();
+                        if connection
+                            .max_datagram_size()
+                            .is_none_or(|maximum| packet.len() > maximum)
+                        {
+                            break;
+                        }
+                        if connection.send_datagram(packet.into())? == DatagramDisposition::Dropped
+                        {
+                            break;
+                        }
+                    }
+                    TerminalDatagramTransport::WorkerBridge {
+                        maximum_datagram_size,
+                    } => {
+                        if datagram.encoded_len() > *maximum_datagram_size {
+                            break;
+                        }
+                        // One bounded packet at a time; no gateway reassembly or state copy.
+                        write_terminal_event(
+                            send,
+                            terminal_id,
+                            attachment_id,
+                            terminal_event::Event::ViewportDatagram(Box::new(datagram)),
+                        )
+                        .await?;
+                    }
                 }
             }
             Ok(())
@@ -2386,7 +2400,7 @@ mod tests {
     use crate::terminal_engine::TerminalEngine;
 
     #[test]
-    fn v3_negotiation_is_rootless_only_and_v2_remains_compatible() {
+    fn v3_negotiation_supports_managed_and_v2_remains_compatible() {
         let mut newest = ProtocolSupport::runtime();
         newest
             .capabilities
@@ -2405,7 +2419,7 @@ mod tests {
             negotiate_client_hello(&hello, &server_protocol_support(true, true, false)).unwrap();
         assert_eq!(
             managed.capabilities.get(CAPABILITY_DATAGRAM_STATE),
-            Some(&2)
+            Some(&3)
         );
         let old_server = negotiate_client_hello(&hello, &ProtocolSupport::runtime()).unwrap();
         assert_eq!(
@@ -2432,7 +2446,7 @@ mod tests {
             validate_worker_selection(
                 managed.version,
                 &selections(&managed),
-                &ProtocolSupport::runtime()
+                &server_protocol_support(true, true, false)
             )
             .is_ok()
         );
@@ -2546,20 +2560,35 @@ mod tests {
             .unwrap();
             assert_eq!(observed.packets.lock().unwrap().len(), 1);
         }
-        assert!(
-            write_streaming_update(
-                &mut tokio::io::sink(),
-                &TerminalDatagramTransport::WorkerBridge {
-                    maximum_datagram_size: 1200
-                },
-                &delta.terminal_id,
-                &delta.attachment_id,
-                &update,
-                true
-            )
-            .await
-            .is_err()
-        );
+        let mut output = Vec::new();
+        write_streaming_update(
+            &mut output,
+            &TerminalDatagramTransport::WorkerBridge {
+                maximum_datagram_size: 256,
+            },
+            &delta.terminal_id,
+            &delta.attachment_id,
+            &update,
+            true,
+        )
+        .await
+        .unwrap();
+        let StreamingUpdate::FragmentedDelta(transfer) = &update else {
+            unreachable!()
+        };
+        let mut input = output.as_slice();
+        for index in 0..transfer.count() {
+            let message = read_message(&mut input).await.unwrap().unwrap();
+            let Some(wire_message::Body::TerminalEvent(event)) = message.body else {
+                panic!("wrong event")
+            };
+            let Some(terminal_event::Event::ViewportDatagram(packet)) = event.event else {
+                panic!("wrong packet")
+            };
+            assert_eq!(*packet, transfer.packet(index));
+            assert!(packet.encoded_len() <= 256);
+        }
+        assert!(read_message(&mut input).await.unwrap().is_none());
     }
 
     #[test]
@@ -2579,7 +2608,7 @@ mod tests {
         }
         assert_eq!(
             server_protocol_support(true, true, false),
-            ProtocolSupport::runtime()
+            server_protocol_support(true, true, true)
         );
     }
 

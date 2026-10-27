@@ -216,6 +216,11 @@ impl WorkerRouter {
                     &mut worker_recv,
                     &mut client_send,
                     &connection,
+                    negotiated
+                        .capabilities
+                        .get(CAPABILITY_DATAGRAM_STATE)
+                        .copied()
+                        .unwrap_or(0),
                     negotiated.has(crate::negotiation::CAPABILITY_SEMANTIC_STATE, 2)
                         && !negotiated.has(crate::negotiation::CAPABILITY_STATE_ACK, 1),
                 )
@@ -530,6 +535,7 @@ async fn forward_worker_messages<R, W>(
     worker_recv: &mut R,
     client_send: &mut W,
     connection: &TransportConnection,
+    datagram_version: u32,
     independent_full_states: bool,
 ) -> Result<()>
 where
@@ -543,6 +549,7 @@ where
                 worker_recv,
                 &mut queued,
                 connection,
+                datagram_version,
                 independent_full_states,
             )
             .await
@@ -556,6 +563,7 @@ async fn forward_worker_messages_inner<R>(
     worker_recv: &mut R,
     client_send: &mut crate::queued_writer::QueuedWriter,
     connection: &TransportConnection,
+    datagram_version: u32,
     independent_full_states: bool,
 ) -> Result<()>
 where
@@ -569,10 +577,10 @@ where
                         !event.terminal_id.is_empty()
                             && !event.attachment_id.is_empty()
                             && event.terminal_id == datagram.terminal_id
-                            && event.attachment_id == datagram.attachment_id
-                            && datagram.diff.is_some(),
+                            && event.attachment_id == datagram.attachment_id,
                         "worker emitted an inconsistent terminal datagram route"
                     );
+                    validate_worker_datagram(datagram, datagram_version)?;
                     Some(datagram.clone())
                 }
                 _ => None,
@@ -600,6 +608,61 @@ where
         }
     }
     client_send.shutdown().await?;
+    Ok(())
+}
+
+// Validate the opaque worker envelope; terminal state remains solely in the worker.
+fn validate_worker_datagram(
+    packet: &crate::protocol::TerminalViewportDatagram,
+    version: u32,
+) -> Result<()> {
+    ensure!(
+        (1..=3).contains(&version),
+        "worker datagram was not negotiated"
+    );
+    if let Some(fragment) = &packet.fragment {
+        ensure!(
+            version == 3
+                && packet.diff.is_none()
+                && packet.inherited_fields == 0
+                && !packet.sparse_rows
+                && packet.primary_patches.is_empty()
+                && packet.alternate_patches.is_empty(),
+            "invalid or unnegotiated worker fragment"
+        );
+        let total = u64::from(fragment.total_encoded);
+        let raw = u64::from(fragment.raw_length);
+        let count = u64::from(fragment.count);
+        let index = u64::from(fragment.index);
+        ensure!(
+            fragment.epoch.len() == 16
+                && fragment.transfer_id.len() == 16
+                && fragment.sha256.len() == 32
+                && fragment.base_generation > 0
+                && fragment.target_generation > fragment.base_generation
+                && count > 0
+                && count <= 128
+                && index < count
+                && total >= count
+                && raw > 0
+                && raw + 2 * total < u64::from(u16::MAX)
+                && matches!(fragment.encoding, 0 | 1),
+            "invalid worker fragment bounds"
+        );
+        ensure!(
+            fragment.data.len() as u64 == (index + 1) * total / count - index * total / count,
+            "invalid worker fragment interval"
+        );
+        ensure!(
+            fragment.encoding != 0 || raw == total,
+            "invalid raw worker fragment length"
+        );
+    } else {
+        ensure!(
+            version < 3 && packet.diff.is_some(),
+            "worker viewport format differs from negotiated version"
+        );
+    }
     Ok(())
 }
 
@@ -920,6 +983,7 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let state = temporary.path().join("state");
         fs::create_dir(&state)?;
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
         let unsafe_root = temporary.path().join("elsewhere");
         fs::create_dir(&unsafe_root)?;
         symlink(&unsafe_root, state.join("users"))?;
@@ -935,6 +999,8 @@ mod tests {
             .is_err()
         );
         fs::remove_file(state.join("users"))?;
+        fs::create_dir(state.join("users"))?;
+        fs::set_permissions(state.join("users"), fs::Permissions::from_mode(0o700))?;
         let router = WorkerRouter::new(
             &state,
             None,
@@ -1041,6 +1107,35 @@ mod tests {
                 viewport.clone(),
             ))),
         }));
+        let mut dense = viewport.clone();
+        dense.diff.as_mut().unwrap().target_metadata = Some(crate::terminal_state_v2::State {
+            title: (0u64..500)
+                .map(|i| format!("{:016x}", i.wrapping_mul(6364136223846793005)))
+                .collect(),
+            ..Default::default()
+        });
+        let transfer =
+            crate::terminal_datagram_v3::ViewportTransfer::prepare(dense, 256, usize::MAX)?
+                .unwrap();
+        assert!(transfer.count() > 1);
+        let fragments: Vec<_> = (0..transfer.count()).map(|i| transfer.packet(i)).collect();
+        for packet in &fragments {
+            validate_worker_datagram(packet, 3)?;
+            assert!(validate_worker_datagram(packet, 2).is_err());
+        }
+        for malformed in 0..6 {
+            let mut packet = fragments[0].clone();
+            let fragment = packet.fragment.as_mut().unwrap();
+            match malformed {
+                0 => fragment.count = 129,
+                1 => fragment.index = fragment.count,
+                2 => fragment.raw_length = 65535,
+                3 => fragment.data.push(0),
+                4 => fragment.encoding = 42,
+                _ => packet.diff = viewport.diff.clone(),
+            }
+            assert!(validate_worker_datagram(&packet, 3).is_err());
+        }
         let mut oversized_viewport = viewport.clone();
         oversized_viewport
             .diff
@@ -1074,6 +1169,7 @@ mod tests {
             &mut worker_reader,
             &mut reliable_writer,
             &server_connection,
+            2,
             false,
         );
         let (producer_result, forwarding_result) = tokio::join!(producer, forwarding);
@@ -1091,6 +1187,42 @@ mod tests {
                 .await
                 .context("worker viewport was not forwarded as a QUIC datagram")??;
         assert_eq!(TerminalViewportDatagram::decode(datagram)?, viewport);
+        assert!(validate_worker_datagram(&viewport, 3).is_err());
+        let (mut worker_writer, mut worker_reader) = tokio::io::duplex(16 * 1024);
+        let (mut reliable_reader, mut reliable_writer) = tokio::io::duplex(16 * 1024);
+        let producer = async {
+            for packet in &fragments {
+                let event = WireMessage::new(wire_message::Body::TerminalEvent(TerminalEvent {
+                    terminal_id: packet.terminal_id.clone(),
+                    attachment_id: packet.attachment_id.clone(),
+                    event: Some(terminal_event::Event::ViewportDatagram(Box::new(
+                        packet.clone(),
+                    ))),
+                }));
+                write_message(&mut worker_writer, &event).await?;
+            }
+            worker_writer.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        let (written, forwarded) = tokio::join!(
+            producer,
+            forward_worker_messages(
+                &mut worker_reader,
+                &mut reliable_writer,
+                &server_connection,
+                3,
+                false
+            )
+        );
+        written?;
+        forwarded?;
+        assert!(read_message(&mut reliable_reader).await?.is_none());
+        for expected in &fragments {
+            let packet =
+                tokio::time::timeout(Duration::from_secs(1), client_connection.read_datagram())
+                    .await??;
+            assert_eq!(&TerminalViewportDatagram::decode(packet)?, expected);
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(50), client_connection.read_datagram())
                 .await
@@ -1156,6 +1288,7 @@ mod tests {
                     &mut worker_output,
                     &mut client_output,
                     &server_connection,
+                    0,
                     true
                 )
             )

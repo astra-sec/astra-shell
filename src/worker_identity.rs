@@ -3,8 +3,8 @@ use anyhow::{Context, Result, ensure};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
-const MAGIC: &[u8; 8] = b"ASTRAWK2";
-const VERSION: u32 = 2;
+const MAGIC: &[u8; 8] = b"ASTRAWK3";
+const VERSION: u32 = 3;
 pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +124,32 @@ mod tests {
         pin(&mut other_connection, WorkerIdentity::new(502))?;
         Ok(())
     }
+    #[tokio::test]
+    async fn rejects_previous_internal_version_in_both_directions() {
+        let (mut gateway, mut old_worker) = tokio::io::duplex(128);
+        let (found, _) = tokio::join!(discover(&mut gateway, 501), async {
+            let mut query = [0; 24];
+            old_worker.read_exact(&mut query).await.unwrap();
+            let mut response = [0; 60];
+            response[..8].copy_from_slice(b"ASTRAWK2");
+            response[8..12].copy_from_slice(&2u32.to_be_bytes());
+            old_worker.write_all(&response).await.unwrap();
+        });
+        assert!(found.is_err());
+        let (mut old_gateway, mut worker) = tokio::io::duplex(128);
+        let (_, introduced) = tokio::join!(
+            async {
+                old_gateway.write_all(b"ASTRAWK2").await.unwrap();
+                old_gateway
+                    .write_all(Uuid::new_v4().as_bytes())
+                    .await
+                    .unwrap();
+            },
+            introduce(&mut worker, WorkerIdentity::new(501))
+        );
+        assert!(introduced.is_err());
+    }
+
     #[tokio::test]
     async fn rejects_wrong_uid_and_unversioned_worker() {
         let (mut gateway, mut worker) = tokio::io::duplex(128);
