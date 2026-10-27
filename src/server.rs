@@ -1651,6 +1651,7 @@ where
                                 &info.id,
                                 &attachment_info.id,
                                 session_objects,
+                                &lease.lease_id,
                             )?;
                             match command.command {
                                 Some(terminal_command::Command::Input(bytes)) => {
@@ -2026,6 +2027,7 @@ fn validate_terminal_command_target(
     terminal_id: &str,
     attachment_id: &str,
     session_objects: bool,
+    attachment_lease_id: &str,
 ) -> Result<()> {
     ensure!(
         command.terminal_id == terminal_id,
@@ -2035,6 +2037,19 @@ fn validate_terminal_command_target(
         ensure!(
             command.attachment_id == attachment_id,
             "terminal command targets the wrong attachment"
+        );
+    }
+    if matches!(
+        command.command,
+        Some(
+            terminal_command::Command::Input(_)
+                | terminal_command::Command::Resize(_)
+                | terminal_command::Command::LeaseControl(_)
+        )
+    ) {
+        ensure!(
+            !attachment_lease_id.is_empty() && command.lease_id == attachment_lease_id,
+            "terminal command does not own this attachment's input lease"
         );
     }
     Ok(())
@@ -2735,18 +2750,102 @@ mod tests {
             attachment_id: "attachment".into(),
             ..Default::default()
         };
-        assert!(validate_terminal_command_target(&command, "terminal", "attachment", true).is_ok());
+        assert!(
+            validate_terminal_command_target(&command, "terminal", "attachment", true, "").is_ok()
+        );
         command.attachment_id = "stale".into();
         assert!(
-            validate_terminal_command_target(&command, "terminal", "attachment", true).is_err()
+            validate_terminal_command_target(&command, "terminal", "attachment", true, "").is_err()
         );
         assert!(
-            validate_terminal_command_target(&command, "terminal", "attachment", false).is_ok()
+            validate_terminal_command_target(&command, "terminal", "attachment", false, "").is_ok()
         );
         command.terminal_id = "wrong".into();
         assert!(
-            validate_terminal_command_target(&command, "terminal", "attachment", false).is_err()
+            validate_terminal_command_target(&command, "terminal", "attachment", false, "")
+                .is_err()
         );
+    }
+
+    #[test]
+    fn viewer_cannot_borrow_another_attachments_lease() {
+        let commands = [
+            terminal_command::Command::Input(b"fixture".to_vec()),
+            terminal_command::Command::Resize(crate::protocol::Resize {
+                rows: 30,
+                cols: 90,
+                ..Default::default()
+            }),
+            terminal_command::Command::LeaseControl(crate::protocol::LeaseControl {
+                action: LeaseControlAction::Renew as i32,
+            }),
+            terminal_command::Command::LeaseControl(crate::protocol::LeaseControl {
+                action: LeaseControlAction::Release as i32,
+            }),
+        ];
+        for action in commands {
+            let command = crate::protocol::TerminalCommand {
+                terminal_id: "terminal".into(),
+                attachment_id: "viewer".into(),
+                lease_id: "another-attachments-current-lease".into(),
+                sequence: 1,
+                command: Some(action),
+            };
+            assert!(
+                validate_terminal_command_target(&command, "terminal", "viewer", true, "").is_err(),
+                "a correct route must not permit borrowing a different attachment's lease"
+            );
+            assert!(
+                validate_terminal_command_target(
+                    &command,
+                    "terminal",
+                    "viewer",
+                    true,
+                    "stale-lease"
+                )
+                .is_err()
+            );
+            assert!(
+                validate_terminal_command_target(
+                    &command,
+                    "terminal",
+                    "viewer",
+                    true,
+                    &command.lease_id
+                )
+                .is_ok()
+            );
+            assert!(
+                validate_terminal_command_target(&command, "terminal", "viewer", false, "")
+                    .is_err()
+            );
+            assert!(
+                validate_terminal_command_target(
+                    &command,
+                    "terminal",
+                    "viewer",
+                    false,
+                    &command.lease_id
+                )
+                .is_ok()
+            );
+        }
+        for action in [
+            terminal_command::Command::Detach(true),
+            terminal_command::Command::StateAck(Default::default()),
+            terminal_command::Command::StateRepair(Default::default()),
+            terminal_command::Command::HistoryPage(Default::default()),
+        ] {
+            let command = crate::protocol::TerminalCommand {
+                terminal_id: "terminal".into(),
+                attachment_id: "viewer".into(),
+                command: Some(action),
+                ..Default::default()
+            };
+            assert!(
+                validate_terminal_command_target(&command, "terminal", "viewer", true, "").is_ok()
+            );
+        }
     }
 
     #[test]
