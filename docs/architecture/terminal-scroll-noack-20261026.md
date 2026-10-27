@@ -1,5 +1,7 @@
 # UI-18: independent full-state backpressure (2026-10-26)
 
+> Historical pre-deployment record. Current deployment is superseded by [the final archive](../maintenance/terminal-optimization-archive-20261028.md); the original managed endpoints now include this change and v3. Original experimental limits below remain historical evidence.
+
 This change is not deployed. Apple UI-18 dependencies are complete; WORK-03 remains
 unfinished and this change does not implement worker hot replacement.
 

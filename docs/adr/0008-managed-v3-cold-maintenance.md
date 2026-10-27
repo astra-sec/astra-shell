@@ -9,3 +9,5 @@ The internal identity handshake is ASTRAWK3/version3. Discovery rejects all prev
 Maintenance preserves original multi-user state, certificate, per-user SSH authorization, resource limits and original UDP4433 listener. Do not overlay the separate rootless catalog. Existing KillMode=process intentionally leaves workers alive, so explicit maintenance must identify and retire those Astra process trees as well. Back up original binaries/units/state. Retain user files and backups; retire only the independent OPS04 unit and its port after successful original-port preparation. Router rules remain untouched.
 
 Validation includes Rust negotiation/old internal rejection/fragment forwarding and bounds, real Apple→managed Quinn missing-fragment quiet-tail repair and resize/epoch/reconnect, same-worker same-terminal gateway restart, plus isolated Linux two-UID lifecycle and public old-client regression. Deployment results are recorded separately, not inferred from source completion.
+
+Final source/artifact, test, original-port deployment and GLIBC recovery evidence: [2026-10-28 archive](../maintenance/terminal-optimization-archive-20261028.md).
