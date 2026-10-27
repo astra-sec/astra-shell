@@ -66,7 +66,7 @@ are recorded in the Apple residual evidence directory. GUI profile creation and
 physical input remain pending while native desktop input is unavailable.
 
 
-## Final artifact receipt
+## Historical private-trial artifact receipt
 
 Product source `6ce700e3e7cfd3bd1d7b1a8781f7d4f41010a68d`, Linux SHA-256
 `2da53fb86b5a110de9d911b1d0adc3af5db8bdb97a8045cbd0456566f37242f3`, runs with
@@ -90,3 +90,31 @@ initial State + ACK: primary136ms and alternate135ms, each one compressed chunk.
 Both loopback test PTYs and server attempts were cleaned up. Combined with the
 private no-GSO control this supports a path/offload problem, without asserting
 which tunnel component is faulty. Source defaults remain unchanged.
+
+## Superseded by existing Review Host
+
+Later on 27 October the user explicitly chose Review Host and authorized its
+service/sessions to be restarted. The empty Icelake private trial was stopped;
+its PID and UDP4435 listener disappeared, original protected process identities
+were preserved, and no new Icelake Host was saved. The manual setup above is
+cancelled. Its retained state/evidence is not an online test destination.
+
+The same official 6ce700e Linux artifact temporarily ran at the existing
+reviewer@47.242.234.115:4433 profile, with reliable/noGSO, the original certificate,
+authorization, isolation, quotas and relay. Actual public primary/alternate
+128-input fixtures pass correctness but still take approximately1.5–1.7seconds
+after the last input to import. That is not physical GUI acceptance or a resolved
+scroll defect. Review-specific numeric diagnosis and current deployment receipts
+are authoritative in the sibling Apple report
+`docs/architecture/terminal-scroll-review-20261027.md` and PROJECT_STATUS.md.
+No additional server product changes or global transport defaults are introduced.
+
+The user's final instruction was to restore all test changes. Review is now back
+on the original859548d image/binary/command with its existing state and credentials.
+Owned fixture PTYs/directories and the task-owned builder/two temporary images
+were removed; the coordinator restored the exact prior Clash rules/configuration.
+The Icelake trial remains stopped and the original Mac process remains running.
+The valid proxy-path diagnostic measured QUIC RTT416–445ms, server export/prepare
+medians33/21ms and update enqueue→ACK710–958ms. An en0-bound strict-pin probe
+measured about101ms RTT, but normal-client TUN-DIRECT attempts both failed before
+spawn. Do not claim a direct scroll improvement or physical GUI acceptance.
